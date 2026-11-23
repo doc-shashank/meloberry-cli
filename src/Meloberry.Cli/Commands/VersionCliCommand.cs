@@ -10,7 +10,17 @@ public sealed class VersionCliCommand : CliCommand
             Verb: "version",
             Usage: "version",
             Description: "Displays the Meloberry CLI version, product name, and runtime details.",
-            HandlerType: typeof(Handler)))
+            HandlerType: typeof(Handler),
+            Prerequisites: "Stateless; also accessible via '-v' or '--version'.",
+            OptionsHelp:
+            [
+                "(No command-specific options; supports global --json.)"
+            ],
+            Examples:
+            [
+                "mby version",
+                "mby -v --json"
+            ]))
     {
     }
 

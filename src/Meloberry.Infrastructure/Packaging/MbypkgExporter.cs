@@ -2,6 +2,7 @@ using System.IO.Compression;
 using System.Text.Json;
 using Meloberry.Application.Abstractions;
 using Meloberry.Domain.Common;
+using Meloberry.Domain.Errors;
 using Meloberry.Domain.Layouts;
 using Meloberry.Domain.Questions;
 using Meloberry.Domain.Quizzes;
@@ -70,14 +71,32 @@ public sealed class MbypkgExporter(
         if (Directory.Exists(targetStorageDir))
             return new Error("Package.TargetExists", $"Destination workspace '{targetStorageDir}' already exists.", ErrorType.Conflict);
 
-        Dictionary<string, Dictionary<string, string>>? layoutMap = null;
+        List<LayoutProfile>? validatedProfiles = null;
         var layoutsEntry = archive.GetEntry("layouts.json");
         if (layoutsEntry is not null)
         {
             var lRes = await ReadBoundedJsonAsync<Dictionary<string, Dictionary<string, string>>>(layoutsEntry, "layouts.json", "Package.InvalidLayouts", totalBytesRead, cancellationToken);
             if (!lRes.IsSuccess) return lRes.Error!;
             totalBytesRead += lRes.Value.BytesRead;
-            layoutMap = lRes.Value.Data;
+            var layoutMap = lRes.Value.Data;
+            validatedProfiles = new List<LayoutProfile>();
+            foreach (var (targetType, values) in layoutMap)
+            {
+                if (!LayoutBoundsCatalog.IsValidTargetType(targetType))
+                    return new Error("Package.InvalidLayouts", $"Unsupported layout target '{targetType}' in layouts.json.", ErrorType.Validation);
+                var profileRes = LayoutProfile.CreateDefault(targetType);
+                if (!profileRes.IsSuccess) return profileRes.Error!;
+                var profile = profileRes.Value;
+                if (values is not null)
+                {
+                    foreach (var (prop, val) in values)
+                    {
+                        var setRes = profile.SetProperty(prop, val);
+                        if (!setRes.IsSuccess) return setRes.Error!;
+                    }
+                }
+                validatedProfiles.Add(profile);
+            }
         }
 
         StudySession? importedSession = null;
@@ -149,11 +168,10 @@ public sealed class MbypkgExporter(
             Directory.Move(stagingDir, targetStorageDir);
             movedToTarget = true;
 
-            if (layoutMap is not null)
+            if (validatedProfiles is not null)
             {
-                foreach (var (targetType, values) in layoutMap)
-                    if (LayoutBoundsCatalog.IsValidTargetType(targetType))
-                        await layoutRepository.SaveProfileAsync(LayoutProfile.Rehydrate(targetType, values), cancellationToken);
+                foreach (var profile in validatedProfiles)
+                    await layoutRepository.SaveProfileAsync(profile, cancellationToken);
             }
 
             if (importedSession is not null)
@@ -244,13 +262,14 @@ public sealed class MbypkgExporter(
         return clean;
     }
 
-    private static async Task<Result<string>> WritePackageAsync<TWorkspace>(
+    private async Task<Result<string>> WritePackageAsync<TWorkspace>(
         string id, string kind, string storageDirectory, TWorkspace workspaceDto,
         IReadOnlyDictionary<string, LayoutProfile> layouts, IReadOnlyList<string> assetRelativePaths,
         string? outputPath, string targetPlatform, bool includeLayouts, CancellationToken cancellationToken)
     {
         var normalizedPlatform = string.Equals(targetPlatform, "android", StringComparison.OrdinalIgnoreCase) ? "android" : "desktop";
         var resolvedOut = ResolvePackageOutputPath(id, storageDirectory, outputPath);
+        transactionManager?.NotifyOutputFileMutating(resolvedOut);
         var outDir = Path.GetDirectoryName(resolvedOut);
         if (!string.IsNullOrWhiteSpace(outDir)) Directory.CreateDirectory(outDir);
 
@@ -370,9 +389,11 @@ public sealed class MbypkgExporter(
                 b.Id, b.Index, b.Kind.ToString(), b.TextContent, b.ImagePath,
                 b.Caption, b.Alt,
                 b.CalloutTone.HasValue ? ArticleBlock.CalloutToneToString(b.CalloutTone.Value) : null,
-                b.CalloutTitle)).ToList(),
+                b.CalloutTitle,
+                b.RefKey)).ToList(),
             includeLayouts ? c.LayoutOverrides.ToDictionary(x => x.Key, x => x.Value) : null,
-            c.Title)).ToList(),
+            c.Title,
+            c.RefKey)).ToList(),
             session.Name, session.Description);
 
     private static QuizPackageDto MapQuizToDto(Quiz quiz, bool includeLayouts) =>
@@ -381,21 +402,32 @@ public sealed class MbypkgExporter(
             McqQuestion m => new QuestionPackageDto(m.Id, m.Index, "Mcq", m.Text, m.MaxOptions, m.IsMultiCorrect,
                 m.Options.Select(o => new OptionPackageDto(o.Index, o.Text, o.ImagePath, o.IsCorrect)).ToList(),
                 null, null, includeLayouts ? m.LayoutOverrides.ToDictionary(x => x.Key, x => x.Value) : null,
-                m.ImagePath, m.Explanation),
+                m.ImagePath, m.Explanation, m.RefKey),
             FlashcardQuestion f => new QuestionPackageDto(f.Id, f.Index, "Flashcard", null, 0, false, [],
-                new SidePackageDto(f.Front.Text, f.Front.ImagePath, f.Front.Position.ToString()),
-                new SidePackageDto(f.Back.Text, f.Back.ImagePath, f.Back.Position.ToString()),
-                includeLayouts ? f.LayoutOverrides.ToDictionary(x => x.Key, x => x.Value) : null),
+                new SidePackageDto(f.Front.Text, f.Front.ImagePath, f.Front.Position.ToString(), f.Front.IsPositionExplicit),
+                new SidePackageDto(f.Back.Text, f.Back.ImagePath, f.Back.Position.ToString(), f.Back.IsPositionExplicit),
+                includeLayouts ? f.LayoutOverrides.ToDictionary(x => x.Key, x => x.Value) : null,
+                null, null, f.RefKey),
             _ => throw new InvalidOperationException("Unsupported question type.")
         }).ToList(),
         string.IsNullOrWhiteSpace(quiz.Name) ? null : quiz.Name,
         string.IsNullOrWhiteSpace(quiz.Description) ? null : quiz.Description);
+
+    private static Result<string?> ValidateAndRegisterRef(string? rawRef, HashSet<string> usedRefs)
+    {
+        var normRes = RefKeyValidator.ValidateAndNormalize(rawRef);
+        if (!normRes.IsSuccess) return normRes.Error!;
+        if (normRes.Value is not null && !usedRefs.Add(normRes.Value))
+            return AddressErrors.DuplicateRef(normRes.Value);
+        return normRes.Value;
+    }
 
     private static Result<StudySession> RehydrateSessionSafe(SessionPackageDto dto, string storageDir)
     {
         if (dto.Components is null)
             return new Error("Package.InvalidWorkspace", "Session workspace.json is missing components.", ErrorType.Validation);
 
+        var usedRefs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var comps = new List<SessionComponent>(dto.Components.Count);
         foreach (var c in dto.Components)
         {
@@ -404,12 +436,15 @@ public sealed class MbypkgExporter(
             if (!Enum.TryParse<ComponentKind>(c.Kind, true, out var kind))
                 return new Error("Package.InvalidWorkspace", $"Unsupported component kind '{c.Kind}'.", ErrorType.Validation);
 
+            var compRefRes = ValidateAndRegisterRef(c.RefKey, usedRefs);
+            if (!compRefRes.IsSuccess) return compRefRes.Error!;
+
             Quiz? quiz = null;
             if (c.Quiz is not null)
             {
                 if (!IsSafeSingleSegmentId(c.Quiz.Id))
                     return new Error("Package.InvalidWorkspace", $"Invalid component quiz ID '{c.Quiz.Id}'.", ErrorType.Validation);
-                var qRes = RehydrateQuizSafe(c.Quiz, storageDir);
+                var qRes = RehydrateQuizSafe(c.Quiz, storageDir, usedRefs);
                 if (!qRes.IsSuccess) return qRes.Error!;
                 quiz = qRes.Value;
             }
@@ -424,6 +459,9 @@ public sealed class MbypkgExporter(
                 if (!IsSafeRelativeAssetPath(b.ImagePath, storageDir))
                     return new Error("Package.InvalidWorkspace", $"Unsafe article imagePath '{b.ImagePath}'.", ErrorType.Validation);
 
+                var blockRefRes = ValidateAndRegisterRef(b.RefKey, usedRefs);
+                if (!blockRefRes.IsSuccess) return blockRefRes.Error!;
+
                 CalloutTone? calloutTone = null;
                 if (!string.IsNullOrWhiteSpace(b.CalloutTone) && ArticleBlock.TryParseCalloutTone(b.CalloutTone, out var parsedTone))
                     calloutTone = parsedTone;
@@ -431,7 +469,7 @@ public sealed class MbypkgExporter(
                     calloutTone = CalloutTone.Pearl;
 
                 blocks.Add(ArticleBlock.Rehydrate(b.Id, c.Id, b.Index, bKind, b.TextContent, b.ImagePath,
-                    caption: b.Caption, alt: b.Alt, calloutTone: calloutTone, calloutTitle: b.CalloutTitle));
+                    refKey: blockRefRes.Value, caption: b.Caption, alt: b.Alt, calloutTone: calloutTone, calloutTitle: b.CalloutTitle));
             }
 
             IReadOnlyList<string> compTargets = kind == ComponentKind.Article
@@ -440,22 +478,26 @@ public sealed class MbypkgExporter(
             var ovRes = ValidateOverrides(compTargets, c.LayoutOverrides);
             if (!ovRes.IsSuccess) return ovRes.Error!;
 
-            comps.Add(SessionComponent.Rehydrate(c.Id, dto.Id, c.Index, kind, quiz, blocks, ovRes.Value, c.Title));
+            comps.Add(SessionComponent.Rehydrate(c.Id, dto.Id, c.Index, kind, quiz, blocks, ovRes.Value, c.Title, compRefRes.Value));
         }
 
         return StudySession.Rehydrate(dto.Id, storageDir, dto.ActiveComponentId, comps, dto.Name, dto.Description);
     }
 
-    private static Result<Quiz> RehydrateQuizSafe(QuizPackageDto dto, string storageDir)
+    private static Result<Quiz> RehydrateQuizSafe(QuizPackageDto dto, string storageDir, HashSet<string>? sharedUsedRefs = null)
     {
         if (!Enum.TryParse<QuizType>(dto.QuizType, true, out var qType))
             return new Error("Package.InvalidWorkspace", $"Unsupported quiz type '{dto.QuizType}'.", ErrorType.Validation);
 
+        var usedRefs = sharedUsedRefs ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var questions = new List<Question>((dto.Questions ?? []).Count);
         foreach (var q in dto.Questions ?? [])
         {
             if (!IsSafeSingleSegmentId(q.Id) || q.Index < 1)
                 return new Error("Package.InvalidWorkspace", $"Invalid question ID or index: '{q.Id}'.", ErrorType.Validation);
+
+            var qRefRes = ValidateAndRegisterRef(q.RefKey, usedRefs);
+            if (!qRefRes.IsSuccess) return qRefRes.Error!;
 
             if (string.Equals(q.QuestionType, "Mcq", StringComparison.OrdinalIgnoreCase))
             {
@@ -476,7 +518,7 @@ public sealed class MbypkgExporter(
 
                 questions.Add(McqQuestion.Rehydrate(q.Id, dto.Id, q.Index, q.PromptText ?? string.Empty,
                     q.MaxOptions is >= 2 and <= 26 ? q.MaxOptions : McqQuestion.DefaultMaxOptions, q.IsMultiCorrect, opts, ovRes.Value,
-                    q.PromptImagePath, q.Explanation));
+                    q.PromptImagePath, q.Explanation, qRefRes.Value));
             }
             else if (string.Equals(q.QuestionType, "Flashcard", StringComparison.OrdinalIgnoreCase))
             {
@@ -488,7 +530,7 @@ public sealed class MbypkgExporter(
                 var backRes = RehydrateSideSafe(q.Back, storageDir);
                 if (!backRes.IsSuccess) return backRes.Error!;
 
-                questions.Add(FlashcardQuestion.Rehydrate(q.Id, dto.Id, q.Index, frontRes.Value, backRes.Value, ovRes.Value));
+                questions.Add(FlashcardQuestion.Rehydrate(q.Id, dto.Id, q.Index, frontRes.Value, backRes.Value, ovRes.Value, qRefRes.Value));
             }
             else
             {
@@ -506,12 +548,12 @@ public sealed class MbypkgExporter(
             return new Error("Package.InvalidWorkspace", $"Unsupported media position '{side.Position}'.", ErrorType.Validation);
         if (!IsSafeRelativeAssetPath(side.ImagePath, storageDir))
             return new Error("Package.InvalidWorkspace", $"Unsafe flashcard imagePath '{side.ImagePath}'.", ErrorType.Validation);
-        return FlashcardSide.Rehydrate(side.Text, side.ImagePath, pos);
+        return FlashcardSide.Rehydrate(side.Text, side.ImagePath, pos, side.IsPositionExplicit);
     }
 
     private sealed record PackageManifest(string PackageVersion, string Kind, string Id, string ExportedAtUtc, List<string> Assets, string TargetPlatform = "desktop");
     private sealed record SessionPackageDto(string Id, string? ActiveComponentId, List<ComponentPackageDto> Components, string? Name = null, string? Description = null);
-    private sealed record ComponentPackageDto(string Id, int Index, string Kind, QuizPackageDto? Quiz, List<ArticleBlockPackageDto> ArticleBlocks, Dictionary<string, string>? LayoutOverrides, string? Title = null);
+    private sealed record ComponentPackageDto(string Id, int Index, string Kind, QuizPackageDto? Quiz, List<ArticleBlockPackageDto> ArticleBlocks, Dictionary<string, string>? LayoutOverrides, string? Title = null, string? RefKey = null);
     private sealed record ArticleBlockPackageDto(
         string Id,
         int Index,
@@ -521,9 +563,10 @@ public sealed class MbypkgExporter(
         string? Caption = null,
         string? Alt = null,
         string? CalloutTone = null,
-        string? CalloutTitle = null);
+        string? CalloutTitle = null,
+        string? RefKey = null);
     private sealed record QuizPackageDto(string Id, string QuizType, List<QuestionPackageDto> Questions, string? Name = null, string? Description = null);
-    private sealed record QuestionPackageDto(string Id, int Index, string QuestionType, string? PromptText, int MaxOptions, bool IsMultiCorrect, List<OptionPackageDto> Options, SidePackageDto? Front, SidePackageDto? Back, Dictionary<string, string>? LayoutOverrides, string? PromptImagePath = null, string? Explanation = null);
+    private sealed record QuestionPackageDto(string Id, int Index, string QuestionType, string? PromptText, int MaxOptions, bool IsMultiCorrect, List<OptionPackageDto> Options, SidePackageDto? Front, SidePackageDto? Back, Dictionary<string, string>? LayoutOverrides, string? PromptImagePath = null, string? Explanation = null, string? RefKey = null);
     private sealed record OptionPackageDto(int Index, string? Text, string? ImagePath, bool IsCorrect);
-    private sealed record SidePackageDto(string? Text, string? ImagePath, string Position);
+    private sealed record SidePackageDto(string? Text, string? ImagePath, string Position, bool IsPositionExplicit = false);
 }

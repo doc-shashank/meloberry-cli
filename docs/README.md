@@ -34,16 +34,20 @@ All read, patch, lint, and delete commands accept either a direct ID or a worksp
 | :--- | :--- |
 | `--json` | Minified single-line JSON on stdout/stderr |
 | `--app-data <dir>` | Override `app_settings.db` & `.mby_id_clock` directory |
-| `-o`, `--out <dir>` | Output directory |
 | `--quiet` / `--verbose` | Minimal summary output vs full lists/reports |
-| `--` | End of options |
-| `MBY_AGENT=1` | Implicitly enables `--json` |
+| `-h`, `--help` | Print prime grammar card (or command-specific help when paired with `<cmd>`) |
+| `-v`, `--version` | Print CLI version and .NET runtime |
+| `--` | End of options (required before positional arguments starting with `-`; unrecognized short/long flags before `--` fail with `Cli.ParseError`, while bare `-` reads `stdin`) |
+| `MBY_AGENT=1` | Implicitly enables `--json` (also accepts `true`) |
 | `MBY_APP_DATA=<dir>` | Default `--app-data` directory |
+| `MBY_BROWSER_PATH=<path>` | Explicit Edge/Chrome executable path for `--headless` / `--verify` |
+
+Command-specific output flags: `-o`, `--out <dir>` is supported only on `apply` and `build` (`pkg` uses positional `[outPath]` / `[destDir]`).
 
 ## JSON Envelope & Exit Codes
 
 Success (`exit 0`, stdout): `{"success":true,"data":{...}}`  
-Failure (`exit != 0`, stderr): `{"success":false,"error":{"code":"...","description":"...","type":"...","path":"...","hint":"..."}}`
+Failure (`exit != 0`, stderr): `{"success":false,"error":{"code":"...","description":"...","type":"...","path":"...","hint":"..."},"data":{...}}` *(optional `data` carries structured diagnostic reports for `check`, `analyze --headless/--static-only`, and `build --verify`)*
 
 | Code | Meaning |
 | :--- | :--- |

@@ -117,7 +117,8 @@ public static class CliResultExtensions
                     type = error.Type.ToString(),
                     path = error.Path,
                     hint = error.Hint
-                }
+                },
+                data = error.Data
             }, ErrorJsonOptions)
             : $"Error [{error.Code}]: {error.Description}");
 

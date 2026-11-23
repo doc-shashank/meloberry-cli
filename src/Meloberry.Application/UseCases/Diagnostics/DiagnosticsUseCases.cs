@@ -107,7 +107,7 @@ public sealed class LintHandler(
     private static Error FailLint(string targetId, LintReportResponse report)
     {
         var summary = string.Join("; ", report.Issues.Where(i => i.Severity == "Error").Select(i => $"[{i.Code}] {i.Message}"));
-        return LintErrors.FailedLintCheck(targetId, report.ErrorCount, summary);
+        return LintErrors.FailedLintCheck(targetId, report.ErrorCount, summary, report);
     }
 
     private static LintReportResponse BuildReport(string targetId, List<LintIssue> issues)
@@ -178,7 +178,18 @@ public sealed class LintHandler(
             return;
         }
         foreach (var question in quiz.Questions)
+        {
+            if ((quiz.Type == QuizType.Mcq && question.Type != QuestionType.Mcq) ||
+                (quiz.Type == QuizType.Flashcard && question.Type != QuestionType.Flashcard))
+            {
+                issues.Add(new LintIssue(
+                    "Error",
+                    "Lint.QuestionTypeMismatch",
+                    question.Id,
+                    $"Quiz '{quiz.Id}' has type '{quiz.Type.ToString().ToLowerInvariant()}' and cannot contain '{question.Type.ToString().ToLowerInvariant()}' question."));
+            }
             await LintQuestionAsync(question, storageDirectory, issues, ct);
+        }
     }
 
     private async Task LintQuestionAsync(Question question, string storageDirectory, List<LintIssue> issues, CancellationToken ct)

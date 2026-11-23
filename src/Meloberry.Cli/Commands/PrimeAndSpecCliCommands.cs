@@ -11,7 +11,17 @@ public sealed class PrimeCliCommand : CliCommand
             Verb: "prime",
             Usage: "prime",
             Description: "Prints the ultra-dense AI-agent grammar card.",
-            HandlerType: typeof(Handler)))
+            HandlerType: typeof(Handler),
+            Prerequisites: "Stateless; requires no existing workspace. Also invoked when running 'mby', 'mby -h', or 'mby --help'.",
+            OptionsHelp:
+            [
+                "(No command-specific options; supports global --json, --app-data.)"
+            ],
+            Examples:
+            [
+                "mby prime",
+                "mby prime --json"
+            ]))
     {
     }
 
@@ -32,7 +42,18 @@ public sealed class SpecCliCommand : CliCommand
             Verb: "spec",
             Usage: "spec [type...]",
             Description: "Prints compact schemas for implemented JSON specs and layout bounds.",
-            HandlerType: typeof(Handler)))
+            HandlerType: typeof(Handler),
+            Prerequisites: "Stateless; pass one or more topic names (session, article, quiz, text, image, mcq, flashcard, layouts, callout, markdown, analyze, pkg, build, batch, patch) or omit to print all.",
+            OptionsHelp:
+            [
+                "(No command-specific options; supports global --json.)"
+            ],
+            Examples:
+            [
+                "mby spec mcq flashcard",
+                "mby spec batch patch --json",
+                "mby spec layouts --json"
+            ]))
     {
     }
 

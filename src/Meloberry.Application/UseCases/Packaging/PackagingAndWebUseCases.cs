@@ -104,7 +104,7 @@ public sealed class BuildWebAppHandler(
         LintReportResponse? detailedLint = command.Verbose ? ws.Report : null;
 
         WebAppVerificationReport? verifyReport = null;
-        if (command.Verify)
+        if (command.Verify || command.StaticVerifyOnly)
         {
             if (verifyHandler is null)
                 return new Error("Verify.Unavailable", "Headless WebApp verifier is not configured.", ErrorType.Validation);
@@ -121,7 +121,8 @@ public sealed class BuildWebAppHandler(
                     "Verify.Failed",
                     $"WebApp runtime verification failed: {verifyReport.BrokenAssets.Count} broken asset(s), {verifyReport.ConsoleErrors.Count} console error(s), {verifyReport.OverflowIssues.Count} overflow issue(s), {verifyReport.KatexErrors.Count} KaTeX error(s).",
                     ErrorType.Validation,
-                    Hint: string.IsNullOrWhiteSpace(verifyReport.ReportPath) ? null : $"Inspect verification details at '{verifyReport.ReportPath}'.");
+                    Hint: string.IsNullOrWhiteSpace(verifyReport.ReportPath) ? null : $"Inspect verification details at '{verifyReport.ReportPath}'.",
+                    Data: verifyReport);
             }
         }
 

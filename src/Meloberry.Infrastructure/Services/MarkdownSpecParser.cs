@@ -25,8 +25,8 @@ internal static partial class MarkdownSpecParser
         "kind", "title", "ref", "name", "description", "layoutOverrides", "order"
     };
 
-    [GeneratedRegex(@"^!\[(?<alt>[^\]]*)\]\((?<path>[^\s)]+)(?:\s+""(?<caption>[^""]*)"")?\)\s*$", RegexOptions.Compiled)]
-    private static partial Regex StandaloneImageRegex();
+    [GeneratedRegex(@"^:::\s*(?<name>[a-zA-Z_][a-zA-Z0-9_-]*)\b", RegexOptions.Compiled)]
+    private static partial Regex UnknownDirectiveFenceRegex();
 
     [GeneratedRegex(@"^:::\s*callout(?:\s*\{(?<attrs>[^}]*)\})?\s*$", RegexOptions.IgnoreCase | RegexOptions.Compiled)]
     private static partial Regex CalloutAttrsFenceRegex();
@@ -43,12 +43,18 @@ internal static partial class MarkdownSpecParser
     public static bool LooksLikeMarkdown(string rawText)
     {
         var trimmed = rawText.TrimStart('\uFEFF', ' ', '\t', '\r', '\n');
-        if (trimmed.Length == 0 || trimmed[0] is '{' or '[')
+        if (trimmed.Length == 0)
             return false;
-        return trimmed.StartsWith("---", StringComparison.Ordinal) ||
-               trimmed.StartsWith("#", StringComparison.Ordinal) ||
-               trimmed.StartsWith(":::", StringComparison.Ordinal) ||
-               trimmed.StartsWith("![", StringComparison.Ordinal);
+        char first = trimmed[0];
+        if (first is '{' or '[' or '"')
+            return false;
+        if (char.IsDigit(first) || (first == '-' && trimmed.Length > 1 && char.IsDigit(trimmed[1])))
+            return false;
+        if (trimmed.Equals("true", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.Equals("false", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.Equals("null", StringComparison.OrdinalIgnoreCase))
+            return false;
+        return true;
     }
 
     public static Result<DeclarativeApplySpec> ParseSingleSpec(string rawMarkdown, string sourceLabel, string? filePath = null)
@@ -64,7 +70,8 @@ internal static partial class MarkdownSpecParser
         if (string.Equals(doc.Kind, "session", StringComparison.OrdinalIgnoreCase))
         {
             var comps = new List<DeclarativeComponentSpec>();
-            if (doc.Blocks.Count > 0)
+            bool hasBody = doc.Blocks.Count > 0;
+            if (hasBody)
             {
                 comps.Add(new DeclarativeComponentSpec(
                     "article",
@@ -85,14 +92,19 @@ internal static partial class MarkdownSpecParser
                 comps,
                 null,
                 null,
-                null,
-                filePath is null ? null : Path.GetDirectoryName(Path.GetFullPath(filePath)));
+                hasBody ? null : doc.LayoutOverrides,
+                filePath is null ? null : Path.GetDirectoryName(Path.GetFullPath(filePath)),
+                Ref: hasBody ? null : doc.Ref,
+                Order: doc.Order);
         }
 
         if (!string.IsNullOrWhiteSpace(doc.Kind) && !string.Equals(doc.Kind, "article", StringComparison.OrdinalIgnoreCase))
         {
             return new Error("Markdown.InvalidFrontmatter", $"Unsupported Markdown frontmatter kind '{doc.Kind}' in '{sourceLabel}'. Use 'article' or 'session'.", ErrorType.Validation);
         }
+
+        if (doc.Blocks.Count == 0)
+            return new Error("Markdown.EmptyBody", $"Markdown article '{sourceLabel}' has no content blocks.", ErrorType.Validation);
 
         return new DeclarativeApplySpec(
             Kind: "article",
@@ -104,7 +116,9 @@ internal static partial class MarkdownSpecParser
             Blocks: doc.Blocks,
             Questions: null,
             LayoutOverrides: doc.LayoutOverrides,
-            AssetBaseDirectory: filePath is null ? null : Path.GetDirectoryName(Path.GetFullPath(filePath)));
+            AssetBaseDirectory: filePath is null ? null : Path.GetDirectoryName(Path.GetFullPath(filePath)),
+            Ref: doc.Ref,
+            Order: doc.Order);
     }
 
     public static Result<DeclarativeComponentSpec> ParseComponent(string rawMarkdown, string filePath)
@@ -243,10 +257,36 @@ internal static partial class MarkdownSpecParser
                     Hint: suggestion is null ? null : $"Did you mean '{suggestion}'?");
             }
 
-            if (string.Equals(key, "layoutOverrides", StringComparison.OrdinalIgnoreCase) && string.IsNullOrEmpty(rawVal))
+            if (string.Equals(key, "layoutOverrides", StringComparison.OrdinalIgnoreCase))
             {
-                currentSection = "layoutOverrides";
-                continue;
+                if (string.IsNullOrEmpty(rawVal))
+                {
+                    currentSection = "layoutOverrides";
+                    continue;
+                }
+
+                if (rawVal.StartsWith('{') && rawVal.EndsWith('}'))
+                {
+                    var inner = rawVal[1..^1].Trim();
+                    if (!string.IsNullOrEmpty(inner))
+                    {
+                        layoutOverrides ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var part in SplitRespectingQuotes(inner, ','))
+                        {
+                            int colon = part.IndexOf(':');
+                            if (colon <= 0)
+                                return new Error("Markdown.InvalidFrontmatter", $"Expected 'key: value' inside inline layoutOverrides at line {lineNum} of '{sourceLabel}'.", ErrorType.Validation, Path: $"frontmatter:{lineNum}");
+                            layoutOverrides[part[..colon].Trim()] = UnquoteYamlScalar(part[(colon + 1)..]);
+                        }
+                    }
+                    continue;
+                }
+
+                return new Error(
+                    "Markdown.InvalidFrontmatter",
+                    $"Invalid 'layoutOverrides' value at line {lineNum} of '{sourceLabel}'. Use indented 'key: value' lines or inline '{{ key: value }}'.",
+                    ErrorType.Validation,
+                    Path: $"frontmatter:{lineNum}");
             }
 
             if (string.Equals(key, "order", StringComparison.OrdinalIgnoreCase))
@@ -258,11 +298,19 @@ internal static partial class MarkdownSpecParser
                 else if (rawVal.StartsWith('[') && rawVal.EndsWith(']'))
                 {
                     order ??= [];
-                    foreach (var part in rawVal[1..^1].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                    foreach (var part in SplitRespectingQuotes(rawVal[1..^1], ','))
                     {
                         var val = UnquoteYamlScalar(part);
                         if (!string.IsNullOrWhiteSpace(val)) order.Add(val);
                     }
+                }
+                else
+                {
+                    return new Error(
+                        "Markdown.InvalidFrontmatter",
+                        $"Invalid 'order' value at line {lineNum} of '{sourceLabel}'. Use indented '- filename' lines or inline '[file1, file2]'.",
+                        ErrorType.Validation,
+                        Path: $"frontmatter:{lineNum}");
                 }
                 continue;
             }
@@ -375,15 +423,23 @@ internal static partial class MarkdownSpecParser
                 continue;
             }
 
-            // Standalone Markdown image: ![alt](path "caption")
-            var imgMatch = StandaloneImageRegex().Match(trimmed);
-            if (imgMatch.Success)
+            // Reject unknown :::directive fences rather than silently rendering them as plain text
+            var unknownFence = UnknownDirectiveFenceRegex().Match(trimmed);
+            if (unknownFence.Success)
+            {
+                var directive = unknownFence.Groups["name"].Value;
+                return new Error(
+                    "Markdown.UnknownFence",
+                    $"Unsupported fenced directive ':::{directive}' at line {i + 1} of '{sourceLabel}'. Supported fences: ':::callout', ':::pearl', ':::clinical', ':::warning'.",
+                    ErrorType.Validation,
+                    Path: $"markdown:{i + 1}",
+                    Hint: "Use ':::callout{tone=\"pearl\" title=\"...\"}', ':::pearl', ':::clinical', or ':::warning'.");
+            }
+
+            // Standalone Markdown image: ![alt](path "caption") or ![alt](<path with spaces> "caption")
+            if (TryParseStandaloneImage(trimmed, out var alt, out var path, out var caption))
             {
                 FlushText();
-                var alt = imgMatch.Groups["alt"].Value.Trim();
-                var path = imgMatch.Groups["path"].Value.Trim();
-                var capGroup = imgMatch.Groups["caption"];
-                string? caption = capGroup.Success ? capGroup.Value.Trim() : (string.IsNullOrWhiteSpace(alt) ? null : alt);
                 blocks.Add(new DeclarativeArticleBlockSpec(
                     "image",
                     null,
@@ -467,14 +523,129 @@ internal static partial class MarkdownSpecParser
         return t;
     }
 
+    private static bool TryParseStandaloneImage(string trimmedLine, out string alt, out string path, out string? caption)
+    {
+        alt = string.Empty;
+        path = string.Empty;
+        caption = null;
+
+        if (!trimmedLine.StartsWith("![", StringComparison.Ordinal) || !trimmedLine.EndsWith(')'))
+            return false;
+
+        int closeBracket = trimmedLine.IndexOf("](", 2, StringComparison.Ordinal);
+        if (closeBracket < 0)
+            return false;
+
+        alt = trimmedLine[2..closeBracket].Trim();
+        var inner = trimmedLine[(closeBracket + 2)..^1].Trim();
+        if (inner.Length == 0)
+            return false;
+
+        string? parsedCaption = null;
+        string rawDestination = inner;
+
+        if (inner.StartsWith('<'))
+        {
+            int closeAngle = inner.IndexOf('>');
+            if (closeAngle <= 1) return false;
+            rawDestination = inner[1..closeAngle].Trim();
+            var rest = inner[(closeAngle + 1)..].Trim();
+            if (rest.Length > 0)
+            {
+                if (!TryParseQuotedCaption(rest, out parsedCaption))
+                    return false;
+            }
+        }
+        else if (inner.EndsWith('"') || inner.EndsWith('\''))
+        {
+            char quote = inner[^1];
+            int openQuote = inner.LastIndexOf(quote, inner.Length - 2);
+            if (openQuote > 0 && char.IsWhiteSpace(inner[openQuote - 1]))
+            {
+                rawDestination = inner[..openQuote].Trim();
+                parsedCaption = inner[(openQuote + 1)..^1].Trim();
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(rawDestination))
+            return false;
+
+        path = rawDestination;
+        caption = parsedCaption ?? (string.IsNullOrWhiteSpace(alt) ? null : alt);
+        return true;
+    }
+
+    private static bool TryParseQuotedCaption(string raw, out string? caption)
+    {
+        caption = null;
+        if (raw.Length < 2) return false;
+        char q = raw[0];
+        if ((q == '"' || q == '\'') && raw[^1] == q)
+        {
+            caption = raw[1..^1].Trim();
+            return true;
+        }
+        return false;
+    }
+
+    private static List<string> SplitRespectingQuotes(string input, char separator)
+    {
+        var parts = new List<string>();
+        var current = new StringBuilder();
+        char activeQuote = '\0';
+
+        for (int i = 0; i < input.Length; i++)
+        {
+            char c = input[i];
+            if (activeQuote != '\0')
+            {
+                current.Append(c);
+                if (c == activeQuote && (i == 0 || input[i - 1] != '\\'))
+                    activeQuote = '\0';
+            }
+            else if (c == '"' || c == '\'')
+            {
+                activeQuote = c;
+                current.Append(c);
+            }
+            else if (c == separator)
+            {
+                var item = current.ToString().Trim();
+                if (item.Length > 0) parts.Add(item);
+                current.Clear();
+            }
+            else
+            {
+                current.Append(c);
+            }
+        }
+
+        var tail = current.ToString().Trim();
+        if (tail.Length > 0) parts.Add(tail);
+        return parts;
+    }
+
     private static string? ExtractFirstH1(IReadOnlyList<DeclarativeArticleBlockSpec> blocks)
     {
         foreach (var b in blocks)
         {
             if (b.Kind != "text" || string.IsNullOrWhiteSpace(b.Text)) continue;
+            string? activeFence = null;
             foreach (var line in b.Text.Replace("\r\n", "\n").Split('\n'))
             {
-                var m = H1HeadingRegex().Match(line.Trim());
+                var trimmed = line.Trim();
+                if (activeFence is null && TryOpenCodeFence(trimmed, out var token))
+                {
+                    activeFence = token;
+                    continue;
+                }
+                if (activeFence is not null)
+                {
+                    if (IsCloseCodeFence(trimmed, activeFence))
+                        activeFence = null;
+                    continue;
+                }
+                var m = H1HeadingRegex().Match(trimmed);
                 if (m.Success) return m.Groups["heading"].Value.Trim();
             }
         }

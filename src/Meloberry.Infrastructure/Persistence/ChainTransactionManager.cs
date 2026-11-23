@@ -32,7 +32,23 @@ public sealed class ChainTransactionManager(MeloberryStorageOptions options) : I
         if (string.IsNullOrWhiteSpace(storageDirectory))
             return;
 
-        _current.Value?.TrackWorkspace(storageDirectory);
+        _current.Value?.TrackDirectory(storageDirectory);
+    }
+
+    internal void NotifyOutputDirectoryMutating(string outputDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(outputDirectory))
+            return;
+
+        _current.Value?.TrackDirectory(outputDirectory);
+    }
+
+    internal void NotifyOutputFileMutating(string outputFilePath)
+    {
+        if (string.IsNullOrWhiteSpace(outputFilePath))
+            return;
+
+        _current.Value?.TrackFile(outputFilePath);
     }
 
     private void Commit(ActiveChainTransaction active, ActiveChainTransaction? previous)
@@ -55,7 +71,24 @@ public sealed class ChainTransactionManager(MeloberryStorageOptions options) : I
 
         SqliteConnection.ClearAllPools();
 
-        foreach (var ws in active.GetTrackedWorkspacesSnapshot())
+        foreach (var file in active.GetTrackedFilesSnapshot())
+        {
+            if (!file.Existed)
+            {
+                TryDeleteFile(file.FullPath);
+                continue;
+            }
+
+            if (!string.IsNullOrWhiteSpace(file.BackupPath) && File.Exists(file.BackupPath))
+            {
+                var parentDir = Path.GetDirectoryName(file.FullPath);
+                if (!string.IsNullOrWhiteSpace(parentDir))
+                    Directory.CreateDirectory(parentDir);
+                File.Copy(file.BackupPath, file.FullPath, overwrite: true);
+            }
+        }
+
+        foreach (var ws in active.GetTrackedDirectoriesSnapshot())
         {
             if (!ws.Existed)
             {
@@ -113,6 +146,16 @@ public sealed class ChainTransactionManager(MeloberryStorageOptions options) : I
             CopyDirectoryContents(subDir, Path.Combine(destinationDir, Path.GetFileName(subDir)));
     }
 
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+        catch { }
+    }
+
     private static void TryDeleteDirectory(string path)
     {
         try
@@ -123,12 +166,14 @@ public sealed class ChainTransactionManager(MeloberryStorageOptions options) : I
         catch { }
     }
 
-    private sealed record TrackedWorkspace(string FullDirectory, bool Existed, string? BackupDirectory);
+    private sealed record TrackedDirectory(string FullDirectory, bool Existed, string? BackupDirectory);
+    private sealed record TrackedFile(string FullPath, bool Existed, string? BackupPath);
 
     private sealed class ActiveChainTransaction(string txRoot, bool appSettingsExisted, string? appSettingsBackupPath)
     {
         private readonly object _gate = new();
-        private readonly Dictionary<string, TrackedWorkspace> _tracked = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, TrackedDirectory> _trackedDirs = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, TrackedFile> _trackedFiles = new(StringComparer.OrdinalIgnoreCase);
 
         public string TxRoot { get; } = txRoot;
         public bool AppSettingsExisted { get; } = appSettingsExisted;
@@ -136,33 +181,64 @@ public sealed class ChainTransactionManager(MeloberryStorageOptions options) : I
         public bool Committed { get; set; }
         public bool RolledBack { get; set; }
 
-        public void TrackWorkspace(string storageDirectory)
+        public void TrackDirectory(string directory)
         {
-            var fullDir = Path.GetFullPath(storageDirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var fullDir = Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
             lock (_gate)
             {
-                if (_tracked.ContainsKey(fullDir))
+                if (_trackedDirs.ContainsKey(fullDir))
                     return;
 
                 if (Directory.Exists(fullDir))
                 {
                     SqliteConnection.ClearAllPools();
-                    var backupDir = Path.Combine(TxRoot, "workspaces", _tracked.Count.ToString());
+                    var backupDir = Path.Combine(TxRoot, "dirs", _trackedDirs.Count.ToString());
                     CopyDirectoryContents(fullDir, backupDir);
-                    _tracked[fullDir] = new TrackedWorkspace(fullDir, Existed: true, backupDir);
+                    _trackedDirs[fullDir] = new TrackedDirectory(fullDir, Existed: true, backupDir);
                 }
                 else
                 {
-                    _tracked[fullDir] = new TrackedWorkspace(fullDir, Existed: false, BackupDirectory: null);
+                    _trackedDirs[fullDir] = new TrackedDirectory(fullDir, Existed: false, BackupDirectory: null);
                 }
             }
         }
 
-        public List<TrackedWorkspace> GetTrackedWorkspacesSnapshot()
+        public void TrackFile(string filePath)
+        {
+            var fullPath = Path.GetFullPath(filePath);
+            lock (_gate)
+            {
+                if (_trackedFiles.ContainsKey(fullPath))
+                    return;
+
+                if (File.Exists(fullPath))
+                {
+                    var backupRoot = Path.Combine(TxRoot, "files");
+                    Directory.CreateDirectory(backupRoot);
+                    var backupPath = Path.Combine(backupRoot, $"{_trackedFiles.Count}.bak");
+                    File.Copy(fullPath, backupPath, overwrite: true);
+                    _trackedFiles[fullPath] = new TrackedFile(fullPath, Existed: true, backupPath);
+                }
+                else
+                {
+                    _trackedFiles[fullPath] = new TrackedFile(fullPath, Existed: false, BackupPath: null);
+                }
+            }
+        }
+
+        public List<TrackedDirectory> GetTrackedDirectoriesSnapshot()
         {
             lock (_gate)
             {
-                return [.. _tracked.Values];
+                return [.. _trackedDirs.Values];
+            }
+        }
+
+        public List<TrackedFile> GetTrackedFilesSnapshot()
+        {
+            lock (_gate)
+            {
+                return [.. _trackedFiles.Values];
             }
         }
     }

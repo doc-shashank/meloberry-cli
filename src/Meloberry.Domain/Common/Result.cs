@@ -2,7 +2,7 @@ namespace Meloberry.Domain.Common;
 
 public enum ErrorType { Validation, NotFound, Conflict, Unauthorized, Forbidden }
 
-public sealed record Error(string Code, string Description, ErrorType Type, string? Path = null, string? Hint = null);
+public sealed record Error(string Code, string Description, ErrorType Type, string? Path = null, string? Hint = null, object? Data = null);
 
 public class Result
 {

@@ -47,7 +47,7 @@ public sealed record SessionAnalysisReport(
             {
                 "mcq" => $"Correct: {(s.IsCorrect == true ? "Yes" : "No")}, Checks: {s.CheckAttempts ?? 0}, Selected: [{string.Join(",", s.SelectedOptionIndices ?? [])}]",
                 "flashcard" => $"Flips: {s.FlipCount ?? 0}, Rating: {s.FlashcardRating ?? "unrated"}",
-                _ => "Viewed"
+                _ => s.VisitedCount > 0 ? "Viewed" : "Skipped"
             };
             sb.AppendLine($"| {s.SlideIndex} | `{s.Id}` | {s.Kind} | {seconds} | {s.VisitedCount} | {details} |");
         }

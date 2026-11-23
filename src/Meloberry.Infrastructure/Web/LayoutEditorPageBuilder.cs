@@ -6,7 +6,7 @@ namespace Meloberry.Infrastructure.Web;
 
 /// <summary>
 /// Generates the component-based GUI Layout Editor served by <c>mby layout edit</c>.
-/// Reuses <see cref="WebAppSharedStyles"/> so previewed cards match <c>buildweb</c> 1:1.
+/// Reuses <see cref="WebAppSharedStyles"/> so previewed cards match <c>mby build</c> 1:1.
 /// </summary>
 public sealed class LayoutEditorPageBuilder : ILayoutEditorPageBuilder
 {
@@ -303,7 +303,7 @@ html, body { height: 100%; overflow: hidden; }
       const body = mk('div', 'mby-card-body');
       if (comp.id === 'article-text') {
         const stack = mk('div', 'mby-article-blocks');
-        stack.innerHTML = '<div><h2>Clean Architecture Overview</h2><p>Inline code pills like <code>mby buildweb</code> stay crisp while fenced blocks keep syntax alignment left-anchored across themes.</p></div><div><pre><code>mby "Session_2026... layout set article blockSpacingPx ' + (vals.blockSpacingPx || '20') + '"</code></pre></div><div><p>Second article paragraph demonstrating vertical spacing between blocks and maximum readable card line width.</p></div>';
+        stack.innerHTML = '<div><h2>Clean Architecture Overview</h2><p>Inline code pills like <code>mby build</code> stay crisp while fenced blocks keep syntax alignment left-anchored across themes.</p></div><div><pre><code>mby layout set article blockSpacingPx ' + (vals.blockSpacingPx || '20') + '</code></pre></div><div><p>Second article paragraph demonstrating vertical spacing between blocks and maximum readable card line width.</p></div>';
         card.appendChild(createUpperTab('ARTICLE')); body.appendChild(stack);
       } else if (comp.id === 'image') {
         card.appendChild(createUpperTab(imageScope === 'all' ? 'IMAGE BLOCK (ALL PROFILES)' : ('IMAGE BLOCK (' + imageScope.toUpperCase() + ')')));

@@ -28,7 +28,8 @@ Three global profiles (`article`, `mcq`, `flashcard`) persist in `<app-data>/app
 | :--- | :--- | :--- |
 | `Lint.EmptySession` | Error | Session has zero components |
 | `Lint.EmptyComponent` | Error | Article has zero blocks or Quiz has zero questions |
-| `Lint.EmptyArticleBlock` | Error | Article text block is empty |
+| `Lint.EmptyArticleBlock` | Error | Article text or callout block is empty |
+| `Lint.QuestionTypeMismatch` | Error | Quiz contains a question whose type conflicts with quiz type (`mcq`/`flashcard`) |
 | `Lint.EmptyQuestionPrompt` | Error | MCQ prompt text is missing |
 | `Lint.InsufficientOptions` | Error | MCQ has `< 2` populated options |
 | `Lint.UnfilledOptionSlot` | Warning | MCQ has fewer populated options than `maxOptions` |
@@ -42,5 +43,5 @@ Three global profiles (`article`, `mcq`, `flashcard`) persist in `<app-data>/app
 ## Generated WebApp, Search & Headless Verification
 
 `build` emits `index.html`, `styles.css`, `app.js`, `assets/`, and offline `katex/` assets when math is detected (including captions & callouts). Articles render semantic `<figure>/<figcaption>` pairs and `pearl`/`clinical`/`warning` callout cards, plus client-side `Ctrl+K` / `/` full-text search across all slides and quiz questions.
-- `mby analyze <webDir> --headless [--static-only]` runs zero-touch DOM/image/overflow/KaTeX/search/console verification and writes `reports/verify.latest.json`.
+- `mby analyze <webDir> --headless` (or `--static-only` without a browser) runs zero-touch DOM/image/overflow/KaTeX/search/console verification and writes `reports/verify.latest.json`.
 - `mby analyze <webDir> --live` captures interactive `POST /api/analysis` telemetry into `<webDir>/reports/*.analysis.json`.

@@ -103,12 +103,22 @@ public sealed class Quiz
 
     public Result<Question> InsertQuestion(Question question, int? targetIndex = null)
     {
+        if (Type == QuizType.Mcq && question.Type != QuestionType.Mcq)
+            return QuizErrors.QuestionTypeMismatch(Id, "mcq", question.Type.ToString().ToLowerInvariant());
+        if (Type == QuizType.Flashcard && question.Type != QuestionType.Flashcard)
+            return QuizErrors.QuestionTypeMismatch(Id, "flashcard", question.Type.ToString().ToLowerInvariant());
+
         var insertResult = IndexedListReorderer.InsertAt(_questions, question, targetIndex);
         return insertResult.IsSuccess ? question : insertResult.Error!;
     }
 
     public Result ReplaceQuestionAt(string existingQuestionId, Question replacement, int? targetIndex = null)
     {
+        if (Type == QuizType.Mcq && replacement.Type != QuestionType.Mcq)
+            return QuizErrors.QuestionTypeMismatch(Id, "mcq", replacement.Type.ToString().ToLowerInvariant());
+        if (Type == QuizType.Flashcard && replacement.Type != QuestionType.Flashcard)
+            return QuizErrors.QuestionTypeMismatch(Id, "flashcard", replacement.Type.ToString().ToLowerInvariant());
+
         int currentIdx = _questions.FindIndex(q => string.Equals(q.Id, existingQuestionId, StringComparison.Ordinal));
         if (currentIdx < 0) return QuestionErrors.NotFound(existingQuestionId);
 

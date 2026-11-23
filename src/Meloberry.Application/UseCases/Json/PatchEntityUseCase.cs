@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Meloberry.Application.Abstractions;
@@ -100,6 +101,8 @@ public sealed class PatchEntityHandler(
             }
         }
 
+        var schemaKey = GetSchemaKey(target);
+
         if (command.SetPairs is not null)
         {
             foreach (var pair in command.SetPairs)
@@ -110,11 +113,10 @@ public sealed class PatchEntityHandler(
 
                 var keyPath = pair[..eq].Trim();
                 var rawVal = pair[(eq + 1)..];
-                ApplySetPair(patchObj, keyPath, rawVal);
+                ApplySetPair(patchObj, schemaKey, keyPath, rawVal);
             }
         }
 
-        var schemaKey = GetSchemaKey(target);
         if (AllowedKeysByKind.TryGetValue(schemaKey, out var allowedKeys))
         {
             foreach (var kv in patchObj)
@@ -133,39 +135,50 @@ public sealed class PatchEntityHandler(
         }
 
         var updatedFields = patchObj.Select(kv => kv.Key).ToList();
+        var existingAssets = ApplySpecHandler.CaptureExistingAssets(target.StorageDirectory);
+        bool persisted = false;
 
-        var mutateRes = target.EntityKind switch
+        try
         {
-            "session" => ApplySessionPatch(target.Session!, patchObj),
-            "quiz" => ApplyQuizPatch(target.Quiz!, patchObj),
-            "component" => ApplyComponentPatch(target.Session!, target.Component!, patchObj),
-            "articleBlock" => await ApplyBlockPatchAsync(target.Session!, target.ArticleBlock!, target.StorageDirectory, jsonDir, patchObj, cancellationToken),
-            "question" => await ApplyQuestionPatchAsync(target, jsonDir, patchObj, cancellationToken),
-            _ => new Error("Patch.UnsupportedTarget", $"Cannot patch '{target.EntityKind}'.", ErrorType.Validation)
-        };
+            var mutateRes = target.EntityKind switch
+            {
+                "session" => ApplySessionPatch(target.Session!, patchObj),
+                "quiz" => ApplyQuizPatch(target.Quiz!, patchObj),
+                "component" => ApplyComponentPatch(target.Session!, target.Component!, patchObj),
+                "articleBlock" => await ApplyBlockPatchAsync(target.Session!, target.ArticleBlock!, target.StorageDirectory, jsonDir, patchObj, cancellationToken),
+                "question" => await ApplyQuestionPatchAsync(target, jsonDir, patchObj, cancellationToken),
+                _ => new Error("Patch.UnsupportedTarget", $"Cannot patch '{target.EntityKind}'.", ErrorType.Validation)
+            };
 
-        if (!mutateRes.IsSuccess) return mutateRes.Error!;
+            if (!mutateRes.IsSuccess) return mutateRes.Error!;
 
-        int? newIndex = null;
-        if (!string.IsNullOrWhiteSpace(command.MoveSpec))
-        {
-            var moveRes = ApplyMove(target, command.MoveSpec);
-            if (!moveRes.IsSuccess) return moveRes.Error!;
-            newIndex = moveRes.Value;
-            updatedFields.Add("index");
+            int? newIndex = null;
+            if (!string.IsNullOrWhiteSpace(command.MoveSpec))
+            {
+                var moveRes = ApplyMove(target, command.MoveSpec);
+                if (!moveRes.IsSuccess) return moveRes.Error!;
+                newIndex = moveRes.Value;
+                updatedFields.Add("index");
+            }
+
+            if (target.Session is not null)
+                await repository.SaveSessionAsync(target.Session, cancellationToken);
+            else if (target.Quiz is not null)
+                await repository.SaveQuizAsync(target.Quiz, cancellationToken);
+
+            persisted = true;
+            return new PatchEntityResponse(
+                target.EntityId,
+                target.EntityKind,
+                target.WorkspaceId,
+                newIndex,
+                updatedFields.Count > 0 ? updatedFields : null);
         }
-
-        if (target.Session is not null)
-            await repository.SaveSessionAsync(target.Session, cancellationToken);
-        else if (target.Quiz is not null)
-            await repository.SaveQuizAsync(target.Quiz, cancellationToken);
-
-        return new PatchEntityResponse(
-            target.EntityId,
-            target.EntityKind,
-            target.WorkspaceId,
-            newIndex,
-            updatedFields.Count > 0 ? updatedFields : null);
+        finally
+        {
+            if (!persisted)
+                ApplySpecHandler.CleanupNewlyAddedAssets(target.StorageDirectory, existingAssets);
+        }
     }
 
     private static string GetSchemaKey(ResolvedEntity target) => target.EntityKind switch
@@ -180,37 +193,103 @@ public sealed class PatchEntityHandler(
         _ => target.EntityKind
     };
 
-    private static void ApplySetPair(JsonObject root, string keyPath, string rawVal)
+    private static void ApplySetPair(JsonObject root, string schemaKey, string keyPath, string rawVal)
     {
-        var parsedVal = ParseScalarOrJsonNode(rawVal);
         var dot = keyPath.IndexOf('.');
         if (dot < 0)
         {
-            root[keyPath] = parsedVal;
+            var parsedVal = ParseSetValueForField(schemaKey, keyPath, null, rawVal);
+            var existingKey = FindKeyIgnoreCase(root, keyPath);
+            root[existingKey ?? keyPath] = parsedVal;
             return;
         }
 
         var parentKey = keyPath[..dot].Trim();
         var childKey = keyPath[(dot + 1)..].Trim();
-        if (root[parentKey] is not JsonObject childObj)
+        var parsedNestedVal = ParseSetValueForField(schemaKey, parentKey, childKey, rawVal);
+
+        var existingParentKey = FindKeyIgnoreCase(root, parentKey);
+        var effectiveParentKey = existingParentKey ?? parentKey;
+        if (root[effectiveParentKey] is not JsonObject childObj)
         {
             childObj = [];
-            root[parentKey] = childObj;
+            root[effectiveParentKey] = childObj;
         }
-        childObj[childKey] = parsedVal;
+
+        var existingChildKey = FindKeyIgnoreCase(childObj, childKey);
+        childObj[existingChildKey ?? childKey] = parsedNestedVal;
     }
 
-    private static JsonNode? ParseScalarOrJsonNode(string rawVal)
+    private static string? FindKeyIgnoreCase(JsonObject obj, string targetKey)
+    {
+        foreach (var kv in obj)
+        {
+            if (string.Equals(kv.Key, targetKey, StringComparison.OrdinalIgnoreCase))
+                return kv.Key;
+        }
+        return null;
+    }
+
+    private static JsonNode? ParseSetValueForField(string schemaKey, string topKey, string? childKey, string rawVal)
     {
         var trimmed = rawVal.Trim();
-        if (string.Equals(trimmed, "null", StringComparison.OrdinalIgnoreCase)) return null;
-        if (string.Equals(trimmed, "true", StringComparison.OrdinalIgnoreCase)) return JsonValue.Create(true);
-        if (string.Equals(trimmed, "false", StringComparison.OrdinalIgnoreCase)) return JsonValue.Create(false);
-        if (int.TryParse(trimmed, out int intVal)) return JsonValue.Create(intVal);
-        if ((trimmed.StartsWith('{') && trimmed.EndsWith('}')) || (trimmed.StartsWith('[') && trimmed.EndsWith(']')))
+        var topLower = topKey.ToLowerInvariant();
+        var childLower = childKey?.ToLowerInvariant();
+
+        if (childLower is not null)
         {
-            try { return JsonNode.Parse(trimmed); } catch { }
+            if (topLower == "layoutoverrides")
+                return string.Equals(trimmed, "null", StringComparison.OrdinalIgnoreCase) ? null : JsonValue.Create(rawVal);
+
+            if (schemaKey == "question:flashcard" && topLower is "front" or "back")
+            {
+                if (childLower is "text" or "imagepath")
+                    return string.Equals(trimmed, "null", StringComparison.OrdinalIgnoreCase) ? null : JsonValue.Create(rawVal);
+                return JsonValue.Create(rawVal);
+            }
+
+            return JsonValue.Create(rawVal);
         }
+
+        if (schemaKey == "question:mcq")
+        {
+            if (topLower == "ismulticorrect")
+            {
+                if (string.Equals(trimmed, "true", StringComparison.OrdinalIgnoreCase)) return JsonValue.Create(true);
+                if (string.Equals(trimmed, "false", StringComparison.OrdinalIgnoreCase)) return JsonValue.Create(false);
+                return JsonValue.Create(rawVal);
+            }
+            if (topLower == "maxoptions")
+            {
+                if (int.TryParse(trimmed, NumberStyles.Integer, CultureInfo.InvariantCulture, out int intVal))
+                    return JsonValue.Create(intVal);
+                return JsonValue.Create(rawVal);
+            }
+        }
+
+        if (topLower is "options" or "layoutoverrides" or "front" or "back")
+        {
+            if (string.Equals(trimmed, "null", StringComparison.OrdinalIgnoreCase)) return null;
+            if ((trimmed.StartsWith('{') && trimmed.EndsWith('}')) || (trimmed.StartsWith('[') && trimmed.EndsWith(']')))
+            {
+                try { return JsonNode.Parse(trimmed); } catch { }
+            }
+            return JsonValue.Create(rawVal);
+        }
+
+        bool isNullableString = (schemaKey, topLower) switch
+        {
+            ("session" or "quiz", "description") => true,
+            (_, "ref") => true,
+            ("articleBlock:image", "caption" or "alt") => true,
+            ("articleBlock:callout", "title") => true,
+            ("question:mcq", "imagepath" or "explanation") => true,
+            _ => false
+        };
+
+        if (isNullableString && string.Equals(trimmed, "null", StringComparison.OrdinalIgnoreCase))
+            return null;
+
         return JsonValue.Create(rawVal);
     }
 
@@ -324,11 +403,14 @@ public sealed class PatchEntityHandler(
         }
         if (TryGetProp(patch, "imagePath", out var imgNode))
         {
-            if (imgNode is null || imgNode.GetValueKind() != JsonValueKind.String)
+            var rawImg = imgNode?.GetValueKind() == JsonValueKind.String ? imgNode.GetValue<string>() : null;
+            if (string.IsNullOrWhiteSpace(rawImg))
                 return new Error("Patch.InvalidValue", "'imagePath' must be a non-empty string.", ErrorType.Validation, Path: "imagePath");
-            var imgRes = await JsonQuestionMaterializer.CopyConfinedImageAsync(imgNode.GetValue<string>(), jsonDir, storageDir, contentInspector, ct);
+            var imgRes = await JsonQuestionMaterializer.CopyConfinedImageAsync(rawImg, jsonDir, storageDir, contentInspector, ct);
             if (!imgRes.IsSuccess) return imgRes.Error!;
-            var res = block.UpdateImage(imgRes.Value!);
+            if (string.IsNullOrWhiteSpace(imgRes.Value))
+                return new Error("Patch.InvalidValue", "'imagePath' must resolve to a valid image.", ErrorType.Validation, Path: "imagePath");
+            var res = block.UpdateImage(imgRes.Value);
             if (!res.IsSuccess) return res.Error!;
         }
         if (TryGetProp(patch, "caption", out var capNode))
@@ -412,24 +494,22 @@ public sealed class PatchEntityHandler(
                 return new Error("Patch.InvalidValue", "'explanation' must be a string or null.", ErrorType.Validation, Path: "explanation");
             mcq.SetExplanation(expNode?.GetValue<string>());
         }
-        if (TryGetProp(patch, "maxOptions", out var maxNode))
+        bool hasMaxOptions = TryGetProp(patch, "maxOptions", out var maxNode);
+        int maxVal = 0;
+        if (hasMaxOptions)
         {
-            if (maxNode is null || !maxNode.AsValue().TryGetValue<int>(out int maxVal))
+            if (maxNode is not JsonValue maxJsonVal || !maxJsonVal.TryGetValue<int>(out maxVal))
                 return new Error("Patch.InvalidValue", "'maxOptions' must be an integer.", ErrorType.Validation, Path: "maxOptions");
-            var res = mcq.SetMaxOptions(maxVal);
-            if (!res.IsSuccess) return res.Error!;
         }
-        if (TryGetProp(patch, "isMultiCorrect", out var multiNode))
+
+        bool hasMulti = TryGetProp(patch, "isMultiCorrect", out var multiNode);
+        bool multiVal = false;
+        if (hasMulti)
         {
-            if (multiNode is null || !multiNode.AsValue().TryGetValue<bool>(out bool multi))
+            if (multiNode is not JsonValue multiJsonVal || !multiJsonVal.TryGetValue<bool>(out multiVal))
                 return new Error("Patch.InvalidValue", "'isMultiCorrect' must be a boolean.", ErrorType.Validation, Path: "isMultiCorrect");
-            if (multi) mcq.ConvertToMultiple();
-            else
-            {
-                var res = mcq.ConvertToSingle();
-                if (!res.IsSuccess) return res.Error!;
-            }
         }
+
         if (TryGetProp(patch, "options", out var optsNode))
         {
             if (optsNode is not JsonArray optsArr)
@@ -457,6 +537,20 @@ public sealed class PatchEntityHandler(
                 }
             }
 
+            bool effectiveMulti = hasMulti ? multiVal : mcq.IsMultiCorrect;
+            var seenIndices = new HashSet<int>();
+            int correctCount = 0;
+            for (int i = 0; i < parsedOpts.Count; i++)
+            {
+                var o = parsedOpts[i];
+                int idx = o.Index > 0 ? o.Index : i + 1;
+                if (!seenIndices.Add(idx))
+                    return new Error("Json.DuplicateOptionIndex", $"MCQ contains duplicate option index {idx}.", ErrorType.Validation, Path: $"options[{i}]");
+                if (o.IsCorrect) correctCount++;
+            }
+            if (!effectiveMulti && correctCount > 1)
+                return new Error("Question.MultipleCorrectInSingle", $"Single-select MCQ specifies {correctCount} correct options. Set 'isMultiCorrect': true or mark only one option correct.", ErrorType.Validation, Path: "options");
+
             // Materialize images first before clearing existing options
             var materialized = new List<(int Index, string? Text, string? Img, bool IsCorrect)>(parsedOpts.Count);
             for (int i = 0; i < parsedOpts.Count; i++)
@@ -468,7 +562,26 @@ public sealed class PatchEntityHandler(
                 materialized.Add((idx, o.Text, imgRes.Value, o.IsCorrect));
             }
 
+            // Validate maxOptions bounds before mutating
+            if (hasMaxOptions && (maxVal < 2 || maxVal > 26))
+                return QuestionErrors.InvalidMaxOptions(maxVal);
+
             mcq.ClearOptions();
+            if (hasMaxOptions)
+            {
+                var maxRes = mcq.SetMaxOptions(maxVal);
+                if (!maxRes.IsSuccess) return maxRes.Error!;
+            }
+            if (hasMulti)
+            {
+                if (multiVal) mcq.ConvertToMultiple();
+                else
+                {
+                    var singleRes = mcq.ConvertToSingle();
+                    if (!singleRes.IsSuccess) return singleRes.Error!;
+                }
+            }
+
             foreach (var (idx, txt, img, isCorrect) in materialized)
             {
                 var optRes = mcq.SetOption(idx, txt, img);
@@ -477,6 +590,23 @@ public sealed class PatchEntityHandler(
                 {
                     var markRes = mcq.MarkCorrect(idx);
                     if (!markRes.IsSuccess) return markRes.Error!;
+                }
+            }
+        }
+        else
+        {
+            if (hasMaxOptions)
+            {
+                var res = mcq.SetMaxOptions(maxVal);
+                if (!res.IsSuccess) return res.Error!;
+            }
+            if (hasMulti)
+            {
+                if (multiVal) mcq.ConvertToMultiple();
+                else
+                {
+                    var res = mcq.ConvertToSingle();
+                    if (!res.IsSuccess) return res.Error!;
                 }
             }
         }
@@ -532,16 +662,30 @@ public sealed class PatchEntityHandler(
             if (imgNode is null) card.ClearSideImage(face);
             else if (imgNode.GetValueKind() == JsonValueKind.String)
             {
-                var copyRes = await JsonQuestionMaterializer.CopyConfinedImageAsync(imgNode.GetValue<string>(), jsonDir, storageDir, contentInspector, ct);
-                if (!copyRes.IsSuccess) return copyRes.Error!;
-                if (copyRes.Value is not null) card.SetSideImage(face, copyRes.Value);
+                var rawImg = imgNode.GetValue<string>();
+                if (string.IsNullOrWhiteSpace(rawImg))
+                {
+                    card.ClearSideImage(face);
+                }
+                else
+                {
+                    var copyRes = await JsonQuestionMaterializer.CopyConfinedImageAsync(rawImg, jsonDir, storageDir, contentInspector, ct);
+                    if (!copyRes.IsSuccess) return copyRes.Error!;
+                    if (string.IsNullOrWhiteSpace(copyRes.Value))
+                        return new Error("Patch.InvalidValue", "Flashcard side 'imagePath' must resolve to a valid image.", ErrorType.Validation, Path: $"{face.ToString().ToLowerInvariant()}.imagePath");
+                    var imgRes = card.SetSideImage(face, copyRes.Value);
+                    if (!imgRes.IsSuccess) return imgRes.Error!;
+                }
             }
-            else return new Error("Patch.InvalidValue", "Flashcard side 'imagePath' must be a string or null.", ErrorType.Validation);
+            else return new Error("Patch.InvalidValue", "Flashcard side 'imagePath' must be a string or null.", ErrorType.Validation, Path: $"{face.ToString().ToLowerInvariant()}.imagePath");
         }
 
         if (TryGetProp(sideObj, "position", out var posNode) || TryGetProp(sideObj, "textPosition", out posNode))
         {
-            var rawPos = posNode?.GetValue<string>()?.Trim().ToLowerInvariant();
+            if (posNode is null || posNode.GetValueKind() != JsonValueKind.String)
+                return new Error("Patch.InvalidValue", "Flashcard side 'position' must be 'belowImage' or 'aboveImage'.", ErrorType.Validation, Path: $"{face.ToString().ToLowerInvariant()}.position");
+
+            var rawPos = posNode.GetValue<string>().Trim().ToLowerInvariant();
             switch (rawPos)
             {
                 case "aboveimage":

@@ -116,9 +116,8 @@ public sealed partial class EntityAddressResolver(IWorkspaceRepository repositor
             int.TryParse(compMatch.Groups["c"].Value, out int compIdx))
         {
             var comp = session.Components.FirstOrDefault(c => c.Index == compIdx);
-            return comp is null
-                ? AddressErrors.NotFound(fullAddress)
-                : new ResolvedEntity("component", comp.Id, session.Id, storageDir, Session: session, Component: comp, Quiz: comp.Quiz);
+            if (comp is not null)
+                return new ResolvedEntity("component", comp.Id, session.Id, storageDir, Session: session, Component: comp, Quiz: comp.Quiz);
         }
 
         if (BlockPathRegex().Match(subPath) is { Success: true } blockMatch &&
@@ -177,9 +176,8 @@ public sealed partial class EntityAddressResolver(IWorkspaceRepository repositor
             int.TryParse(qMatch.Groups["q"].Value, out int qIdx))
         {
             var question = quiz.Questions.FirstOrDefault(q => q.Index == qIdx);
-            return question is null
-                ? AddressErrors.NotFound(fullAddress)
-                : new ResolvedEntity("question", question.Id, quiz.Id, storageDir, Quiz: quiz, Question: question);
+            if (question is not null)
+                return new ResolvedEntity("question", question.Id, quiz.Id, storageDir, Quiz: quiz, Question: question);
         }
 
         var refNorm = subPath.ToLowerInvariant();

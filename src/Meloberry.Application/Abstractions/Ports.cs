@@ -57,7 +57,9 @@ public sealed record DeclarativeApplySpec(
     IReadOnlyList<DeclarativeArticleBlockSpec>? Blocks,
     IReadOnlyList<JsonQuestionSpec>? Questions,
     Dictionary<string, string>? LayoutOverrides,
-    string? AssetBaseDirectory = null);
+    string? AssetBaseDirectory = null,
+    string? Ref = null,
+    IReadOnlyList<string>? Order = null);
 
 public interface IDeclarativeSpecLoader
 {
@@ -139,7 +141,7 @@ public interface IWorkspaceRepository
     Task<ArticleBlockLookupContext?> FindArticleBlockAsync(string artCompId, CancellationToken cancellationToken = default);
     Task<QuizOwnerContext?> FindQuizContainerAsync(string quizOrComponentId, CancellationToken cancellationToken = default);
     Task<QuestionOwnerContext?> FindQuestionOwnerAsync(string questionId, CancellationToken cancellationToken = default);
-    Task<IReadOnlyList<WorkspaceListItem>> ListWorkspacesAsync(string? directoryFilter = null, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<WorkspaceListItem>> ListWorkspacesAsync(string? directoryFilter = null, bool includeAll = false, CancellationToken cancellationToken = default);
     Task SaveOwnerAsync(QuizOwnerContext owner, CancellationToken cancellationToken = default);
 }
 

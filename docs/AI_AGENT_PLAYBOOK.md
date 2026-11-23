@@ -4,7 +4,7 @@ Minimal-token execution rules for driving `mby` deterministically.
 
 ## Conventions
 
-1. **Discover lazily**: Run `mby prime` once or `mby <cmd> --help`. Query `mby spec <type...>` (including `callout`, `markdown`, `analyze`, `pkg`, `build`) for exact limits and schemas.
+1. **Discover lazily**: Run `mby prime` once or `mby <cmd> --help`. Query `mby spec <type...>` (including `callout`, `markdown`, `analyze`, `pkg`, `build`, `batch`, `patch`) for exact limits and schemas.
 2. **Use `MBY_AGENT=1` or `--json`**: Receive single-line minified JSON (`--quiet` omits large ID arrays).
 3. **Prefer Markdown & Modular Directories**: Author `./articles/*.md` (YAML frontmatter + `![alt](path "caption")` + `:::callout` + GFM tables) + quiz `.json` files instead of escaping long prose inside JSON strings.
 4. **Address with `#path` or `#ref`**: Component `ref` values auto-slugify cleanly when omitted, or set explicit `"ref": "slug"` (`<=32` chars).

@@ -53,6 +53,17 @@ internal static class JsonQuestionMaterializer
             }
             if (spec.IsMultiCorrect) mcq.ConvertToMultiple();
 
+            var seenIndices = new HashSet<int>();
+            int correctCount = 0;
+            foreach (var opt in spec.Options)
+            {
+                if (!seenIndices.Add(opt.Index))
+                    return new Error("Json.DuplicateOptionIndex", $"MCQ contains duplicate option index {opt.Index}.", ErrorType.Validation, Path: "options");
+                if (opt.IsCorrect) correctCount++;
+            }
+            if (!spec.IsMultiCorrect && correctCount > 1)
+                return new Error("Question.MultipleCorrectInSingle", $"Single-select MCQ specifies {correctCount} correct options. Set 'isMultiCorrect': true or mark only one option correct.", ErrorType.Validation, Path: "options");
+
             foreach (var opt in spec.Options)
             {
                 var imgRes = await CopyConfinedImageAsync(opt.ImagePath, jsonBaseDirectory, storageDirectory, contentInspector, cancellationToken, specRootDirectory, workspaceCwdDirectory);

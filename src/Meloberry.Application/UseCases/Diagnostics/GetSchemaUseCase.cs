@@ -43,7 +43,7 @@ public sealed record SchemaLayoutPropertySpec(
 public sealed class GetSchemaHandler
 {
     public static readonly IReadOnlyList<string> SupportedTopics =
-        ["session", "article", "quiz", "text", "image", "mcq", "flashcard", "layouts", "callout", "markdown", "analyze", "pkg", "build"];
+        ["session", "article", "quiz", "text", "image", "mcq", "flashcard", "layouts", "callout", "markdown", "analyze", "pkg", "build", "batch", "patch"];
 
     public Task<Result<GetSchemaResponse>> HandleAsync(GetSchemaQuery query, CancellationToken cancellationToken = default)
     {
@@ -83,6 +83,8 @@ public sealed class GetSchemaHandler
                 case "analyze": schemas.Add(BuildAnalyzeSchema()); break;
                 case "pkg": schemas.Add(BuildPkgSchema()); break;
                 case "build": schemas.Add(BuildBuildSchema()); break;
+                case "batch": schemas.Add(BuildBatchSchema()); break;
+                case "patch": schemas.Add(BuildPatchSchema()); break;
             }
         }
 
@@ -352,7 +354,7 @@ public sealed class GetSchemaHandler
                 new("--headless", "boolean", false, "Zero-touch headless Edge/Chrome CDP check (slides, images, overflow, KaTeX, console errors -> reports/verify.latest.json)."),
                 new("--static-only", "boolean", false, "Validate HTML/JS/CSS/DATA/asset existence without launching a browser."),
                 new("--timeout", "integer", false, "Headless browser timeout in seconds (default 30).", null, null, null, 5, 180),
-                new("--live", "boolean", false, "Launch interactive browser preview + /__mby_analysis endpoint to record *.analysis.json."),
+                new("--live", "boolean", false, "Launch interactive browser preview + /api/analysis endpoint to record *.analysis.json."),
                 new("--all", "boolean", false, "Aggregate all saved *.analysis.json reports in <webDir>/reports.")
             ],
             Example: new { command = "mby analyze ./study_web --headless --json" });
@@ -366,13 +368,14 @@ public sealed class GetSchemaHandler
                 // Import: mby pkg import <file.mbypkg> [destDir]
                 """,
             Command: "mby pkg export <wsId> <desktop|android> [outPath] [--include-layout] | mby pkg import <file.mbypkg> [destDir]",
-            Summary: "Mandatory lint runs before export; default output writes <wsId>.mbypkg into CWD.",
+            Summary: "Mandatory lint runs before export; default export writes <wsId>.mbypkg into the workspace's project root (for .meloberry/workspaces) or parent directory.",
             DisallowUnmappedProperties: false,
             Fields:
             [
                 new("targetPlatform", "string", true, "Target package consumer.", ["desktop", "android"]),
                 new("--include-layout", "boolean", false, "Bundle non-default global/entity layout overrides."),
-                new("outputPath", "string", false, "Optional .mbypkg destination path (defaults to <cwd>/<wsId>.mbypkg).")
+                new("outputPath", "string", false, "Optional .mbypkg destination path or directory (defaults to <projectRoot>/<wsId>.mbypkg for .meloberry/workspaces, else <workspaceParent>/<wsId>.mbypkg)."),
+                new("destDir", "string", false, "Optional import destination directory (defaults to CWD).")
             ],
             Example: new { exportCmd = "mby pkg export Session_123 android ./chapter2.mbypkg --json" });
 
@@ -381,19 +384,82 @@ public sealed class GetSchemaHandler
             Topic: "build",
             CompactSignature: """
                 // Compile Study WebApp from Workspace ID, JSON, Markdown file, or Directory
-                // mby build <addr|spec.json|article.md|dir|-> [-o webDir] [--verify] [--preview] [--no-wait] [--verbose]
+                // mby build <addr|spec.json|article.md|dir|-> [-o webDir] [--verify] [--static-only] [--ephemeral] [--timeout 30] [--preview] [--no-wait]
                 """,
-            Command: "mby build <addr|spec|dir|-> [-o webDir] [--verify] [--preview] [--no-wait] [--quiet|--verbose]",
-            Summary: "Lints workspace, compiles standalone offline HTML/CSS/JS (+ search index), optionally runs --verify CDP check.",
+            Command: "mby build <addr|spec|dir|-> [-o webDir] [--verify] [--static-only] [--ephemeral] [--timeout 30] [--preview] [--no-wait] [--quiet|--verbose]",
+            Summary: "Lints workspace, compiles standalone offline HTML/CSS/JS (+ search index), optionally runs --verify CDP or --static-only check.",
             DisallowUnmappedProperties: false,
             Fields:
             [
-                new("target", "string", true, "Existing Session_*/Set_* ID, spec file, Markdown directory, or '-'."),
-                new("-o", "string", false, "Output web directory (defaults to <id>_web in project root)."),
+                new("target", "string", true, "Existing Session_*/Set_* ID (or workspace DB folder), spec file, Markdown directory, or '-'."),
+                new("-o", "string", false, "Output web directory (defaults to <projectRoot>/<id>_web or <workspaceParent>/<id>_web for existing workspaces; ./mby_web for one-shot builds)."),
                 new("--verify", "boolean", false, "Run headless browser verification immediately after building (exits 2 on failure)."),
-                new("--preview", "boolean", false, "Open interactive local preview server.")
+                new("--static-only", "boolean", false, "Run static HTML/JS/CSS/DATA/asset verification without launching a browser."),
+                new("--ephemeral", "boolean", false, "For one-shot builds, compile inside a temporary workspace and delete it afterwards."),
+                new("--timeout", "integer", false, "Headless browser verification timeout in seconds (default 30).", null, null, null, 5, 180),
+                new("--preview", "boolean", false, "Open interactive local preview server."),
+                new("--no-wait", "boolean", false, "Exit immediately after printing preview URL (with --preview).")
             ],
             Example: new { buildCmd = "mby build ./articles/ -o ./study_web --verify --json" });
+
+    private static SchemaTopicDefinition BuildBatchSchema() =>
+        new(
+            Topic: "batch",
+            CompactSignature: """
+                // Atomic JSON operations array (rolls back all steps on any failure; $0.id / $prev.id substitution in addr)
+                // Ops: apply | patch | rm | check | build | pkg | layout
+                // [{ op:"apply", spec:{...}, out?:"...", build?:"...", verify?:bool, staticOnly?:bool, timeout?:int },
+                //  { op:"patch", addr:"$0.id", data?:{...}, set?:["k=v"], move?:"1:shift" },
+                //  { op:"check"|"rm"|"build"|"pkg", addr:"$0.id", ... },
+                //  { op:"layout", target:"mcq", property:"optionColumns", value:"2" }]
+                """,
+            Command: "mby batch <file|->",
+            Summary: "Executes a non-empty JSON array of operations atomically in one transaction with $0.id/$prev.id chaining.",
+            DisallowUnmappedProperties: false,
+            Fields:
+            [
+                new("op", "string", true, "Operation kind for the step.", ["apply", "patch", "rm", "check", "build", "pkg", "layout"]),
+                new("addr", "string", false, "Target address (alias: target); supports $0.id..$N.id and $prev.id placeholders."),
+                new("spec", "object", false, "Inline declarative spec for 'apply' (or pass 'file')."),
+                new("data", "object", false, "Patch JSON object for 'patch' (alias: patch; or pass 'file', 'set', 'move')."),
+                new("set", "array<string>", false, "Array of 'key=value' strings for 'patch'."),
+                new("move", "string", false, "Reorder spec '<index>:<shift|exchange>' for 'patch'."),
+                new("out", "string", false, "Output directory/path for 'apply', 'build', or 'pkg'."),
+                new("platform", "string", false, "Package platform for 'pkg' (default 'desktop').", ["desktop", "android"]),
+                new("includeLayout", "boolean", false, "Bundle layout overrides for 'pkg'."),
+                new("property", "string", false, "Layout property name for 'layout' (with 'target' and 'value').")
+            ],
+            Example: new object[]
+            {
+                new { op = "apply", spec = new { kind = "quiz", quizType = "mcq", name = "Draft" } },
+                new { op = "patch", addr = "$0.id", data = new { name = "Final Quiz" } },
+                new { op = "check", addr = "$0.id" }
+            });
+
+    private static SchemaTopicDefinition BuildPatchSchema() =>
+        new(
+            Topic: "patch",
+            CompactSignature: """
+                // Surgical partial update / reorder by ID, #path, or #ref (strict per-entity keys; null clears nullable fields/overrides)
+                // session|quiz: { name?, description? } | component: { title?, ref?, layoutOverrides? }
+                // block(text): { text?, ref? } | block(image): { imagePath?, caption?, alt?, ref? } | block(callout): { tone?, title?, text?, ref? }
+                // mcq: { text?, imagePath?, explanation?, isMultiCorrect?, maxOptions?, options?, ref?, layoutOverrides? }
+                // flashcard: { front?:{text?,imagePath?,position?}, back?:{text?,imagePath?,position?}, ref?, layoutOverrides? }
+                """,
+            Command: "mby patch <addr> [file|-] [--set k=v] [--move idx:shift|exchange]",
+            Summary: "Updates allowed fields of an existing entity via JSON object and/or repeatable --set k=v, or reorders with --move.",
+            DisallowUnmappedProperties: true,
+            Fields:
+            [
+                new("addr", "string", true, "Target entity ID, <wsId>#c<n>[.b<m>|.q<m>], <setId>#q<m>, or <wsId>#<ref>."),
+                new("--set", "string", false, "Repeatable key=value update; supports dot paths (layoutOverrides.<k>=<v|null>, front.text=...)."),
+                new("--move", "string", false, "Reorder component, block, or question to 1-based index: '<idx>:shift' or '<idx>:exchange'."),
+                new("layoutOverrides", "object<string,string|null>", false, "Set bounded overrides or clear an override key with null (component/question).")
+            ],
+            Example: new
+            {
+                command = "mby patch Session_123#c2.q1 --set text=\"Updated prompt\" --set layoutOverrides.optionColumns=2 --json"
+            });
 
     private static IReadOnlyList<SchemaLayoutPropertySpec> BuildLayoutSpecs()
     {

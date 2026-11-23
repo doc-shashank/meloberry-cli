@@ -9,7 +9,9 @@ public sealed class MeloberryStorageOptions
 
     private static string ResolveDefaultAppDataDirectory()
     {
-        var overrideDir = Environment.GetEnvironmentVariable("MELOBERRY_APPDATA");
+        var overrideDir = Environment.GetEnvironmentVariable("MBY_APP_DATA");
+        if (string.IsNullOrWhiteSpace(overrideDir))
+            overrideDir = Environment.GetEnvironmentVariable("MELOBERRY_APPDATA");
         return !string.IsNullOrWhiteSpace(overrideDir)
             ? Path.GetFullPath(overrideDir)
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Meloberry");

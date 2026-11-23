@@ -21,7 +21,8 @@ public sealed record ApplySpecCommand(
     bool Verbose = false,
     bool VerifyWeb = false,
     bool StaticVerifyOnly = false,
-    int VerifyTimeoutSeconds = 30);
+    int VerifyTimeoutSeconds = 30,
+    bool Ephemeral = false);
 
 public sealed record AppliedComponentSummary(
     string P,
@@ -62,6 +63,12 @@ public sealed class ApplySpecHandler(
 {
     public async Task<Result<ApplySpecResponse>> HandleAsync(ApplySpecCommand command, CancellationToken cancellationToken = default)
     {
+        if ((command.VerifyWeb || command.StaticVerifyOnly) && string.IsNullOrWhiteSpace(command.BuildOutDir))
+            return new Error("Cli.InvalidArgs", "Options '--verify' and '--static-only' require '--build <webDir>'.", ErrorType.Validation);
+
+        if (command.Ephemeral && !string.IsNullOrWhiteSpace(command.TargetAddress))
+            return new Error("Cli.InvalidArgs", "Option '--ephemeral' cannot be used when appending to an existing workspace.", ErrorType.Validation);
+
         var loadRes = command.InlineJson is not null
             ? await specLoader.LoadFromTextAsync(command.InlineJson, cancellationToken)
             : await specLoader.LoadAsync(command.JsonFilePath ?? string.Empty, cancellationToken);
@@ -90,10 +97,15 @@ public sealed class ApplySpecHandler(
         var addedBlocks = new List<string>();
         var addedQuestions = new List<string>();
 
+        string? ephemeralRoot = command.Ephemeral && !command.DryRun
+            ? Path.Combine(Path.GetTempPath(), $"mby_ephemeral_{Guid.NewGuid():N}")
+            : null;
+        var effectiveWorkingDir = ephemeralRoot ?? command.WorkingDirectory;
+
         Result<ApplySpecResponse> applyRes;
         if (string.IsNullOrWhiteSpace(command.TargetAddress))
         {
-            applyRes = await CreateNewWorkspaceAsync(spec, command.WorkingDirectory, command.DryRun, command.Quiet, command.Verbose, jsonDir, cwd, addedComponents, addedBlocks, addedQuestions, cancellationToken);
+            applyRes = await CreateNewWorkspaceAsync(spec, effectiveWorkingDir, command.DryRun, command.Quiet, command.Verbose, jsonDir, cwd, addedComponents, addedBlocks, addedQuestions, cancellationToken);
         }
         else
         {
@@ -111,43 +123,65 @@ public sealed class ApplySpecHandler(
         }
 
         if (!applyRes.IsSuccess || command.DryRun)
+        {
+            if (ephemeralRoot is not null) CleanupDirectory(ephemeralRoot);
             return applyRes;
+        }
 
         var res = applyRes.Value;
-        string? webOut = null;
-        string? pkgOut = null;
-        ApplyLintSummary? lintSummary = res.Lint;
-        WebAppVerificationReport? verifyReport = null;
-
-        if (!string.IsNullOrWhiteSpace(command.BuildOutDir))
+        try
         {
-            var buildRes = await buildWebHandler.HandleAsync(
-                new BuildWebAppCommand(res.TargetId, command.BuildOutDir, command.VerifyWeb, command.Verbose, command.Quiet, command.StaticVerifyOnly, command.VerifyTimeoutSeconds),
-                cancellationToken);
-            if (!buildRes.IsSuccess) return buildRes.Error!;
-            webOut = buildRes.Value.IndexHtmlPath;
-            lintSummary = buildRes.Value.Lint;
-            verifyReport = buildRes.Value.Verify;
+            string? webOut = null;
+            string? pkgOut = null;
+            ApplyLintSummary? lintSummary = res.Lint;
+            WebAppVerificationReport? verifyReport = null;
+
+            if (!string.IsNullOrWhiteSpace(command.BuildOutDir))
+            {
+                var buildRes = await buildWebHandler.HandleAsync(
+                    new BuildWebAppCommand(res.TargetId, command.BuildOutDir, command.VerifyWeb, command.Verbose, command.Quiet, command.StaticVerifyOnly, command.VerifyTimeoutSeconds),
+                    cancellationToken);
+                if (!buildRes.IsSuccess) return buildRes.Error!;
+                webOut = buildRes.Value.IndexHtmlPath;
+                lintSummary = buildRes.Value.Lint;
+                verifyReport = buildRes.Value.Verify;
+            }
+
+            if (!string.IsNullOrWhiteSpace(command.ExportSpec))
+            {
+                var colonIdx = command.ExportSpec.IndexOf(':');
+                var platform = colonIdx >= 0 ? command.ExportSpec[..colonIdx] : command.ExportSpec;
+                var outPath = colonIdx >= 0 && colonIdx + 1 < command.ExportSpec.Length ? command.ExportSpec[(colonIdx + 1)..] : null;
+                var expRes = await exportHandler.HandleAsync(new ExportPackageCommand(res.TargetId, outPath, platform), cancellationToken);
+                if (!expRes.IsSuccess) return expRes.Error!;
+                pkgOut = expRes.Value.PackagePath;
+                lintSummary = new ApplyLintSummary(expRes.Value.LintReport.IsClean, expRes.Value.LintReport.ErrorCount, expRes.Value.LintReport.WarningCount);
+            }
+
+            return res with
+            {
+                CreatedWorkspace = command.Ephemeral ? false : res.CreatedWorkspace,
+                Lint = lintSummary,
+                WebOutputPath = webOut,
+                PackagePath = pkgOut,
+                Verify = verifyReport
+            };
         }
-
-        if (!string.IsNullOrWhiteSpace(command.ExportSpec))
+        finally
         {
-            var colonIdx = command.ExportSpec.IndexOf(':');
-            var platform = colonIdx >= 0 ? command.ExportSpec[..colonIdx] : command.ExportSpec;
-            var outPath = colonIdx >= 0 && colonIdx + 1 < command.ExportSpec.Length ? command.ExportSpec[(colonIdx + 1)..] : null;
-            var expRes = await exportHandler.HandleAsync(new ExportPackageCommand(res.TargetId, outPath, platform), cancellationToken);
-            if (!expRes.IsSuccess) return expRes.Error!;
-            pkgOut = expRes.Value.PackagePath;
-            lintSummary = new ApplyLintSummary(expRes.Value.LintReport.IsClean, expRes.Value.LintReport.ErrorCount, expRes.Value.LintReport.WarningCount);
+            if (command.Ephemeral)
+            {
+                try
+                {
+                    if (string.Equals(res.EntityKind, "session", StringComparison.OrdinalIgnoreCase))
+                        await repository.DeleteSessionAsync(res.TargetId, CancellationToken.None);
+                    else if (string.Equals(res.EntityKind, "quiz", StringComparison.OrdinalIgnoreCase))
+                        await repository.DeleteQuizAsync(res.TargetId, CancellationToken.None);
+                }
+                catch { }
+                if (ephemeralRoot is not null) CleanupDirectory(ephemeralRoot);
+            }
         }
-
-        return res with
-        {
-            Lint = lintSummary,
-            WebOutputPath = webOut,
-            PackagePath = pkgOut,
-            Verify = verifyReport
-        };
     }
 
     private async Task<Result<ApplySpecResponse>> CreateNewWorkspaceAsync(
@@ -163,8 +197,8 @@ public sealed class ApplySpecHandler(
         List<string> addedQuestions,
         CancellationToken ct)
     {
-        if (spec.LayoutOverrides is { Count: > 0 })
-            return new Error("Json.InvalidFieldForType", "Top-level 'layoutOverrides' belong on components or individual questions, not workspace roots.", ErrorType.Validation);
+        if (spec.Order is { Count: > 0 })
+            return new Error("Json.InvalidFieldForType", "Top-level 'order' is only supported in directory manifests ('_session.md' or 'session.json').", ErrorType.Validation);
 
         var baseDir = string.IsNullOrWhiteSpace(workingDirectory)
             ? Path.Combine(cwd, ".meloberry", "workspaces")
@@ -180,18 +214,30 @@ public sealed class ApplySpecHandler(
 
         if (kind == "article")
         {
+            if (spec.Components is { Count: > 0 } || spec.Questions is { Count: > 0 })
+                return new Error("Json.InvalidFieldForType", "Article spec cannot include 'components' or 'questions'.", ErrorType.Validation);
+
             spec = spec with
             {
                 Kind = "session",
                 Name = spec.Name ?? spec.Title ?? "Study Session",
                 Components =
                 [
-                    new DeclarativeComponentSpec("article", spec.Title ?? spec.Name, null, spec.Blocks, null, spec.LayoutOverrides, null, jsonDir)
+                    new DeclarativeComponentSpec("article", spec.Title ?? spec.Name, null, spec.Blocks, null, spec.LayoutOverrides, spec.Ref, jsonDir)
                 ],
                 Blocks = null,
-                LayoutOverrides = null
+                LayoutOverrides = null,
+                Ref = null
             };
             kind = "session";
+        }
+
+        if (kind is "session" or "quiz" or "mcq" or "flashcard" or "mixed")
+        {
+            if (spec.LayoutOverrides is { Count: > 0 })
+                return new Error("Json.InvalidFieldForType", "Top-level 'layoutOverrides' belong on components or individual questions, not workspace roots.", ErrorType.Validation);
+            if (!string.IsNullOrWhiteSpace(spec.Ref))
+                return new Error("Json.InvalidFieldForType", "Top-level 'ref' belongs on components, blocks, or questions, not workspace roots.", ErrorType.Validation);
         }
 
         if (kind == "session")
@@ -224,9 +270,11 @@ public sealed class ApplySpecHandler(
                     session.SetDescription(spec.Description);
 
                 var usedRefs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var compSpec in spec.Components ?? [])
+                var compsList = spec.Components ?? [];
+                var reservedExplicitRefs = CollectExplicitSpecRefs(compsList);
+                foreach (var compSpec in compsList)
                 {
-                    var addCompRes = await AddComponentFromSpecAsync(session, storageDir, compSpec, jsonDir, cwd, usedRefs, addedComponents, addedBlocks, addedQuestions, ct);
+                    var addCompRes = await AddComponentFromSpecAsync(session, storageDir, compSpec, jsonDir, cwd, usedRefs, reservedExplicitRefs, addedComponents, addedBlocks, addedQuestions, ct);
                     if (!addCompRes.IsSuccess)
                     {
                         CleanupDirectory(storageDir);
@@ -346,36 +394,58 @@ public sealed class ApplySpecHandler(
         List<string> addedQuestions,
         CancellationToken ct)
     {
-        if (!string.IsNullOrWhiteSpace(spec.Name))
-        {
-            var nameRes = session.SetName(spec.Name);
-            if (!nameRes.IsSuccess) return nameRes.Error!;
-        }
-        if (spec.Description is not null)
-            session.SetDescription(spec.Description);
+        if (spec.Order is { Count: > 0 })
+            return new Error("Json.InvalidFieldForType", "Top-level 'order' is only supported in directory manifests ('_session.md' or 'session.json').", ErrorType.Validation);
 
         var compsToAdd = new List<DeclarativeComponentSpec>();
+        bool isSingleComponentSpec = false;
         if (spec.Components is { Count: > 0 })
         {
             if (spec.Blocks is { Count: > 0 } || spec.Questions is { Count: > 0 })
                 return new Error("Json.InvalidFieldForType", "Cannot mix 'components[]' with root 'blocks' or 'questions'.", ErrorType.Validation);
+            if (spec.LayoutOverrides is { Count: > 0 })
+                return new Error("Json.InvalidFieldForType", "Top-level 'layoutOverrides' belong on components or individual questions, not session roots.", ErrorType.Validation);
+            if (!string.IsNullOrWhiteSpace(spec.Ref))
+                return new Error("Json.InvalidFieldForType", "Top-level 'ref' belongs on components, blocks, or questions, not session roots.", ErrorType.Validation);
             compsToAdd.AddRange(spec.Components);
         }
         else if (spec.Blocks is { Count: > 0 } || spec.Questions is { Count: > 0 } ||
                  (spec.Kind is not null && !string.Equals(spec.Kind, "session", StringComparison.OrdinalIgnoreCase)))
         {
+            isSingleComponentSpec = true;
             var singleKind = spec.Kind ?? (spec.Blocks is { Count: > 0 } ? "article" : "quiz");
             compsToAdd.Add(new DeclarativeComponentSpec(
-                singleKind, spec.Title, spec.QuizType, spec.Blocks, spec.Questions, spec.LayoutOverrides));
+                singleKind, spec.Title ?? spec.Name, spec.QuizType, spec.Blocks, spec.Questions, spec.LayoutOverrides, spec.Ref, jsonDir));
+        }
+        else
+        {
+            if (spec.LayoutOverrides is { Count: > 0 })
+                return new Error("Json.InvalidFieldForType", "Top-level 'layoutOverrides' belong on components or individual questions, not session roots.", ErrorType.Validation);
+            if (!string.IsNullOrWhiteSpace(spec.Ref))
+                return new Error("Json.InvalidFieldForType", "Top-level 'ref' belongs on components, blocks, or questions, not session roots.", ErrorType.Validation);
+        }
+
+        if (!isSingleComponentSpec)
+        {
+            if (!string.IsNullOrWhiteSpace(spec.Name))
+            {
+                var nameRes = session.SetName(spec.Name);
+                if (!nameRes.IsSuccess) return nameRes.Error!;
+            }
+            if (spec.Description is not null)
+                session.SetDescription(spec.Description);
         }
 
         var workingAssetRoot = dryRun ? CreateDryRunStagingCopy(realStorageDir) : realStorageDir;
+        var existingAssets = dryRun ? null : CaptureExistingAssets(realStorageDir);
+        bool persisted = false;
         try
         {
             var usedRefs = CollectSessionRefs(session);
+            var reservedExplicitRefs = CollectExplicitSpecRefs(compsToAdd);
             foreach (var compSpec in compsToAdd)
             {
-                var res = await AddComponentFromSpecAsync(session, workingAssetRoot, compSpec, jsonDir, cwd, usedRefs, addedComponents, addedBlocks, addedQuestions, ct);
+                var res = await AddComponentFromSpecAsync(session, workingAssetRoot, compSpec, jsonDir, cwd, usedRefs, reservedExplicitRefs, addedComponents, addedBlocks, addedQuestions, ct);
                 if (!res.IsSuccess) return res.Error!;
             }
 
@@ -391,6 +461,7 @@ public sealed class ApplySpecHandler(
             }
 
             await repository.SaveSessionAsync(session, ct);
+            persisted = true;
             return new ApplySpecResponse(
                 session.Id, "session", realStorageDir, CreatedWorkspace: false, DryRun: false,
                 Components: MapComponentSummaries(addedComponents),
@@ -400,6 +471,7 @@ public sealed class ApplySpecHandler(
         finally
         {
             if (dryRun) CleanupDirectory(workingAssetRoot);
+            else if (!persisted && existingAssets is not null) CleanupNewlyAddedAssets(realStorageDir, existingAssets);
         }
     }
 
@@ -417,6 +489,8 @@ public sealed class ApplySpecHandler(
         List<string> addedQuestions,
         CancellationToken ct)
     {
+        if (spec.Order is { Count: > 0 })
+            return new Error("Json.InvalidFieldForType", "Top-level 'order' is only supported in directory manifests ('_session.md' or 'session.json').", ErrorType.Validation);
         if (spec.Components is { Count: > 0 })
             return new Error("Json.InvalidFieldForType", "Cannot pass 'components[]' when targeting a single Component_*.", ErrorType.Validation);
 
@@ -425,6 +499,16 @@ public sealed class ApplySpecHandler(
         {
             var tRes = comp.SetTitle(title);
             if (!tRes.IsSuccess) return tRes.Error!;
+        }
+
+        if (!string.IsNullOrWhiteSpace(spec.Ref))
+        {
+            var existingRefs = CollectSessionRefs(session);
+            if (comp.RefKey is not null) existingRefs.Remove(comp.RefKey);
+            var refRes = comp.SetRefKey(spec.Ref);
+            if (!refRes.IsSuccess) return refRes.Error!;
+            if (comp.RefKey is not null && !existingRefs.Add(comp.RefKey))
+                return AddressErrors.DuplicateRef(comp.RefKey);
         }
 
         if (spec.LayoutOverrides is not null)
@@ -437,6 +521,8 @@ public sealed class ApplySpecHandler(
         }
 
         var workingAssetRoot = dryRun ? CreateDryRunStagingCopy(realStorageDir) : realStorageDir;
+        var existingAssets = dryRun ? null : CaptureExistingAssets(realStorageDir);
+        bool persisted = false;
         try
         {
             var usedRefs = CollectSessionRefs(session);
@@ -468,6 +554,7 @@ public sealed class ApplySpecHandler(
             }
 
             await repository.SaveSessionAsync(session, ct);
+            persisted = true;
             return new ApplySpecResponse(
                 comp.Id, "component", realStorageDir, CreatedWorkspace: false, DryRun: false,
                 AddedBlockIds: CompactIds(addedBlocks, quiet, verbose),
@@ -476,6 +563,7 @@ public sealed class ApplySpecHandler(
         finally
         {
             if (dryRun) CleanupDirectory(workingAssetRoot);
+            else if (!persisted && existingAssets is not null) CleanupNewlyAddedAssets(realStorageDir, existingAssets);
         }
     }
 
@@ -491,10 +579,14 @@ public sealed class ApplySpecHandler(
         List<string> addedQuestions,
         CancellationToken ct)
     {
+        if (spec.Order is { Count: > 0 })
+            return new Error("Json.InvalidFieldForType", "Top-level 'order' is only supported in directory manifests ('_session.md' or 'session.json').", ErrorType.Validation);
         if (spec.Components is { Count: > 0 } || spec.Blocks is { Count: > 0 })
             return new Error("Json.InvalidFieldForType", "Standalone quiz cannot accept 'components[]' or article 'blocks[]'.", ErrorType.Validation);
         if (spec.LayoutOverrides is { Count: > 0 })
             return new Error("Json.InvalidFieldForType", "Top-level 'layoutOverrides' belong on individual questions, not standalone quiz roots.", ErrorType.Validation);
+        if (!string.IsNullOrWhiteSpace(spec.Ref))
+            return new Error("Json.InvalidFieldForType", "Top-level 'ref' belongs on individual questions, not standalone quiz roots.", ErrorType.Validation);
 
         if (!string.IsNullOrWhiteSpace(spec.Name))
         {
@@ -505,6 +597,8 @@ public sealed class ApplySpecHandler(
             quiz.SetDescription(spec.Description);
 
         var workingAssetRoot = dryRun ? CreateDryRunStagingCopy(realStorageDir) : realStorageDir;
+        var existingAssets = dryRun ? null : CaptureExistingAssets(realStorageDir);
+        bool persisted = false;
         try
         {
             var usedRefs = quiz.Questions.Where(q => q.RefKey is not null).Select(q => q.RefKey!).ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -521,6 +615,7 @@ public sealed class ApplySpecHandler(
             }
 
             await repository.SaveQuizAsync(quiz, ct);
+            persisted = true;
             return new ApplySpecResponse(
                 quiz.Id, "quiz", realStorageDir, CreatedWorkspace: false, DryRun: false,
                 AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose));
@@ -528,6 +623,7 @@ public sealed class ApplySpecHandler(
         finally
         {
             if (dryRun) CleanupDirectory(workingAssetRoot);
+            else if (!persisted && existingAssets is not null) CleanupNewlyAddedAssets(realStorageDir, existingAssets);
         }
     }
 
@@ -538,6 +634,7 @@ public sealed class ApplySpecHandler(
         string specRootDir,
         string cwd,
         HashSet<string> usedRefs,
+        HashSet<string> reservedExplicitRefs,
         List<SessionComponent> addedComponents,
         List<string> addedBlocks,
         List<string> addedQuestions,
@@ -563,7 +660,10 @@ public sealed class ApplySpecHandler(
         {
             var seed = !string.IsNullOrWhiteSpace(compSpec.Title) ? compSpec.Title : $"{rawKind}-{session.Components.Count}";
             var fallback = comp.Kind == ComponentKind.Article ? "art" : "quiz";
-            var autoRef = RefKeyValidator.GenerateSlug(seed, fallback, usedRefs);
+            var autoGenAvoid = new HashSet<string>(usedRefs, StringComparer.OrdinalIgnoreCase);
+            autoGenAvoid.UnionWith(reservedExplicitRefs);
+            var autoRef = RefKeyValidator.GenerateSlug(seed, fallback, autoGenAvoid);
+            usedRefs.Add(autoRef);
             comp.SetRefKey(autoRef);
         }
 
@@ -710,6 +810,29 @@ public sealed class ApplySpecHandler(
         return ids;
     }
 
+    private static HashSet<string> CollectExplicitSpecRefs(IReadOnlyList<DeclarativeComponentSpec> components)
+    {
+        var reserved = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        static void TryReserve(string? raw, HashSet<string> set)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) return;
+            var res = RefKeyValidator.ValidateAndNormalize(raw);
+            if (res.IsSuccess && res.Value is not null) set.Add(res.Value);
+        }
+
+        foreach (var c in components)
+        {
+            TryReserve(c.Ref, reserved);
+            if (c.Blocks is not null)
+                foreach (var b in c.Blocks)
+                    TryReserve(b.Ref, reserved);
+            if (c.Questions is not null)
+                foreach (var q in c.Questions)
+                    TryReserve(q.Ref, reserved);
+        }
+        return reserved;
+    }
+
     internal static HashSet<string> CollectSessionRefs(StudySession session)
     {
         var refs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -745,6 +868,31 @@ public sealed class ApplySpecHandler(
                 File.Copy(f, Path.Combine(stagingAssets, Path.GetFileName(f)), overwrite: true);
         }
         return staging;
+    }
+
+    internal static HashSet<string> CaptureExistingAssets(string storageDir)
+    {
+        var assetsDir = Path.Combine(storageDir, "assets");
+        if (!Directory.Exists(assetsDir))
+            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        return Directory.EnumerateFiles(assetsDir)
+            .Select(Path.GetFileName)
+            .Where(n => !string.IsNullOrWhiteSpace(n))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase)!;
+    }
+
+    internal static void CleanupNewlyAddedAssets(string storageDir, HashSet<string> existingAssets)
+    {
+        var assetsDir = Path.Combine(storageDir, "assets");
+        if (!Directory.Exists(assetsDir)) return;
+        foreach (var file in Directory.EnumerateFiles(assetsDir))
+        {
+            var name = Path.GetFileName(file);
+            if (!existingAssets.Contains(name))
+            {
+                try { File.Delete(file); } catch { }
+            }
+        }
     }
 
     private static void CleanupDirectory(string storageDir)

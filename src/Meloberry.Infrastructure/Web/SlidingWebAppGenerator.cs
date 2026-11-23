@@ -9,10 +9,13 @@ using Meloberry.Domain.Questions;
 using Meloberry.Domain.Quizzes;
 using Meloberry.Domain.Sessions;
 using Meloberry.Infrastructure.Packaging;
+using Meloberry.Infrastructure.Persistence;
 
 namespace Meloberry.Infrastructure.Web;
 
-public sealed class SlidingWebAppGenerator(ICliToolMetadataProvider metadataProvider) : IWebAppGenerator
+public sealed class SlidingWebAppGenerator(
+    ICliToolMetadataProvider metadataProvider,
+    ChainTransactionManager? transactionManager = null) : IWebAppGenerator
 {
     private static readonly MarkdownPipeline MarkdownPipeline = new MarkdownPipelineBuilder().UseAdvancedExtensions().DisableHtml().Build();
     private static readonly Regex MarkdownUrlAttributeRegex = new(@"(?<attr>\b(?:href|src)\s*=\s*)(?<quote>[""'])(?<url>[^""']*)\k<quote>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -148,6 +151,7 @@ public sealed class SlidingWebAppGenerator(ICliToolMetadataProvider metadataProv
         var outDir = !string.IsNullOrWhiteSpace(outputDirectory)
             ? Path.GetFullPath(outputDirectory)
             : Path.Combine(Packaging.MbypkgExporter.ResolveDefaultOutputBaseDirectory(storageDirectory), $"{id}_web");
+        transactionManager?.NotifyOutputDirectoryMutating(outDir);
         Directory.CreateDirectory(outDir);
 
         var dstAssets = Path.Combine(outDir, "assets");
@@ -430,7 +434,7 @@ const imageZoomModal = $('imageZoomModal'), zoomTargetImg = $('zoomTargetImg'), 
 const searchModal = $('searchModal'), searchInput = $('searchInput'), searchResultsEl = $('searchResults'), searchMetaEl = $('searchMeta'), topbarSearchBtn = $('topbarSearchBtn'), greetingSearchBtn = $('greetingSearchBtn'), searchCloseBtn = $('searchCloseBtn');
 const SAVE_ICON_SVG = '<svg class="mby-save-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm-5 16c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3zm3-10H5V5h10v4z"/></svg>';
 
-let currentIndex = 0, isFinished = false, sessionStartedAt = new Date(), activeLeafEnterMs = null, autoSaveSent = false;
+let currentIndex = 0, isFinished = false, sessionStartedAt = new Date(), activeLeafEnterMs = null, lastVisitedLeafId = null, autoSaveSent = false;
 const activeQuizQuestionIdx = new Map(), quizControllers = new Map(), mcqStateMap = new Map(), flashcardStateMap = new Map();
 const leafSlides = DATA.slides.flatMap(s => (s.kind === 'quiz' && Array.isArray(s.questions)) ? s.questions : [s]);
 const slideTelemetry = leafSlides.map((s, idx) => ({
@@ -447,6 +451,16 @@ function getActiveLeafId() {
   if (!s) return null;
   if (s.kind === 'quiz' && s.questions?.length) return s.questions[Math.max(0, Math.min(activeQuizQuestionIdx.get(s.id) || 0, s.questions.length - 1))].id;
   return s.id;
+}
+function enterActiveLeaf(forceRecord = false) {
+  const leafId = getActiveLeafId();
+  if (!leafId) return;
+  if (forceRecord || leafId !== lastVisitedLeafId) {
+    const m = metricById.get(leafId);
+    if (m) m.visitedCount += 1;
+    lastVisitedLeafId = leafId;
+  }
+  activeLeafEnterMs = Date.now();
 }
 function flushActiveLeafTime() {
   if (activeLeafEnterMs === null) return;
@@ -654,25 +668,26 @@ function buildBundledQuiz(quizSlide) {
   qTrack.addEventListener('transitionend', e => { if (e.target === qTrack && e.propertyName === 'transform') requestAnimationFrame(updateScrollDownHint); });
   qViewport.addEventListener('transitionend', e => { if (e.target === qViewport && e.propertyName === 'height') requestAnimationFrame(updateScrollDownHint); });
 
-  function selectQuestion(qIdx) {
+  function selectQuestion(qIdx, opts = { recordVisit: true, flushPrevious: true, scrollToTop: true }) {
     if (questions.length === 0) return;
-    closePrevCompMenu(); flushActiveLeafTime();
+    const { recordVisit = true, flushPrevious = true, scrollToTop = true } = opts || {};
+    closePrevCompMenu();
+    if (flushPrevious) flushActiveLeafTime();
     const clamped = Math.max(0, Math.min(qIdx, questions.length - 1));
     activeQuizQuestionIdx.set(quizSlide.id, clamped);
-    const m = metricById.get(questions[clamped].id);
-    if (greetingScreen.classList.contains('hidden')) {
-      if (m && DATA.slides[currentIndex]?.id === quizSlide.id) m.visitedCount += 1;
-      activeLeafEnterMs = Date.now();
+    if (recordVisit && greetingScreen.classList.contains('hidden') && DATA.slides[currentIndex]?.id === quizSlide.id) {
+      enterActiveLeaf();
     }
     qTrack.style.transform = 'translateX(-' + (clamped * 100) + '%)';
-    refreshPills(clamped); updateNavButtonsUi(); scrollSlideToTop(wrap.closest('.mby-slide'));
+    refreshPills(clamped); updateNavButtonsUi();
+    if (scrollToTop) scrollSlideToTop(wrap.closest('.mby-slide'));
     requestAnimationFrame(() => { syncQuizViewportHeight(clamped); updateScrollDownHint(); });
   }
 
   quizControllers.set(quizSlide.id, { selectQuestion, syncHeight: () => syncQuizViewportHeight(activeQuizQuestionIdx.get(quizSlide.id) || 0), getQuestionCount: () => questions.length });
   if (quizSlide.title) wrap.appendChild(mk('div', 'mby-quiz-section-title', quizSlide.title));
   wrap.appendChild(pillsRow); wrap.appendChild(qViewport);
-  selectQuestion(activeQuizQuestionIdx.get(quizSlide.id) || 0);
+  selectQuestion(activeQuizQuestionIdx.get(quizSlide.id) || 0, { recordVisit: false, flushPrevious: false, scrollToTop: false });
   return wrap;
 }
 
@@ -700,7 +715,7 @@ function buildAnalysisMarkdown(report) {
   if (report.weakItemIds.length > 0) { lines.push('## Weak / Review Items', ''); report.weakItemIds.forEach(id => lines.push('- `' + id + '`')); lines.push(''); }
   lines.push('## Per-Slide Breakdown', '', '| # | ID | Kind | Time (s) | Visits | Result / Details |', '| :---: | :--- | :--- | ---: | ---: | :--- |');
   report.slides.forEach(s => {
-    let d = 'Viewed';
+    let d = s.visitedCount > 0 ? 'Viewed' : 'Skipped';
     if (s.kind === 'mcq') d = 'Correct: ' + (s.isCorrect === true ? 'Yes' : 'No') + ', Checks: ' + (s.checkAttempts || 0) + ', Selected: [' + (s.selectedOptionIndices || []).join(',') + ']';
     else if (s.kind === 'flashcard') d = 'Flips: ' + (s.flipCount || 0) + ', Rating: ' + (s.flashcardRating || 'unrated');
     lines.push('| ' + s.slideIndex + ' | `' + s.id + '` | ' + s.kind + ' | ' + (s.timeSpentMs / 1000).toFixed(1) + ' | ' + s.visitedCount + ' | ' + d + ' |');
@@ -750,6 +765,7 @@ function openFinishScreen(triggerSave) {
   topbarModeHint.textContent = 'Session Analysis';
 
   const report = buildAnalysisReport(), markdown = buildAnalysisMarkdown(report), metricBySlideId = new Map(report.slides.map(s => [s.id, s]));
+  activeLeafEnterMs = null;
   finishScreen.innerHTML = '';
   const body = mk('div', 'mby-card-body');
   body.appendChild(mk('div', 'mby-summary-header', null, [mk('h2', null, report.title || report.workspaceId), mk('div', 'mby-summary-meta', `${report.workspaceId}  •  Completed in ${(report.totalDurationMs / 1000).toFixed(1)}s`)]));
@@ -797,7 +813,7 @@ function openFinishScreen(triggerSave) {
 }
 
 function returnToSlides() {
-  isFinished = false; finishScreen.classList.add('hidden');
+  isFinished = false; autoSaveSent = false; finishScreen.classList.add('hidden');
   playerViewport.classList.remove('hidden'); playerControls.classList.remove('hidden'); backToSlidesBtn.classList.add('hidden');
   topbarModeHint.textContent = ''; activeLeafEnterMs = Date.now(); requestAnimationFrame(updateScrollDownHint);
 }
@@ -821,9 +837,14 @@ function updateNavButtonsUi() {
 }
 
 const activeScrollAnimMap = new WeakMap();
+function cancelScrollAnimation(slideEl) {
+  if (!slideEl) return;
+  const prevId = activeScrollAnimMap.get(slideEl);
+  if (prevId) { cancelAnimationFrame(prevId); activeScrollAnimMap.delete(slideEl); }
+}
 function scrollSlideToTop(slideEl) {
   if (!slideEl) return;
-  const prevId = activeScrollAnimMap.get(slideEl); if (prevId) cancelAnimationFrame(prevId);
+  cancelScrollAnimation(slideEl);
   const startTop = slideEl.scrollTop; if (startTop <= 0) { slideEl.scrollTop = 0; return; }
   const startMs = performance.now();
   function step(now) {
@@ -835,17 +856,21 @@ function scrollSlideToTop(slideEl) {
   activeScrollAnimMap.set(slideEl, requestAnimationFrame(step));
 }
 
-function goToSlide(idx) {
+function goToSlide(idx, targetQIdx = null, opts = {}) {
   if (DATA.slides.length === 0) return;
+  const shouldScrollToTop = opts?.scrollToTop !== false;
   closePrevCompMenu(); flushActiveLeafTime();
   currentIndex = Math.max(0, Math.min(idx, DATA.slides.length - 1));
-  const slide = DATA.slides[currentIndex], m = metricById.get(getActiveLeafId());
-  if (m) m.visitedCount += 1;
-  activeLeafEnterMs = Date.now();
+  const slide = DATA.slides[currentIndex];
+  if (slide?.kind === 'quiz' && targetQIdx !== null && targetQIdx !== undefined) {
+    quizControllers.get(slide.id)?.selectQuestion(targetQIdx, { recordVisit: false, flushPrevious: false, scrollToTop: shouldScrollToTop });
+  }
+  enterActiveLeaf();
   track.style.transform = 'translateX(-' + (currentIndex * 100) + '%)';
   updateNavButtonsUi();
   Array.from(dotsNav.children).forEach((d, i) => d.classList.toggle('active', i === currentIndex));
-  scrollSlideToTop(track.children[currentIndex]);
+  if (shouldScrollToTop) scrollSlideToTop(track.children[currentIndex]);
+  else cancelScrollAnimation(track.children[currentIndex]);
   requestAnimationFrame(() => { if (slide?.kind === 'quiz') quizControllers.get(slide.id)?.syncHeight(); updateScrollDownHint(); });
 }
 function navigatePrevious() {
@@ -923,7 +948,7 @@ function renderSlides() {
 
 startSessionBtn.addEventListener('click', () => {
   greetingScreen.classList.add('hidden'); playerTopbar.classList.remove('hidden'); playerViewport.classList.remove('hidden'); playerControls.classList.remove('hidden');
-  sessionStartedAt = new Date(); activeLeafEnterMs = null; goToSlide(0);
+  sessionStartedAt = new Date(); activeLeafEnterMs = null; lastVisitedLeafId = null; goToSlide(0);
 });
 backToSlidesBtn.addEventListener('click', returnToSlides);
 
@@ -1005,11 +1030,20 @@ function highlightMatchSnippet(rawText, tokens) {
   }
   const start = Math.max(0, center - 45);
   const end = Math.min(rawText.length, start + 165);
-  let slice = (start > 0 ? '...' : '') + rawText.slice(start, end) + (end < rawText.length ? '...' : '');
-  const escaped = escapeHtml(slice);
-  if (tokens.length === 0) return escaped;
-  const pattern = tokens.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
-  return escaped.replace(new RegExp(`(${pattern})`, 'gi'), '<mark>$1</mark>');
+  const slice = (start > 0 ? '...' : '') + rawText.slice(start, end) + (end < rawText.length ? '...' : '');
+  if (tokens.length === 0) return escapeHtml(slice);
+  const uniqueTokens = Array.from(new Set(tokens)).sort((a, b) => b.length - a.length);
+  const pattern = uniqueTokens.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+  const regex = new RegExp(pattern, 'gi');
+  let out = '', lastIdx = 0, match;
+  while ((match = regex.exec(slice)) !== null) {
+    if (match[0].length === 0) { regex.lastIndex += 1; continue; }
+    if (match.index > lastIdx) out += escapeHtml(slice.slice(lastIdx, match.index));
+    out += '<mark>' + escapeHtml(match[0]) + '</mark>';
+    lastIdx = match.index + match[0].length;
+  }
+  if (lastIdx < slice.length) out += escapeHtml(slice.slice(lastIdx));
+  return out;
 }
 
 function renderSearchResults() {
@@ -1049,18 +1083,16 @@ function jumpToSearchEntry(item) {
   closeSearchModal();
   if (!greetingScreen.classList.contains('hidden')) {
     greetingScreen.classList.add('hidden'); playerTopbar.classList.remove('hidden'); playerViewport.classList.remove('hidden'); playerControls.classList.remove('hidden');
-    sessionStartedAt = new Date(); activeLeafEnterMs = null;
+    sessionStartedAt = new Date(); activeLeafEnterMs = null; lastVisitedLeafId = null;
   } else if (isFinished) {
     returnToSlides();
   }
-  goToSlide(item.slideIdx);
-  if (item.qIdx !== null) {
-    const slide = DATA.slides[item.slideIdx];
-    quizControllers.get(slide?.id)?.selectQuestion(item.qIdx);
-  }
+  goToSlide(item.slideIdx, item.qIdx, { scrollToTop: !item.blockId });
   if (item.blockId) {
     requestAnimationFrame(() => {
-      const targetEl = track.children[item.slideIdx]?.querySelector(`[data-block-id="${CSS.escape(item.blockId)}"]`);
+      const slideEl = track.children[item.slideIdx];
+      cancelScrollAnimation(slideEl);
+      const targetEl = slideEl?.querySelector(`[data-block-id="${CSS.escape(item.blockId)}"]`);
       if (targetEl) {
         targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
         targetEl.classList.add('mby-search-pulse');

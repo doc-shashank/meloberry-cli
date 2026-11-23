@@ -29,6 +29,7 @@ public static class ArticleErrors
     public static Error BlockNotFound(string artCompId) => new("ArticleBlock.NotFound", $"Article block '{artCompId}' was not found.", ErrorType.NotFound);
     public static Error WrongBlockKind(string artCompId, string expectedKind) => new("ArticleBlock.WrongKind", $"Article block '{artCompId}' is not a {expectedKind} block.", ErrorType.Conflict);
     public static Error EmptyContent() => new("ArticleBlock.EmptyContent", "Article text block content cannot be empty.", ErrorType.Validation);
+    public static Error EmptyImagePath() => new("ArticleBlock.EmptyImagePath", "Article image block path cannot be empty.", ErrorType.Validation);
     public static Error InvalidCalloutTone(string rawTone) => new("ArticleBlock.InvalidCalloutTone", $"Invalid callout tone '{rawTone}'. Supported tones: 'pearl', 'clinical', 'warning'.", ErrorType.Validation, Hint: "Set tone to 'pearl', 'clinical', or 'warning'.");
     public static Error EmptyCalloutContent() => new("ArticleBlock.EmptyCalloutContent", "Callout block text content cannot be empty.", ErrorType.Validation);
 }
@@ -38,6 +39,8 @@ public static class QuizErrors
     public static Error NotFound(string quizId) => new("Quiz.NotFound", $"Quiz '{quizId}' was not found.", ErrorType.NotFound);
     public static Error InvalidType(string quizType) => new("Quiz.InvalidType", $"Invalid quiz type '{quizType}'. Supported types: 'mcq', 'flashcard', 'mixed'.", ErrorType.Validation);
     public static Error EmptyName() => new("Quiz.EmptyName", "Quiz name cannot be empty.", ErrorType.Validation);
+    public static Error QuestionTypeMismatch(string quizId, string quizType, string questionType) =>
+        new("Quiz.QuestionTypeMismatch", $"Quiz '{quizId}' has quizType '{quizType}' and cannot contain '{questionType}' questions.", ErrorType.Validation, Hint: "Change quizType to 'mixed' or match the question type to the quiz type.");
 }
 
 public static class QuestionErrors
@@ -51,6 +54,7 @@ public static class QuestionErrors
     public static Error OptionNotPopulated(int optionIndex) => new("Question.OptionNotPopulated", $"Option {optionIndex} has not been set yet and cannot be marked correct.", ErrorType.Conflict);
     public static Error CannotRevertToSingleWithMultipleCorrect(int correctCount) => new("Question.MultipleCorrectActive", $"Cannot convert to single-correct while {correctCount} options are marked correct.", ErrorType.Conflict);
     public static Error EmptyText() => new("Question.EmptyText", "Question text cannot be empty.", ErrorType.Validation);
+    public static Error EmptyImagePath() => new("Question.EmptyImagePath", "Question image path cannot be empty.", ErrorType.Validation);
 }
 
 public static class LayoutErrors
@@ -62,8 +66,8 @@ public static class LayoutErrors
 
 public static class LintErrors
 {
-    public static Error FailedLintCheck(string targetId, int errorCount, string summary) =>
-        new("Lint.Failed", $"Export blocked: '{targetId}' failed mandatory lint check with {errorCount} error(s): {summary}", ErrorType.Validation);
+    public static Error FailedLintCheck(string targetId, int errorCount, string summary, object? report = null) =>
+        new("Lint.Failed", $"Export blocked: '{targetId}' failed mandatory lint check with {errorCount} error(s): {summary}", ErrorType.Validation, Data: report);
 }
 
 public static class AnalysisErrors
@@ -85,5 +89,13 @@ public static class AddressErrors
             Hint: string.IsNullOrWhiteSpace(suggestedSlug)
                 ? "Shorten to <=32 lowercase chars matching ^[a-z0-9][a-z0-9_-]{0,31}$, or omit ref to auto-generate on components."
                 : $"Use suggested valid ref '{suggestedSlug}' (<=32 chars), or omit ref on components to auto-generate.");
+    public static Error ReservedRef(string rawRef, string? suggestedSlug = null) =>
+        new(
+            "Address.InvalidRef",
+            $"Ref '{rawRef}' conflicts with reserved positional path syntax ('c<n>' or 'q<n>').",
+            ErrorType.Validation,
+            Hint: string.IsNullOrWhiteSpace(suggestedSlug)
+                ? "Choose a slug that is not of the form c<number> or q<number>."
+                : $"Use suggested valid ref '{suggestedSlug}' instead.");
     public static Error DuplicateRef(string refKey) => new("Address.DuplicateRef", $"Duplicate ref '{refKey}' within workspace.", ErrorType.Conflict);
 }

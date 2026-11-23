@@ -168,7 +168,7 @@ public sealed class SqliteWorkspaceRepository(
         return quiz is not null && foundQ is not null ? new QuestionOwnerContext(null, null, quiz, foundQ, entry.StorageDirectory) : null;
     }
 
-    public async Task<IReadOnlyList<WorkspaceListItem>> ListWorkspacesAsync(string? directoryFilter = null, CancellationToken cancellationToken = default)
+    public async Task<IReadOnlyList<WorkspaceListItem>> ListWorkspacesAsync(string? directoryFilter = null, bool includeAll = false, CancellationToken cancellationToken = default)
     {
         var scanDir = string.IsNullOrWhiteSpace(directoryFilter)
             ? workingDirectoryProvider.GetCurrentDirectory()
@@ -196,12 +196,13 @@ public sealed class SqliteWorkspaceRepository(
         if (staleIds.Count > 0)
             await PruneStaleRegistryEntriesAsync(staleIds, cancellationToken);
 
+        bool filterByScanDir = !string.IsNullOrWhiteSpace(directoryFilter) || !includeAll;
+        var normScan = scanDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
         var items = new List<WorkspaceListItem>();
         foreach (var e in rows)
         {
-            if (!string.IsNullOrWhiteSpace(directoryFilter))
+            if (filterByScanDir)
             {
-                var normScan = scanDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
                 var normStorage = Path.GetFullPath(e.StorageDirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
                 if (!string.Equals(normStorage, normScan, StringComparison.OrdinalIgnoreCase) &&
                     !normStorage.StartsWith(normScan + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))

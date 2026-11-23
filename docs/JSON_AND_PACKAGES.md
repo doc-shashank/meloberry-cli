@@ -78,4 +78,4 @@ ZIP archive produced after mandatory `check`:
 - `layouts.json`: global profiles (included only with `--include-layout`)
 - `assets/<filename>`: deduped verified media files
 
-`pkg import` enforces matching single-segment IDs, ZIP entry confinement, and `50 MB` per-entry / `250 MB` total decompressed caps via atomic staging.
+`pkg export` defaults to `<projectRoot>/<wsId>.mbypkg` for workspaces under `.meloberry/workspaces/` (or `<workspaceParent>/<wsId>.mbypkg` otherwise) when `[outPath]` is omitted. `pkg import` defaults to CWD when `[destDir]` is omitted and enforces matching single-segment IDs, ZIP entry confinement, and `50 MB` per-entry / `250 MB` total decompressed caps via atomic staging.

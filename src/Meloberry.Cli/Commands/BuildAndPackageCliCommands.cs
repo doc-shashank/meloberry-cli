@@ -1,37 +1,44 @@
+using System.Text.RegularExpressions;
 using Meloberry.Application.UseCases.Diagnostics;
 using Meloberry.Application.UseCases.Json;
 using Meloberry.Application.UseCases.Layouts;
 using Meloberry.Application.UseCases.Packaging;
 using Meloberry.Cli.Abstractions;
+using Meloberry.Domain.Common;
 
 namespace Meloberry.Cli.Commands;
 
-public sealed class BuildCliCommand : CliCommand
+public sealed partial class BuildCliCommand : CliCommand
 {
-    private static readonly HashSet<string> AllowedFlags = new(StringComparer.OrdinalIgnoreCase) { "preview", "no-wait", "verify", "static-only" };
+    private static readonly HashSet<string> AllowedFlags = new(StringComparer.OrdinalIgnoreCase) { "preview", "no-wait", "verify", "static-only", "ephemeral" };
     private static readonly HashSet<string> AllowedValues = new(StringComparer.OrdinalIgnoreCase) { "out", "timeout" };
+
+    [GeneratedRegex(@"^(Session|Set)_\d{8}_\d{6}_\d{3}$", RegexOptions.Compiled)]
+    private static partial Regex StrictWorkspaceIdRegex();
 
     public BuildCliCommand()
         : base(new CommandDescriptor(
             Verb: "build",
-            Usage: "build <addr|spec.json|article.md|dir|-> [-o webDir] [--verify] [--static-only] [--timeout 30] [--preview] [--no-wait]",
+            Usage: "build <addr|spec.json|article.md|dir|-> [-o webDir] [--verify] [--static-only] [--ephemeral] [--timeout 30] [--preview] [--no-wait]",
             Description: "Runs mandatory lint and emits the deterministic study WebApp (supports one-shot JSON, Markdown, directories, or stdin).",
             HandlerType: typeof(Handler),
             AllowedFlagOptions: AllowedFlags,
             AllowedValueOptions: AllowedValues,
-            Prerequisites: "Workspace ID must already exist in CWD or .meloberry/workspaces, or pass a spec file/dir/'-' for one-shot compile.",
+            Prerequisites: "Workspace ID must already exist in CWD or .meloberry/workspaces, or pass a spec file/dir/'-' for one-shot compile (persists workspace DB under .meloberry/workspaces unless --ephemeral is passed).",
             OptionsHelp:
             [
-                "-o, --out <webDir>   Output WebApp directory (default: <id>_web or ./mby_web for one-shot).",
+                "-o, --out <webDir>   Output WebApp directory (default: <projectRoot>/<id>_web or <workspaceParent>/<id>_web for existing workspaces; ./mby_web for one-shot).",
                 "--verify             Run automated runtime verification after building (exits 2 on failure).",
-                "--static-only        Check static HTML/JS/CSS/asset integrity during --verify without launching a browser.",
-                "--timeout <sec>      Headless browser verification timeout in seconds (default 30).",
+                "--static-only        Check static HTML/JS/CSS/asset integrity without launching a browser.",
+                "--ephemeral          For one-shot builds, compile inside a temporary workspace and delete it afterwards.",
+                "--timeout <sec>      Headless browser verification timeout in seconds (default 30, range 5..180).",
                 "--preview            Serve built WebApp locally.",
                 "--no-wait            Exit immediately after printing preview URL (useful with --preview)."
             ],
             Examples:
             [
                 "mby build ./articles/ -o ./study_web --verify --json",
+                "mby build ./articles/ -o ./study_web --ephemeral --json",
                 "mby build Session_2026... -o ./study_web --json"
             ]))
     {
@@ -53,14 +60,20 @@ public sealed class BuildCliCommand : CliCommand
             bool noWait = context.HasFlag("no-wait");
             bool verify = context.HasFlag("verify");
             bool staticOnly = context.HasFlag("static-only");
+            bool ephemeral = context.HasFlag("ephemeral");
             int timeout = 30;
             var rawTimeout = context.GetOptionValue("timeout");
             if (!string.IsNullOrWhiteSpace(rawTimeout) && (!int.TryParse(rawTimeout, out timeout) || timeout < 5))
                 return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Invalid --timeout '{rawTimeout}'. Pass integer seconds >= 5.", context.GlobalOptions.Json);
 
+            bool isStdin = string.Equals(target, "-", StringComparison.Ordinal);
+            bool isExistingFile = !isStdin && File.Exists(target);
+            bool isExistingDir = !isStdin && !isExistingFile && Directory.Exists(target);
+            bool isWorkspaceDbFolder = isExistingDir && IsWorkspaceDatabaseDirectory(target);
+            bool isStrictWsId = !isStdin && !isExistingFile && StrictWorkspaceIdRegex().IsMatch(target);
+
             string webOutDir;
-            if (string.Equals(target, "-", StringComparison.Ordinal) ||
-                (!IsWorkspaceId(target) && (File.Exists(target) || Directory.Exists(target))))
+            if (isStdin || isExistingFile || (isExistingDir && !isWorkspaceDbFolder))
             {
                 var (filePath, inlineJson, errExit) = await CliCommandHelpers.ReadJsonInputAsync(context, target);
                 if (errExit is not null) return errExit.Value;
@@ -77,7 +90,8 @@ public sealed class BuildCliCommand : CliCommand
                         Verbose: context.GlobalOptions.Verbose,
                         VerifyWeb: verify,
                         StaticVerifyOnly: staticOnly,
-                        VerifyTimeoutSeconds: timeout),
+                        VerifyTimeoutSeconds: timeout,
+                        Ephemeral: ephemeral),
                     context.CancellationToken);
                 if (!applyRes.IsSuccess) return applyRes.ToExitCode(context.Console, context.GlobalOptions.Json);
 
@@ -88,10 +102,16 @@ public sealed class BuildCliCommand : CliCommand
                     return ExitCodes.Success;
                 }
             }
-            else
+            else if (isStrictWsId || isWorkspaceDbFolder)
             {
+                if (ephemeral)
+                    return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Option '--ephemeral' is only supported for one-shot spec/file/dir/'-' builds.", context.GlobalOptions.Json);
+
+                var effectiveWsId = isWorkspaceDbFolder
+                    ? Path.GetFileName(target.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
+                    : target;
                 var buildRes = await buildWebHandler.HandleAsync(
-                    new BuildWebAppCommand(target, outDir, verify, context.GlobalOptions.Verbose, context.GlobalOptions.Quiet, staticOnly, timeout),
+                    new BuildWebAppCommand(effectiveWsId, outDir, verify, context.GlobalOptions.Verbose, context.GlobalOptions.Quiet, staticOnly, timeout),
                     context.CancellationToken);
                 if (!buildRes.IsSuccess) return buildRes.ToExitCode(context.Console, context.GlobalOptions.Json);
 
@@ -102,12 +122,27 @@ public sealed class BuildCliCommand : CliCommand
                     return ExitCodes.Success;
                 }
             }
+            else
+            {
+                return Result.Failure(new Error(
+                    "Json.FileNotFound",
+                    $"Input file or directory '{target}' was not found.",
+                    ErrorType.NotFound,
+                    Hint: "Pass an existing spec file/directory, '-' for stdin, or a valid workspace ID (Session_YYYYMMDD_HHMMSS_fff / Set_YYYYMMDD_HHMMSS_fff)."))
+                    .ToExitCode(context.Console, context.GlobalOptions.Json);
+            }
 
             return await previewHost.ServeDirectoryAsync(webOutDir, context.Console, noWait, context.GlobalOptions.Json, silent: false, context.CancellationToken);
         }
 
-        private static bool IsWorkspaceId(string raw) =>
-            raw.StartsWith("Session_", StringComparison.Ordinal) || raw.StartsWith("Set_", StringComparison.Ordinal);
+        private static bool IsWorkspaceDatabaseDirectory(string directoryPath)
+        {
+            var trimmed = directoryPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var dirName = Path.GetFileName(trimmed);
+            return !string.IsNullOrWhiteSpace(dirName) &&
+                   (dirName.StartsWith("Session_", StringComparison.Ordinal) || dirName.StartsWith("Set_", StringComparison.Ordinal)) &&
+                   File.Exists(Path.Combine(trimmed, $"{dirName}.db"));
+        }
     }
 }
 
@@ -122,7 +157,7 @@ public sealed class PkgCliCommand : CliCommand
             Description: "Exports (content-only default, non-interactive) or imports .mbypkg v1.0 archives.",
             HandlerType: typeof(Handler),
             AllowedFlagOptions: AllowedFlags,
-            Prerequisites: "Runs mandatory lint before export; default output writes <wsId>.mbypkg into CWD unless [outPath] is given.",
+            Prerequisites: "Runs mandatory lint before export; default export writes <wsId>.mbypkg into the workspace's project root (for .meloberry/workspaces) or parent directory unless [outPath] is given. Import defaults to CWD unless [destDir] is given.",
             OptionsHelp:
             [
                 "--include-layout   Bundle non-default global layout profiles & entity layoutOverrides inside the .mbypkg."
@@ -186,10 +221,21 @@ public sealed class LayoutCliCommand : CliCommand
     public LayoutCliCommand()
         : base(new CommandDescriptor(
             Verb: "layout",
-            Usage: "layout <get|set|edit> ...",
+            Usage: "layout <get [mcq|flashcard|article] | set <mcq|flashcard|article> <prop> <val> | edit [target] [--no-wait]>",
             Description: "Reads layout bounds, updates global profile properties, or launches the local GUI layout editor.",
             HandlerType: typeof(Handler),
-            AllowedFlagOptions: AllowedFlags))
+            AllowedFlagOptions: AllowedFlags,
+            Prerequisites: "Global layout profiles persist in <app-data>/app_settings.db. 'themeMode' and 'slideTransitionMs' synchronize across all three profiles ('article', 'mcq', 'flashcard').",
+            OptionsHelp:
+            [
+                "--no-wait   Exit immediately after printing the local GUI editor URL (used with 'layout edit')."
+            ],
+            Examples:
+            [
+                "mby layout get mcq --json",
+                "mby layout set article blockSpacingPx 24 --json",
+                "mby layout edit article-text --no-wait --json"
+            ]))
     {
     }
 
@@ -260,7 +306,7 @@ public sealed class AnalyzeCliCommand : CliCommand
                 "--headless     Launch headless Edge/Chrome via CDP, step every slide/question, check images/overflow/KaTeX/console, write reports/verify.latest.json.",
                 "--static-only  Verify HTML/JS/CSS, DATA JSON, and referenced local image assets on disk without launching a browser.",
                 "--timeout <n>  Timeout in seconds for --headless (default 30, range 5..180).",
-                "--live         Start preview server + /__mby_analysis receiver to save runtime session telemetry.",
+                "--live         Start preview server + /api/analysis receiver to save runtime session telemetry.",
                 "--all          Aggregate all saved *.analysis.json telemetry files in <webDir>/reports.",
                 "--no-wait      Exit immediately after printing URL in --live mode."
             ],
@@ -303,9 +349,15 @@ public sealed class AnalyzeCliCommand : CliCommand
                 if (!report.Passed)
                 {
                     if (context.GlobalOptions.Json)
-                        CliCommandHelpers.WriteOutput(context, report, string.Empty);
-                    else
-                        context.Console.Error.WriteLine(summary);
+                    {
+                        return Result.Failure(new Error(
+                            "Verify.Failed",
+                            summary,
+                            ErrorType.Validation,
+                            Hint: string.IsNullOrWhiteSpace(report.ReportPath) ? null : $"Inspect verification details at '{report.ReportPath}'.",
+                            Data: report)).ToExitCode(context.Console, json: true);
+                    }
+                    context.Console.Error.WriteLine(summary);
                     return ExitCodes.ValidationError;
                 }
 

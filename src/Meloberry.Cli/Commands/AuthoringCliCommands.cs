@@ -12,18 +12,19 @@ public sealed class ApplyCliCommand : CliCommand
     public ApplyCliCommand()
         : base(new CommandDescriptor(
             Verb: "apply",
-            Usage: "apply [addr] <file|dir|-> [-o dir] [--build dir] [--verify] [--export plat:path] [--dry-run] [--quiet|--verbose]",
+            Usage: "apply [addr] <file|dir|-> [-o dir] [--build dir] [--verify] [--static-only] [--timeout 30] [--export plat[:path]] [--dry-run] [--quiet|--verbose]",
             Description: "Creates or appends to a session/quiz/component from JSON, Markdown (.md), a modular directory, or stdin ('-').",
             HandlerType: typeof(Handler),
             AllowedFlagOptions: AllowedFlags,
             AllowedValueOptions: AllowedValues,
+            Prerequisites: "Input must be a valid JSON spec, Markdown (.md), directory of .md/.json, or '-' (stdin). '--verify' and '--static-only' require '--build <webDir>'.",
             OptionsHelp:
             [
                 "-o, --out <dir>          Base workspace folder (defaults to .meloberry/workspaces).",
                 "--build <webDir>         Also compile the study WebApp into <webDir>.",
                 "--verify                 Run headless verification on --build output.",
-                "--static-only            Run static asset/DATA check when --verify is set.",
-                "--timeout <sec>          Timeout for headless verification (default 30).",
+                "--static-only            Run static asset/DATA check when --build is set (without launching a browser).",
+                "--timeout <sec>          Timeout for headless verification in seconds (default 30, range 5..180).",
                 "--export <plat[:path]>   Also export desktop/android .mbypkg archive.",
                 "--dry-run                Validate and lint in memory without writing workspace DB."
             ],
@@ -86,7 +87,19 @@ public sealed class PatchCliCommand : CliCommand
             Usage: "patch <addr> [file|-] [--set k=v] [--move idx:shift|exchange]",
             Description: "Surgically updates or reorders an entity by ID, path (#c1.b2), or #ref.",
             HandlerType: typeof(Handler),
-            AllowedValueOptions: AllowedValues))
+            AllowedValueOptions: AllowedValues,
+            Prerequisites: "Target entity must exist (addressed by direct ID, <wsId>#c<n>[.b<m>|.q<m>], <setId>#q<m>, or <wsId>#<ref>). Provide a patch JSON file/'-', --set, and/or --move.",
+            OptionsHelp:
+            [
+                "--set <k=v>          Repeatable field update; supports dot paths (e.g. layoutOverrides.<k>=<v|null>, front.text=...).",
+                "--move <idx>:<mode>  Reorder component, block, or question to 1-based <idx> using 'shift' or 'exchange'."
+            ],
+            Examples:
+            [
+                "mby patch Session_2026...#c2.q1 --set text=\"Updated prompt\" --set layoutOverrides.optionColumns=2 --json",
+                "mby patch Session_2026...#c1.b2 --move 1:shift --json",
+                "mby patch Session_2026...#intro ./patch.json --json"
+            ]))
     {
     }
 
@@ -131,7 +144,17 @@ public sealed class BatchCliCommand : CliCommand
             Verb: "batch",
             Usage: "batch <file|->",
             Description: "Executes a JSON operations array atomically inside one transaction.",
-            HandlerType: typeof(Handler)))
+            HandlerType: typeof(Handler),
+            Prerequisites: "Input must be a non-empty JSON array of operations ('apply', 'patch', 'rm', 'check', 'build', 'pkg', 'layout'). Any failing step rolls back the entire transaction.",
+            OptionsHelp:
+            [
+                "(No command-specific options; supports global --json, --app-data, --quiet, --verbose. See 'mby spec batch' for operation schema.)"
+            ],
+            Examples:
+            [
+                "mby batch ./ops.json --json",
+                "mby batch - --json < ops.json"
+            ]))
     {
     }
 
@@ -160,7 +183,17 @@ public sealed class RmCliCommand : CliCommand
             Verb: "rm",
             Usage: "rm <addr>",
             Description: "Deletes a workspace, component, block, or question non-interactively.",
-            HandlerType: typeof(Handler)))
+            HandlerType: typeof(Handler),
+            Prerequisites: "Deletes immediately without confirmation. Target workspace, component, block, or question must exist.",
+            OptionsHelp:
+            [
+                "(No command-specific options; supports global --json, --app-data, --quiet, --verbose.)"
+            ],
+            Examples:
+            [
+                "mby rm Session_2026...#c1.b2 --json",
+                "mby rm Session_2026... --json"
+            ]))
     {
     }
 

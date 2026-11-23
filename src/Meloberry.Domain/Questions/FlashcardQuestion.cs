@@ -46,7 +46,7 @@ public sealed class FlashcardQuestion : Question
 
     public Result SetSideImage(FlashcardFace face, string imagePath)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(imagePath);
+        if (string.IsNullOrWhiteSpace(imagePath)) return QuestionErrors.EmptyImagePath();
         GetSide(face).SetImage(imagePath);
         return Result.Success();
     }

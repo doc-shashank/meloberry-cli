@@ -2,6 +2,8 @@ using Meloberry.Application;
 using Meloberry.Application.UseCases.Common;
 using Meloberry.Application.UseCases.Json;
 using Meloberry.Domain.Common;
+using Meloberry.Domain.Questions;
+using Meloberry.Domain.Sessions;
 using Meloberry.Infrastructure;
 using Microsoft.Extensions.DependencyInjection;
 using Xunit;
@@ -113,5 +115,102 @@ public sealed class AddressAndPatchTests : IDisposable
         Assert.False(unknownRes.IsSuccess);
         Assert.Equal("Patch.UnknownField", unknownRes.Error!.Code);
         Assert.Equal("Did you mean 'explanation'?", unknownRes.Error.Hint);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void Domain_UpdateImage_And_SetSideImage_ReturnValidationErrorOnBlankPath(string blankPath)
+    {
+        var block = ArticleBlock.CreateImage("ArtComp_1", "Component_1", "assets/fig1.png");
+        var blockRes = block.UpdateImage(blankPath);
+        Assert.False(blockRes.IsSuccess);
+        Assert.Equal("ArticleBlock.EmptyImagePath", blockRes.Error!.Code);
+        Assert.Equal(ErrorType.Validation, blockRes.Error.Type);
+        Assert.Equal("assets/fig1.png", block.ImagePath);
+
+        var card = FlashcardQuestion.CreateNew("Question_1", "Quiz_1", 1);
+        var cardRes = card.SetSideImage(FlashcardFace.Front, blankPath);
+        Assert.False(cardRes.IsSuccess);
+        Assert.Equal("Question.EmptyImagePath", cardRes.Error!.Code);
+        Assert.Equal(ErrorType.Validation, cardRes.Error.Type);
+    }
+
+    [Fact]
+    public async Task PatchEntityHandler_RejectsEmptyImagePathOnArticleBlock_AndClearsOnFlashcardSide()
+    {
+        var services = new ServiceCollection();
+        services.AddApplication();
+        services.AddInfrastructure(opts => opts.AppDataDirectory = Path.Combine(_tempRoot, "appdata"));
+        using var provider = services.BuildServiceProvider();
+        using var scope = provider.CreateScope();
+
+        var apply = scope.ServiceProvider.GetRequiredService<ApplySpecHandler>();
+        var resolver = scope.ServiceProvider.GetRequiredService<EntityAddressResolver>();
+        var patch = scope.ServiceProvider.GetRequiredService<PatchEntityHandler>();
+
+        var specDir = Path.Combine(_tempRoot, "spec");
+        Directory.CreateDirectory(specDir);
+        await File.WriteAllBytesAsync(Path.Combine(specDir, "diagram.png"), [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+
+        var specPath = Path.Combine(specDir, "session.json");
+        await File.WriteAllTextAsync(specPath, """
+        {
+          "kind": "session",
+          "name": "Image Patch Test",
+          "components": [
+            {
+              "kind": "article",
+              "title": "Art",
+              "blocks": [
+                { "kind": "image", "ref": "img-one", "imagePath": "diagram.png" }
+              ]
+            },
+            {
+              "kind": "quiz",
+              "quizType": "flashcard",
+              "questions": [
+                { "type": "flashcard", "ref": "fc-one", "front": { "text": "Front", "imagePath": "diagram.png" }, "back": { "text": "Back" } }
+              ]
+            }
+          ]
+        }
+        """);
+
+        var applied = (await apply.HandleAsync(new ApplySpecCommand(null, specPath, null, _tempRoot))).Value;
+        var wsId = applied.TargetId;
+
+        var originalImgPath = (await resolver.ResolveAsync($"{wsId}#img-one")).Value.ArticleBlock!.ImagePath;
+        Assert.False(string.IsNullOrWhiteSpace(originalImgPath));
+
+        // --set imagePath= (empty string) returns validation error instead of throwing ArgumentNullException
+        var setEmptyRes = await patch.HandleAsync(new PatchEntityCommand($"{wsId}#img-one", SetPairs: ["imagePath="]));
+        Assert.False(setEmptyRes.IsSuccess);
+        Assert.Equal("Patch.InvalidValue", setEmptyRes.Error!.Code);
+        Assert.Equal(ErrorType.Validation, setEmptyRes.Error.Type);
+        Assert.Equal("imagePath", setEmptyRes.Error.Path);
+
+        // JSON whitespace and null imagePath also return validation error
+        foreach (var badJson in new[] { """{"imagePath":""}""", """{"imagePath":"   "}""", """{"imagePath":null}""" })
+        {
+            var res = await patch.HandleAsync(new PatchEntityCommand($"{wsId}#img-one", InlineJson: badJson));
+            Assert.False(res.IsSuccess);
+            Assert.Equal("Patch.InvalidValue", res.Error!.Code);
+            Assert.Equal(ErrorType.Validation, res.Error.Type);
+            Assert.Equal("imagePath", res.Error.Path);
+        }
+
+        // Original image block remains untouched
+        Assert.Equal(originalImgPath, (await resolver.ResolveAsync($"{wsId}#img-one")).Value.ArticleBlock!.ImagePath);
+
+        // Flashcard side imagePath: "" clears the side image cleanly instead of silently no-oping
+        var cardBefore = (FlashcardQuestion)(await resolver.ResolveAsync($"{wsId}#fc-one")).Value.Question!;
+        Assert.False(string.IsNullOrWhiteSpace(cardBefore.Front.ImagePath));
+
+        var clearCardRes = await patch.HandleAsync(new PatchEntityCommand($"{wsId}#fc-one", InlineJson: """{"front":{"imagePath":"   "}}"""));
+        Assert.True(clearCardRes.IsSuccess);
+
+        var cardAfter = (FlashcardQuestion)(await resolver.ResolveAsync($"{wsId}#fc-one")).Value.Question!;
+        Assert.Null(cardAfter.Front.ImagePath);
     }
 }

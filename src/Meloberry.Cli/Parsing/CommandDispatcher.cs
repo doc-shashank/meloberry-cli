@@ -3,6 +3,7 @@ using System.Text.Json;
 using Meloberry.Cli.Abstractions;
 using Meloberry.Cli.Commands;
 using Meloberry.Cli.Hosting;
+using Meloberry.Infrastructure;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Meloberry.Cli.Parsing;
@@ -19,7 +20,7 @@ public sealed class CommandDispatcher(
     private static readonly HashSet<string> GlobalKnownFlagOptions = new(StringComparer.OrdinalIgnoreCase)
     {
         "json", "help", "version", "dry-run", "preview", "no-wait", "include-layout", "all", "live",
-        "quiet", "verbose", "headless", "verify", "static-only"
+        "quiet", "verbose", "headless", "verify", "static-only", "ephemeral"
     };
 
     private readonly Dictionary<string, CliCommand> _commands =
@@ -32,9 +33,8 @@ public sealed class CommandDispatcher(
     {
         bool envAgent = string.Equals(Environment.GetEnvironmentVariable("MBY_AGENT"), "1", StringComparison.OrdinalIgnoreCase) ||
                         string.Equals(Environment.GetEnvironmentVariable("MBY_AGENT"), "true", StringComparison.OrdinalIgnoreCase);
-        string? envAppData = Environment.GetEnvironmentVariable("MBY_APP_DATA");
 
-        if (!TryParseArgs(args, envAgent, envAppData, out var verb, out var positional, out var named, out var globals, out var showHelp, out var showVersion, out var parseErr))
+        if (!TryParseArgs(args, envAgent, out var verb, out var positional, out var named, out var globals, out var showHelp, out var showVersion, out var parseErr))
         {
             return CliResultExtensions.WriteValidationError(console, "Cli.ParseError", parseErr!, globals.Json);
         }
@@ -160,8 +160,20 @@ public sealed class CommandDispatcher(
         {
             if (!string.IsNullOrWhiteSpace(globals.AppDataDirectory))
             {
-                overrideProvider = CliApplicationRunner.BuildServiceProvider(globals.AppDataDirectory);
-                activeFactory = overrideProvider.GetRequiredService<IServiceScopeFactory>();
+                var requestedFull = Path.GetFullPath(globals.AppDataDirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                string? activeFull = null;
+                using (var checkScope = scopeFactory.CreateScope())
+                {
+                    var activeOpts = checkScope.ServiceProvider.GetService<MeloberryStorageOptions>();
+                    if (!string.IsNullOrWhiteSpace(activeOpts?.AppDataDirectory))
+                        activeFull = Path.GetFullPath(activeOpts.AppDataDirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                }
+
+                if (!string.Equals(requestedFull, activeFull, StringComparison.OrdinalIgnoreCase))
+                {
+                    overrideProvider = CliApplicationRunner.BuildServiceProvider(requestedFull);
+                    activeFactory = overrideProvider.GetRequiredService<IServiceScopeFactory>();
+                }
             }
 
             using var scope = activeFactory.CreateScope();
@@ -177,7 +189,6 @@ public sealed class CommandDispatcher(
     private static bool TryParseArgs(
         string[] args,
         bool envAgent,
-        string? envAppData,
         out string verb,
         out List<string> positional,
         out Dictionary<string, List<string>> named,
@@ -194,7 +205,7 @@ public sealed class CommandDispatcher(
         errorMessage = null;
 
         bool json = envAgent;
-        string? appDataDir = string.IsNullOrWhiteSpace(envAppData) ? null : envAppData;
+        string? appDataDir = null;
         bool quiet = false;
         bool verbose = false;
         bool endOfOptions = false;
@@ -285,6 +296,12 @@ public sealed class CommandDispatcher(
                         }
                         break;
                 }
+            }
+            else if (!endOfOptions && token.Length > 1 && token[0] == '-')
+            {
+                globals = new GlobalCliOptions(json, appDataDir, quiet, verbose);
+                errorMessage = $"Unknown option '{token}'.";
+                return false;
             }
             else
             {

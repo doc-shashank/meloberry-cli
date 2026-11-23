@@ -19,7 +19,7 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
     private static readonly string[] KnownSchemaKeys =
     [
         "kind", "name", "description", "title", "quizType", "components", "blocks", "questions",
-        "layoutOverrides", "ref", "text", "imagePath", "caption", "alt", "tone",
+        "layoutOverrides", "order", "ref", "text", "imagePath", "caption", "alt", "tone",
         "type", "explanation", "maxOptions", "isMultiCorrect", "options", "index", "isCorrect",
         "front", "back", "position", "textPosition"
     ];
@@ -66,22 +66,42 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
 
         var sessionMdPath = Path.Combine(fullDir, "_session.md");
         var sessionJsonPath = Path.Combine(fullDir, "session.json");
-        if (File.Exists(sessionMdPath))
+        bool hasSessionMd = File.Exists(sessionMdPath);
+        bool hasSessionJson = File.Exists(sessionJsonPath);
+
+        if (hasSessionMd && hasSessionJson)
+        {
+            return new Error(
+                "Json.InvalidSpec",
+                $"Directory '{directoryPath}' contains both '_session.md' and 'session.json'. Keep only one session manifest.",
+                ErrorType.Validation);
+        }
+
+        if (hasSessionMd)
         {
             var raw = await File.ReadAllTextAsync(sessionMdPath, ct);
             var parsed = MarkdownSpecParser.ParseDocument(raw, sessionMdPath, isSessionManifest: true);
             if (!parsed.IsSuccess) return parsed.Error!;
+            if (parsed.Value.LayoutOverrides is { Count: > 0 })
+                return new Error("Json.InvalidFieldForType", "Top-level 'layoutOverrides' belong on components or individual questions, not '_session.md' session manifests.", ErrorType.Validation);
+            if (!string.IsNullOrWhiteSpace(parsed.Value.Ref))
+                return new Error("Json.InvalidFieldForType", "Top-level 'ref' belongs on components, blocks, or questions, not '_session.md' session manifests.", ErrorType.Validation);
             sessionName = parsed.Value.Name ?? parsed.Value.Title;
             sessionDescription = parsed.Value.Description;
             explicitOrder = parsed.Value.Order;
         }
-        else if (File.Exists(sessionJsonPath))
+        else if (hasSessionJson)
         {
             var raw = await File.ReadAllTextAsync(sessionJsonPath, ct);
             var parsed = ParseSpec(raw, sessionJsonPath);
             if (!parsed.IsSuccess) return parsed.Error!;
+            if (parsed.Value.LayoutOverrides is { Count: > 0 })
+                return new Error("Json.InvalidFieldForType", "Top-level 'layoutOverrides' belong on components or individual questions, not 'session.json' session roots.", ErrorType.Validation);
+            if (!string.IsNullOrWhiteSpace(parsed.Value.Ref))
+                return new Error("Json.InvalidFieldForType", "Top-level 'ref' belongs on components, blocks, or questions, not 'session.json' session roots.", ErrorType.Validation);
             sessionName = parsed.Value.Name ?? parsed.Value.Title;
             sessionDescription = parsed.Value.Description;
+            explicitOrder = parsed.Value.Order;
             manifestComponents = parsed.Value.Components;
         }
 
@@ -90,8 +110,7 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
             {
                 var name = Path.GetFileName(f);
                 if (name.StartsWith('_')) return false;
-                if (string.Equals(name, "session.json", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(name, "manifest.json", StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(name, "session.json", StringComparison.OrdinalIgnoreCase))
                     return false;
                 return IsMarkdownFile(f) || string.Equals(Path.GetExtension(f), ".json", StringComparison.OrdinalIgnoreCase);
             })
@@ -109,6 +128,14 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
                 manifestComponents.Select(c => c with { SourceDirectory = fullDir }).ToList(),
                 null, null, null,
                 AssetBaseDirectory: fullDir);
+        }
+
+        if (discoveredFiles.Count > 0 && manifestComponents is { Count: > 0 })
+        {
+            return new Error(
+                "Json.InvalidSpec",
+                $"Directory '{directoryPath}' defines inline 'components[]' in 'session.json' alongside standalone component files. Keep 'session.json' metadata-only or remove separate component files.",
+                ErrorType.Validation);
         }
 
         if (discoveredFiles.Count == 0)
@@ -143,6 +170,7 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
                     spec.Blocks,
                     null,
                     spec.LayoutOverrides,
+                    Ref: spec.Ref,
                     SourceDirectory: fullDir));
             }
             else if (spec.Questions is { Count: > 0 } || spec.Kind?.ToLowerInvariant() is "quiz" or "mcq" or "flashcard" or "mixed")
@@ -157,6 +185,7 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
                     null,
                     spec.Questions,
                     spec.LayoutOverrides,
+                    Ref: spec.Ref,
                     SourceDirectory: fullDir));
             }
             else
@@ -294,7 +323,9 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
                 dto.Components is null ? null : components,
                 rootBlocksRes.Value,
                 rootQuestionsRes.Value,
-                dto.LayoutOverrides);
+                dto.LayoutOverrides,
+                Ref: dto.Ref,
+                Order: dto.Order);
         }
         catch (JsonException ex)
         {
@@ -391,10 +422,12 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
     private sealed class ApplySpecDto
     {
         public string? Kind { get; set; }
+        public string? Ref { get; set; }
         public string? Name { get; set; }
         public string? Description { get; set; }
         public string? Title { get; set; }
         public string? QuizType { get; set; }
+        public List<string>? Order { get; set; }
         public List<ApplyComponentDto?>? Components { get; set; }
         public List<ApplyArticleBlockDto?>? Blocks { get; set; }
         public List<ApplyQuestionDto?>? Questions { get; set; }

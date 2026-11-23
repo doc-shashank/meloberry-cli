@@ -25,7 +25,22 @@ public static class RefKeyValidator
                 return AddressErrors.InvalidRef(trimmed, SuggestSlug(trimmed));
         }
 
+        if (IsReservedPositionalSlug(normalized))
+            return AddressErrors.ReservedRef(trimmed, SuggestSlug(trimmed));
+
         return Result<string?>.Success(normalized);
+    }
+
+    public static bool IsReservedPositionalSlug(string normalized)
+    {
+        if (normalized.Length < 2 || (normalized[0] != 'c' && normalized[0] != 'q'))
+            return false;
+        for (int i = 1; i < normalized.Length; i++)
+        {
+            if (normalized[i] < '0' || normalized[i] > '9')
+                return false;
+        }
+        return true;
     }
 
     public static string SuggestSlug(string? raw, string fallbackPrefix = "ref") =>
@@ -59,7 +74,7 @@ public static class RefKeyValidator
         if (fallback.Length == 0 || !IsAsciiAlphanumeric(fallback[0]))
             fallback = "item";
 
-        if (normalized.Length == 0 || !IsAsciiAlphanumeric(normalized[0]))
+        if (normalized.Length == 0 || !IsAsciiAlphanumeric(normalized[0]) || IsReservedPositionalSlug(normalized))
             normalized = normalized.Length == 0 ? fallback : $"{fallback}-{normalized}".TrimEnd('-', '_');
 
         if (normalized.Length <= MaxLength)

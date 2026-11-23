@@ -98,7 +98,8 @@ public sealed partial class BatchOperationsHandler(
                         $"Batch step {i} ('{op}') failed and rolled back: {error.Description}",
                         error.Type,
                         Path: $"[{i}]{(error.Path is null ? string.Empty : "." + error.Path)}",
-                        Hint: error.Hint);
+                        Hint: error.Hint,
+                        Data: error.Data);
                 }
 
                 producedIds.Add(producedId);
@@ -142,13 +143,16 @@ public sealed partial class BatchOperationsHandler(
                 var buildOut = GetString(obj, "build");
                 var exportSpec = GetString(obj, "export");
                 bool dryRun = GetBool(obj, "dryRun");
+                bool verify = GetBool(obj, "verify");
+                bool staticOnly = GetBool(obj, "staticOnly");
+                int timeout = GetInt(obj, "timeout") ?? 30;
                 var specNode = GetNode(obj, "spec");
 
                 if (specNode is null && string.IsNullOrWhiteSpace(file))
                     return (false, null, null, new Error("Batch.InvalidOp", "'apply' requires 'spec' object or 'file' path.", ErrorType.Validation));
 
                 var res = await applyHandler.HandleAsync(
-                    new ApplySpecCommand(target, file, specNode?.ToJsonString(), outDir, dryRun, buildOut, exportSpec), ct);
+                    new ApplySpecCommand(target, file, specNode?.ToJsonString(), outDir, dryRun, buildOut, exportSpec, VerifyWeb: verify, StaticVerifyOnly: staticOnly, VerifyTimeoutSeconds: timeout), ct);
                 return res.IsSuccess
                     ? (true, res.Value, res.Value.TargetId, null)
                     : (false, null, null, res.Error);
@@ -163,8 +167,21 @@ public sealed partial class BatchOperationsHandler(
                 var file = GetString(obj, "file");
                 var dataNode = GetNode(obj, "data") ?? GetNode(obj, "patch");
                 var move = GetString(obj, "move");
-                var setNode = GetNode(obj, "set") as JsonArray;
-                var sets = setNode?.Where(x => x is not null).Select(x => x!.GetValue<string>()).ToList();
+                List<string>? sets = null;
+                var rawSetNode = GetNode(obj, "set");
+                if (rawSetNode is not null)
+                {
+                    if (rawSetNode is not JsonArray setArr)
+                        return (false, null, null, new Error("Batch.InvalidOp", "'patch.set' must be an array of 'key=value' strings.", ErrorType.Validation, Path: "set"));
+                    sets = new List<string>(setArr.Count);
+                    for (int sIdx = 0; sIdx < setArr.Count; sIdx++)
+                    {
+                        var item = setArr[sIdx];
+                        if (item is null || item.GetValueKind() != JsonValueKind.String)
+                            return (false, null, null, new Error("Batch.InvalidOp", $"'patch.set[{sIdx}]' must be a 'key=value' string.", ErrorType.Validation, Path: $"set[{sIdx}]"));
+                        sets.Add(item.GetValue<string>());
+                    }
+                }
 
                 var res = await patchHandler.HandleAsync(
                     new PatchEntityCommand(addr, file, dataNode?.ToJsonString(), sets, move), ct);
@@ -179,9 +196,9 @@ public sealed partial class BatchOperationsHandler(
                 if (string.IsNullOrWhiteSpace(addr))
                     return (false, null, null, new Error("Batch.InvalidOp", "'rm' requires 'addr'.", ErrorType.Validation));
                 var res = await deleteHandler.HandleAsync(new DeleteEntityCommand(addr), ct);
-                return res.IsSuccess
-                    ? (true, res.Value, res.Value.DeletedId, null)
-                    : (false, null, null, res.Error);
+                if (!res.IsSuccess) return (false, null, null, res.Error);
+                var nextProducedId = res.Value.EntityKind is "session" or "quiz" ? null : res.Value.WorkspaceId;
+                return (true, res.Value, nextProducedId, null);
             }
 
             case "check":
@@ -192,7 +209,7 @@ public sealed partial class BatchOperationsHandler(
                 var res = await lintHandler.HandleAsync(new LintCommand(addr), ct);
                 if (!res.IsSuccess) return (false, null, null, res.Error);
                 if (res.Value.ErrorCount > 0)
-                    return (false, res.Value, null, new Error("Lint.Failed", $"Lint failed with {res.Value.ErrorCount} error(s).", ErrorType.Validation));
+                    return (false, res.Value, null, new Error("Lint.Failed", $"Lint failed with {res.Value.ErrorCount} error(s).", ErrorType.Validation, Data: res.Value));
                 return (true, res.Value, res.Value.TargetId, null);
             }
 
@@ -204,7 +221,8 @@ public sealed partial class BatchOperationsHandler(
                 var outDir = GetString(obj, "out");
                 bool verify = GetBool(obj, "verify");
                 bool staticOnly = GetBool(obj, "staticOnly");
-                var res = await buildHandler.HandleAsync(new BuildWebAppCommand(addr, outDir, Verify: verify, StaticVerifyOnly: staticOnly), ct);
+                int timeout = GetInt(obj, "timeout") ?? 30;
+                var res = await buildHandler.HandleAsync(new BuildWebAppCommand(addr, outDir, Verify: verify, StaticVerifyOnly: staticOnly, VerifyTimeoutSeconds: timeout), ct);
                 return res.IsSuccess
                     ? (true, res.Value, res.Value.TargetId, null)
                     : (false, null, null, res.Error);
@@ -258,5 +276,11 @@ public sealed partial class BatchOperationsHandler(
     {
         var node = GetNode(obj, name);
         return node is JsonValue v && v.TryGetValue<bool>(out bool b) && b;
+    }
+
+    private static int? GetInt(JsonObject obj, string name)
+    {
+        var node = GetNode(obj, name);
+        return node is JsonValue v && v.TryGetValue<int>(out int n) ? n : null;
     }
 }

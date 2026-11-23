@@ -2,6 +2,7 @@ using System.Text;
 using Meloberry.Application.UseCases.Diagnostics;
 using Meloberry.Application.UseCases.Quizzes;
 using Meloberry.Cli.Abstractions;
+using Meloberry.Domain.Common;
 
 namespace Meloberry.Cli.Commands;
 
@@ -15,7 +16,18 @@ public sealed class GetCliCommand : CliCommand
             Usage: "get <addr> [--view outline|full|ids]",
             Description: "Inspects an entity by ID, path (#c1.b2), or #ref (defaults to compact outline).",
             HandlerType: typeof(Handler),
-            AllowedValueOptions: AllowedValues))
+            AllowedValueOptions: AllowedValues,
+            Prerequisites: "Target entity must exist (direct ID, <wsId>#c<n>[.b<m>|.q<m>], <setId>#q<m>, or <wsId>#<ref>).",
+            OptionsHelp:
+            [
+                "--view <mode>   Output verbosity: 'outline' (default, compact snippets), 'full' (complete content), or 'ids' (minimal ID/path map)."
+            ],
+            Examples:
+            [
+                "mby get Session_2026... --json",
+                "mby get Session_2026...#c1 --view full --json",
+                "mby get Session_2026... --view ids --json"
+            ]))
     {
     }
 
@@ -102,12 +114,26 @@ public sealed class GetCliCommand : CliCommand
 
 public sealed class LsCliCommand : CliCommand
 {
+    private static readonly HashSet<string> AllowedFlags = new(StringComparer.OrdinalIgnoreCase) { "all" };
+
     public LsCliCommand()
         : base(new CommandDescriptor(
             Verb: "ls",
-            Usage: "ls [directory]",
-            Description: "Lists discovered study session and standalone quiz workspaces.",
-            HandlerType: typeof(Handler)))
+            Usage: "ls [directory] [--all]",
+            Description: "Lists discovered study session and standalone quiz workspaces in CWD + .meloberry/workspaces (or globally with --all).",
+            HandlerType: typeof(Handler),
+            AllowedFlagOptions: AllowedFlags,
+            Prerequisites: "Scans [directory] (or CWD + .meloberry/workspaces when omitted); pass --all to query all globally registered workspaces in app_settings.db.",
+            OptionsHelp:
+            [
+                "--all   List all workspaces registered globally in app_settings.db across all directories."
+            ],
+            Examples:
+            [
+                "mby ls --json",
+                "mby ls ./custom_dir --json",
+                "mby ls --all --json"
+            ]))
     {
     }
 
@@ -116,12 +142,13 @@ public sealed class LsCliCommand : CliCommand
         public Task<int> InvokeAsync(CliInvocationContext context)
         {
             if (context.PositionalArgs.Count > 1)
-                return Task.FromResult(CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: ls [directory]", context.GlobalOptions.Json));
+                return Task.FromResult(CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: ls [directory] [--all]", context.GlobalOptions.Json));
 
             var dir = context.PositionalArgs.Count == 1 ? context.PositionalArgs[0] : null;
+            bool includeAll = context.HasFlag("all");
             return CliCommandHelpers.FinishAsync(
                 context,
-                useCase.HandleAsync(new ListWorkspacesQuery(dir), context.CancellationToken),
+                useCase.HandleAsync(new ListWorkspacesQuery(dir, includeAll), context.CancellationToken),
                 items => items.Count == 0
                     ? "No workspaces found."
                     : string.Join(Environment.NewLine, items.Select(x => $"{x.Id} | {x.Kind} ({x.SubType}) | items:{x.ItemCount} | {x.StorageDirectory}")));
@@ -137,6 +164,7 @@ public sealed class CheckCliCommand : CliCommand
             Usage: "check <addr> [--quiet] [--verbose]",
             Description: "Runs mandatory lint validation on a workspace or sub-entity.",
             HandlerType: typeof(Handler),
+            Prerequisites: "Target workspace or sub-entity must exist. Exits 2 (Lint.Failed) if any Error-severity lint issues are found.",
             OptionsHelp:
             [
                 "--quiet    Omit empty issues array when lint is clean.",
@@ -168,9 +196,14 @@ public sealed class CheckCliCommand : CliCommand
             if (report.ErrorCount > 0)
             {
                 if (context.GlobalOptions.Json)
-                    CliCommandHelpers.WriteOutput(context, report, string.Empty);
-                else
-                    foreach (var line in lines) context.Console.Error.WriteLine(line);
+                {
+                    return Result.Failure(new Error(
+                        "Lint.Failed",
+                        $"Check {report.TargetId}: {report.ErrorCount} error(s), {report.WarningCount} warning(s).",
+                        ErrorType.Validation,
+                        Data: report)).ToExitCode(context.Console, json: true);
+                }
+                foreach (var line in lines) context.Console.Error.WriteLine(line);
                 return ExitCodes.ValidationError;
             }
 

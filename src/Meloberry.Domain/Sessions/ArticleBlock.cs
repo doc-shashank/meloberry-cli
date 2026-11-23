@@ -126,7 +126,7 @@ public sealed class ArticleBlock : IIndexedEntity
     public Result UpdateImage(string imagePath)
     {
         if (Kind != ArticleBlockKind.Image) return ArticleErrors.WrongBlockKind(Id, "image");
-        ArgumentException.ThrowIfNullOrWhiteSpace(imagePath);
+        if (string.IsNullOrWhiteSpace(imagePath)) return ArticleErrors.EmptyImagePath();
         ImagePath = imagePath;
         return Result.Success();
     }
