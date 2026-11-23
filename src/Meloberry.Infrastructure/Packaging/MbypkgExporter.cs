@@ -303,11 +303,25 @@ public sealed class MbypkgExporter(
     private static string ResolvePackageOutputPath(string id, string storageDirectory, string? outputPath)
     {
         if (string.IsNullOrWhiteSpace(outputPath))
-            return Path.Combine(Directory.GetParent(storageDirectory)?.FullName ?? Directory.GetCurrentDirectory(), $"{id}.mbypkg");
+            return Path.Combine(ResolveDefaultOutputBaseDirectory(storageDirectory), $"{id}.mbypkg");
 
         var full = Path.GetFullPath(outputPath);
         if (Directory.Exists(full)) return Path.Combine(full, $"{id}.mbypkg");
         return full.EndsWith(".mbypkg", StringComparison.OrdinalIgnoreCase) ? full : $"{full}.mbypkg";
+    }
+
+    internal static string ResolveDefaultOutputBaseDirectory(string storageDirectory)
+    {
+        var parent = Directory.GetParent(storageDirectory);
+        if (parent is not null &&
+            string.Equals(parent.Name, "workspaces", StringComparison.OrdinalIgnoreCase) &&
+            parent.Parent is not null &&
+            string.Equals(parent.Parent.Name, ".meloberry", StringComparison.OrdinalIgnoreCase) &&
+            parent.Parent.Parent is not null)
+        {
+            return parent.Parent.Parent.FullName;
+        }
+        return parent?.FullName ?? Directory.GetCurrentDirectory();
     }
 
     private static async Task WriteJsonEntryAsync<T>(ZipArchive archive, string entryName, T payload, CancellationToken ct)
@@ -352,7 +366,11 @@ public sealed class MbypkgExporter(
     private static SessionPackageDto MapSessionToDto(StudySession session, bool includeLayouts) =>
         new(session.Id, session.ActiveComponentId, session.Components.Select(c => new ComponentPackageDto(
             c.Id, c.Index, c.Kind.ToString(), c.Quiz is null ? null : MapQuizToDto(c.Quiz, includeLayouts),
-            c.ArticleBlocks.Select(b => new ArticleBlockPackageDto(b.Id, b.Index, b.Kind.ToString(), b.TextContent, b.ImagePath)).ToList(),
+            c.ArticleBlocks.Select(b => new ArticleBlockPackageDto(
+                b.Id, b.Index, b.Kind.ToString(), b.TextContent, b.ImagePath,
+                b.Caption, b.Alt,
+                b.CalloutTone.HasValue ? ArticleBlock.CalloutToneToString(b.CalloutTone.Value) : null,
+                b.CalloutTitle)).ToList(),
             includeLayouts ? c.LayoutOverrides.ToDictionary(x => x.Key, x => x.Value) : null,
             c.Title)).ToList(),
             session.Name, session.Description);
@@ -406,7 +424,14 @@ public sealed class MbypkgExporter(
                 if (!IsSafeRelativeAssetPath(b.ImagePath, storageDir))
                     return new Error("Package.InvalidWorkspace", $"Unsafe article imagePath '{b.ImagePath}'.", ErrorType.Validation);
 
-                blocks.Add(ArticleBlock.Rehydrate(b.Id, c.Id, b.Index, bKind, b.TextContent, b.ImagePath));
+                CalloutTone? calloutTone = null;
+                if (!string.IsNullOrWhiteSpace(b.CalloutTone) && ArticleBlock.TryParseCalloutTone(b.CalloutTone, out var parsedTone))
+                    calloutTone = parsedTone;
+                else if (bKind == ArticleBlockKind.Callout)
+                    calloutTone = CalloutTone.Pearl;
+
+                blocks.Add(ArticleBlock.Rehydrate(b.Id, c.Id, b.Index, bKind, b.TextContent, b.ImagePath,
+                    caption: b.Caption, alt: b.Alt, calloutTone: calloutTone, calloutTitle: b.CalloutTitle));
             }
 
             IReadOnlyList<string> compTargets = kind == ComponentKind.Article
@@ -487,7 +512,16 @@ public sealed class MbypkgExporter(
     private sealed record PackageManifest(string PackageVersion, string Kind, string Id, string ExportedAtUtc, List<string> Assets, string TargetPlatform = "desktop");
     private sealed record SessionPackageDto(string Id, string? ActiveComponentId, List<ComponentPackageDto> Components, string? Name = null, string? Description = null);
     private sealed record ComponentPackageDto(string Id, int Index, string Kind, QuizPackageDto? Quiz, List<ArticleBlockPackageDto> ArticleBlocks, Dictionary<string, string>? LayoutOverrides, string? Title = null);
-    private sealed record ArticleBlockPackageDto(string Id, int Index, string Kind, string? TextContent, string? ImagePath);
+    private sealed record ArticleBlockPackageDto(
+        string Id,
+        int Index,
+        string Kind,
+        string? TextContent,
+        string? ImagePath,
+        string? Caption = null,
+        string? Alt = null,
+        string? CalloutTone = null,
+        string? CalloutTitle = null);
     private sealed record QuizPackageDto(string Id, string QuizType, List<QuestionPackageDto> Questions, string? Name = null, string? Description = null);
     private sealed record QuestionPackageDto(string Id, int Index, string QuestionType, string? PromptText, int MaxOptions, bool IsMultiCorrect, List<OptionPackageDto> Options, SidePackageDto? Front, SidePackageDto? Back, Dictionary<string, string>? LayoutOverrides, string? PromptImagePath = null, string? Explanation = null);
     private sealed record OptionPackageDto(int Index, string? Text, string? ImagePath, bool IsCorrect);

@@ -16,7 +16,12 @@ public sealed record ApplySpecCommand(
     string? WorkingDirectory = null,
     bool DryRun = false,
     string? BuildOutDir = null,
-    string? ExportSpec = null);
+    string? ExportSpec = null,
+    bool Quiet = false,
+    bool Verbose = false,
+    bool VerifyWeb = false,
+    bool StaticVerifyOnly = false,
+    int VerifyTimeoutSeconds = 30);
 
 public sealed record AppliedComponentSummary(
     string P,
@@ -41,7 +46,8 @@ public sealed record ApplySpecResponse(
     IReadOnlyList<string>? AddedQuestionIds = null,
     ApplyLintSummary? Lint = null,
     string? WebOutputPath = null,
-    string? PackagePath = null);
+    string? PackagePath = null,
+    WebAppVerificationReport? Verify = null);
 
 public sealed class ApplySpecHandler(
     IIdGenerator idGenerator,
@@ -62,9 +68,23 @@ public sealed class ApplySpecHandler(
         if (!loadRes.IsSuccess) return loadRes.Error!;
 
         var spec = loadRes.Value;
-        var jsonDir = command.InlineJson is not null
-            ? workingDirectoryProvider.GetCurrentDirectory()
-            : Path.GetDirectoryName(Path.GetFullPath(command.JsonFilePath!)) ?? workingDirectoryProvider.GetCurrentDirectory();
+        var cwd = workingDirectoryProvider.GetCurrentDirectory();
+        string jsonDir;
+        if (!string.IsNullOrWhiteSpace(spec.AssetBaseDirectory))
+        {
+            jsonDir = spec.AssetBaseDirectory;
+        }
+        else if (command.InlineJson is not null || string.IsNullOrWhiteSpace(command.JsonFilePath))
+        {
+            jsonDir = cwd;
+        }
+        else
+        {
+            var fullSpecPath = Path.GetFullPath(command.JsonFilePath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            jsonDir = workingDirectoryProvider.DirectoryExists(fullSpecPath)
+                ? fullSpecPath
+                : (Path.GetDirectoryName(fullSpecPath) ?? cwd);
+        }
 
         var addedComponents = new List<SessionComponent>();
         var addedBlocks = new List<string>();
@@ -73,7 +93,7 @@ public sealed class ApplySpecHandler(
         Result<ApplySpecResponse> applyRes;
         if (string.IsNullOrWhiteSpace(command.TargetAddress))
         {
-            applyRes = await CreateNewWorkspaceAsync(spec, command.WorkingDirectory, command.DryRun, jsonDir, addedComponents, addedBlocks, addedQuestions, cancellationToken);
+            applyRes = await CreateNewWorkspaceAsync(spec, command.WorkingDirectory, command.DryRun, command.Quiet, command.Verbose, jsonDir, cwd, addedComponents, addedBlocks, addedQuestions, cancellationToken);
         }
         else
         {
@@ -83,9 +103,9 @@ public sealed class ApplySpecHandler(
 
             applyRes = target.EntityKind switch
             {
-                "session" => await AppendToSessionAsync(target.Session!, target.StorageDirectory, spec, command.DryRun, jsonDir, addedComponents, addedBlocks, addedQuestions, cancellationToken),
-                "component" => await AppendToComponentAsync(target.Session!, target.Component!, target.StorageDirectory, spec, command.DryRun, jsonDir, addedBlocks, addedQuestions, cancellationToken),
-                "quiz" => await AppendToQuizAsync(target.Quiz!, target.StorageDirectory, spec, command.DryRun, jsonDir, addedQuestions, cancellationToken),
+                "session" => await AppendToSessionAsync(target.Session!, target.StorageDirectory, spec, command.DryRun, command.Quiet, command.Verbose, jsonDir, cwd, addedComponents, addedBlocks, addedQuestions, cancellationToken),
+                "component" => await AppendToComponentAsync(target.Session!, target.Component!, target.StorageDirectory, spec, command.DryRun, command.Quiet, command.Verbose, jsonDir, cwd, addedBlocks, addedQuestions, cancellationToken),
+                "quiz" => await AppendToQuizAsync(target.Quiz!, target.StorageDirectory, spec, command.DryRun, command.Quiet, command.Verbose, jsonDir, cwd, addedQuestions, cancellationToken),
                 _ => new Error("Apply.UnsupportedTarget", $"Target '{command.TargetAddress}' ({target.EntityKind}) cannot be used with apply. Target a session, component, quiz, or omit target.", ErrorType.Validation)
             };
         }
@@ -97,13 +117,17 @@ public sealed class ApplySpecHandler(
         string? webOut = null;
         string? pkgOut = null;
         ApplyLintSummary? lintSummary = res.Lint;
+        WebAppVerificationReport? verifyReport = null;
 
         if (!string.IsNullOrWhiteSpace(command.BuildOutDir))
         {
-            var buildRes = await buildWebHandler.HandleAsync(new BuildWebAppCommand(res.TargetId, command.BuildOutDir), cancellationToken);
+            var buildRes = await buildWebHandler.HandleAsync(
+                new BuildWebAppCommand(res.TargetId, command.BuildOutDir, command.VerifyWeb, command.Verbose, command.Quiet, command.StaticVerifyOnly, command.VerifyTimeoutSeconds),
+                cancellationToken);
             if (!buildRes.IsSuccess) return buildRes.Error!;
             webOut = buildRes.Value.IndexHtmlPath;
-            lintSummary = new ApplyLintSummary(buildRes.Value.LintReport.IsClean, buildRes.Value.LintReport.ErrorCount, buildRes.Value.LintReport.WarningCount);
+            lintSummary = buildRes.Value.Lint;
+            verifyReport = buildRes.Value.Verify;
         }
 
         if (!string.IsNullOrWhiteSpace(command.ExportSpec))
@@ -121,7 +145,8 @@ public sealed class ApplySpecHandler(
         {
             Lint = lintSummary,
             WebOutputPath = webOut,
-            PackagePath = pkgOut
+            PackagePath = pkgOut,
+            Verify = verifyReport
         };
     }
 
@@ -129,7 +154,10 @@ public sealed class ApplySpecHandler(
         DeclarativeApplySpec spec,
         string? workingDirectory,
         bool dryRun,
+        bool quiet,
+        bool verbose,
         string jsonDir,
+        string cwd,
         List<SessionComponent> addedComponents,
         List<string> addedBlocks,
         List<string> addedQuestions,
@@ -138,13 +166,32 @@ public sealed class ApplySpecHandler(
         if (spec.LayoutOverrides is { Count: > 0 })
             return new Error("Json.InvalidFieldForType", "Top-level 'layoutOverrides' belong on components or individual questions, not workspace roots.", ErrorType.Validation);
 
-        var baseDir = workingDirectoryProvider.NormalizeDirectoryPath(workingDirectory);
+        var baseDir = string.IsNullOrWhiteSpace(workingDirectory)
+            ? Path.Combine(cwd, ".meloberry", "workspaces")
+            : workingDirectoryProvider.NormalizeDirectoryPath(workingDirectory);
         var kind = spec.Kind?.Trim().ToLowerInvariant();
         if (string.IsNullOrWhiteSpace(kind))
         {
             if (spec.Components is { Count: > 0 }) kind = "session";
+            else if (spec.Blocks is { Count: > 0 }) kind = "article";
             else if (spec.Questions is { Count: > 0 }) kind = "quiz";
             else return new Error("Json.InvalidSpec", "Declarative JSON must specify 'kind' ('session' or 'quiz') or include 'components' / 'questions'.", ErrorType.Validation);
+        }
+
+        if (kind == "article")
+        {
+            spec = spec with
+            {
+                Kind = "session",
+                Name = spec.Name ?? spec.Title ?? "Study Session",
+                Components =
+                [
+                    new DeclarativeComponentSpec("article", spec.Title ?? spec.Name, null, spec.Blocks, null, spec.LayoutOverrides, null, jsonDir)
+                ],
+                Blocks = null,
+                LayoutOverrides = null
+            };
+            kind = "session";
         }
 
         if (kind == "session")
@@ -179,7 +226,7 @@ public sealed class ApplySpecHandler(
                 var usedRefs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var compSpec in spec.Components ?? [])
                 {
-                    var addCompRes = await AddComponentFromSpecAsync(session, storageDir, compSpec, jsonDir, usedRefs, addedComponents, addedBlocks, addedQuestions, ct);
+                    var addCompRes = await AddComponentFromSpecAsync(session, storageDir, compSpec, jsonDir, cwd, usedRefs, addedComponents, addedBlocks, addedQuestions, ct);
                     if (!addCompRes.IsSuccess)
                     {
                         CleanupDirectory(storageDir);
@@ -193,8 +240,8 @@ public sealed class ApplySpecHandler(
                     return new ApplySpecResponse(
                         session.Id, "session", Path.Combine(baseDir, sessionId), CreatedWorkspace: false, DryRun: true,
                         Components: MapComponentSummaries(addedComponents),
-                        AddedBlockIds: addedBlocks.Count > 0 ? addedBlocks : null,
-                        AddedQuestionIds: addedQuestions.Count > 0 ? addedQuestions : null,
+                        AddedBlockIds: CompactIds(addedBlocks, quiet, verbose),
+                        AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose),
                         Lint: new ApplyLintSummary(report.IsClean, report.ErrorCount, report.WarningCount));
                 }
 
@@ -202,8 +249,8 @@ public sealed class ApplySpecHandler(
                 return new ApplySpecResponse(
                     session.Id, "session", storageDir, CreatedWorkspace: true, DryRun: false,
                     Components: MapComponentSummaries(addedComponents),
-                    AddedBlockIds: addedBlocks.Count > 0 ? addedBlocks : null,
-                    AddedQuestionIds: addedQuestions.Count > 0 ? addedQuestions : null);
+                    AddedBlockIds: CompactIds(addedBlocks, quiet, verbose),
+                    AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose));
             }
             catch
             {
@@ -250,7 +297,7 @@ public sealed class ApplySpecHandler(
                     quiz.SetDescription(spec.Description);
 
                 var usedRefs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                var qRes = await AddQuestionsFromSpecsAsync(quiz, storageDir, spec.Questions ?? [], jsonDir, usedRefs, addedQuestions, ct);
+                var qRes = await AddQuestionsFromSpecsAsync(quiz, storageDir, spec.Questions ?? [], jsonDir, jsonDir, cwd, usedRefs, addedQuestions, ct);
                 if (!qRes.IsSuccess)
                 {
                     CleanupDirectory(storageDir);
@@ -262,14 +309,14 @@ public sealed class ApplySpecHandler(
                     var report = await lintHandler.LintQuizInMemoryAsync(quiz, storageDir, ct);
                     return new ApplySpecResponse(
                         quiz.Id, "quiz", Path.Combine(baseDir, quizId), CreatedWorkspace: false, DryRun: true,
-                        AddedQuestionIds: addedQuestions,
+                        AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose),
                         Lint: new ApplyLintSummary(report.IsClean, report.ErrorCount, report.WarningCount));
                 }
 
                 await repository.CreateQuizAsync(quiz, ct);
                 return new ApplySpecResponse(
                     quiz.Id, "quiz", storageDir, CreatedWorkspace: true, DryRun: false,
-                    AddedQuestionIds: addedQuestions);
+                    AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose));
             }
             catch
             {
@@ -290,7 +337,10 @@ public sealed class ApplySpecHandler(
         string realStorageDir,
         DeclarativeApplySpec spec,
         bool dryRun,
+        bool quiet,
+        bool verbose,
         string jsonDir,
+        string cwd,
         List<SessionComponent> addedComponents,
         List<string> addedBlocks,
         List<string> addedQuestions,
@@ -325,7 +375,7 @@ public sealed class ApplySpecHandler(
             var usedRefs = CollectSessionRefs(session);
             foreach (var compSpec in compsToAdd)
             {
-                var res = await AddComponentFromSpecAsync(session, workingAssetRoot, compSpec, jsonDir, usedRefs, addedComponents, addedBlocks, addedQuestions, ct);
+                var res = await AddComponentFromSpecAsync(session, workingAssetRoot, compSpec, jsonDir, cwd, usedRefs, addedComponents, addedBlocks, addedQuestions, ct);
                 if (!res.IsSuccess) return res.Error!;
             }
 
@@ -335,8 +385,8 @@ public sealed class ApplySpecHandler(
                 return new ApplySpecResponse(
                     session.Id, "session", realStorageDir, CreatedWorkspace: false, DryRun: true,
                     Components: MapComponentSummaries(addedComponents),
-                    AddedBlockIds: addedBlocks.Count > 0 ? addedBlocks : null,
-                    AddedQuestionIds: addedQuestions.Count > 0 ? addedQuestions : null,
+                    AddedBlockIds: CompactIds(addedBlocks, quiet, verbose),
+                    AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose),
                     Lint: new ApplyLintSummary(report.IsClean, report.ErrorCount, report.WarningCount));
             }
 
@@ -344,8 +394,8 @@ public sealed class ApplySpecHandler(
             return new ApplySpecResponse(
                 session.Id, "session", realStorageDir, CreatedWorkspace: false, DryRun: false,
                 Components: MapComponentSummaries(addedComponents),
-                AddedBlockIds: addedBlocks.Count > 0 ? addedBlocks : null,
-                AddedQuestionIds: addedQuestions.Count > 0 ? addedQuestions : null);
+                AddedBlockIds: CompactIds(addedBlocks, quiet, verbose),
+                AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose));
         }
         finally
         {
@@ -359,7 +409,10 @@ public sealed class ApplySpecHandler(
         string realStorageDir,
         DeclarativeApplySpec spec,
         bool dryRun,
+        bool quiet,
+        bool verbose,
         string jsonDir,
+        string cwd,
         List<string> addedBlocks,
         List<string> addedQuestions,
         CancellationToken ct)
@@ -392,7 +445,7 @@ public sealed class ApplySpecHandler(
                 if (spec.Questions is { Count: > 0 })
                     return new Error("Json.InvalidFieldForType", "Article component cannot accept 'questions[]'.", ErrorType.Validation);
 
-                var blockRes = await AddBlocksFromSpecsAsync(comp, workingAssetRoot, spec.Blocks ?? [], jsonDir, usedRefs, addedBlocks, ct);
+                var blockRes = await AddBlocksFromSpecsAsync(comp, workingAssetRoot, spec.Blocks ?? [], jsonDir, jsonDir, cwd, usedRefs, addedBlocks, ct);
                 if (!blockRes.IsSuccess) return blockRes.Error!;
             }
             else if (comp.Quiz is not null)
@@ -400,7 +453,7 @@ public sealed class ApplySpecHandler(
                 if (spec.Blocks is { Count: > 0 })
                     return new Error("Json.InvalidFieldForType", "Quiz component cannot accept article 'blocks[]'.", ErrorType.Validation);
 
-                var qRes = await AddQuestionsFromSpecsAsync(comp.Quiz, workingAssetRoot, spec.Questions ?? [], jsonDir, usedRefs, addedQuestions, ct);
+                var qRes = await AddQuestionsFromSpecsAsync(comp.Quiz, workingAssetRoot, spec.Questions ?? [], jsonDir, jsonDir, cwd, usedRefs, addedQuestions, ct);
                 if (!qRes.IsSuccess) return qRes.Error!;
             }
 
@@ -409,16 +462,16 @@ public sealed class ApplySpecHandler(
                 var report = await lintHandler.LintSessionInMemoryAsync(session, workingAssetRoot, ct);
                 return new ApplySpecResponse(
                     comp.Id, "component", realStorageDir, CreatedWorkspace: false, DryRun: true,
-                    AddedBlockIds: addedBlocks.Count > 0 ? addedBlocks : null,
-                    AddedQuestionIds: addedQuestions.Count > 0 ? addedQuestions : null,
+                    AddedBlockIds: CompactIds(addedBlocks, quiet, verbose),
+                    AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose),
                     Lint: new ApplyLintSummary(report.IsClean, report.ErrorCount, report.WarningCount));
             }
 
             await repository.SaveSessionAsync(session, ct);
             return new ApplySpecResponse(
                 comp.Id, "component", realStorageDir, CreatedWorkspace: false, DryRun: false,
-                AddedBlockIds: addedBlocks.Count > 0 ? addedBlocks : null,
-                AddedQuestionIds: addedQuestions.Count > 0 ? addedQuestions : null);
+                AddedBlockIds: CompactIds(addedBlocks, quiet, verbose),
+                AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose));
         }
         finally
         {
@@ -431,7 +484,10 @@ public sealed class ApplySpecHandler(
         string realStorageDir,
         DeclarativeApplySpec spec,
         bool dryRun,
+        bool quiet,
+        bool verbose,
         string jsonDir,
+        string cwd,
         List<string> addedQuestions,
         CancellationToken ct)
     {
@@ -452,7 +508,7 @@ public sealed class ApplySpecHandler(
         try
         {
             var usedRefs = quiz.Questions.Where(q => q.RefKey is not null).Select(q => q.RefKey!).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            var qRes = await AddQuestionsFromSpecsAsync(quiz, workingAssetRoot, spec.Questions ?? [], jsonDir, usedRefs, addedQuestions, ct);
+            var qRes = await AddQuestionsFromSpecsAsync(quiz, workingAssetRoot, spec.Questions ?? [], jsonDir, jsonDir, cwd, usedRefs, addedQuestions, ct);
             if (!qRes.IsSuccess) return qRes.Error!;
 
             if (dryRun)
@@ -460,14 +516,14 @@ public sealed class ApplySpecHandler(
                 var report = await lintHandler.LintQuizInMemoryAsync(quiz, workingAssetRoot, ct);
                 return new ApplySpecResponse(
                     quiz.Id, "quiz", realStorageDir, CreatedWorkspace: false, DryRun: true,
-                    AddedQuestionIds: addedQuestions,
+                    AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose),
                     Lint: new ApplyLintSummary(report.IsClean, report.ErrorCount, report.WarningCount));
             }
 
             await repository.SaveQuizAsync(quiz, ct);
             return new ApplySpecResponse(
                 quiz.Id, "quiz", realStorageDir, CreatedWorkspace: false, DryRun: false,
-                AddedQuestionIds: addedQuestions);
+                AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose));
         }
         finally
         {
@@ -479,7 +535,8 @@ public sealed class ApplySpecHandler(
         StudySession session,
         string storageDir,
         DeclarativeComponentSpec compSpec,
-        string jsonDir,
+        string specRootDir,
+        string cwd,
         HashSet<string> usedRefs,
         List<SessionComponent> addedComponents,
         List<string> addedBlocks,
@@ -502,6 +559,13 @@ public sealed class ApplySpecHandler(
             if (comp.RefKey is not null && !usedRefs.Add(comp.RefKey))
                 return AddressErrors.DuplicateRef(comp.RefKey);
         }
+        else
+        {
+            var seed = !string.IsNullOrWhiteSpace(compSpec.Title) ? compSpec.Title : $"{rawKind}-{session.Components.Count}";
+            var fallback = comp.Kind == ComponentKind.Article ? "art" : "quiz";
+            var autoRef = RefKeyValidator.GenerateSlug(seed, fallback, usedRefs);
+            comp.SetRefKey(autoRef);
+        }
 
         addedComponents.Add(comp);
 
@@ -520,25 +584,28 @@ public sealed class ApplySpecHandler(
             }
         }
 
+        var compAssetDir = !string.IsNullOrWhiteSpace(compSpec.SourceDirectory) ? compSpec.SourceDirectory : specRootDir;
         if (comp.Kind == ComponentKind.Article)
         {
             if (compSpec.Questions is { Count: > 0 })
                 return new Error("Json.InvalidFieldForType", "Article component cannot specify 'questions[]'.", ErrorType.Validation);
 
-            return await AddBlocksFromSpecsAsync(comp, storageDir, compSpec.Blocks ?? [], jsonDir, usedRefs, addedBlocks, ct);
+            return await AddBlocksFromSpecsAsync(comp, storageDir, compSpec.Blocks ?? [], compAssetDir, specRootDir, cwd, usedRefs, addedBlocks, ct);
         }
 
         if (compSpec.Blocks is { Count: > 0 })
             return new Error("Json.InvalidFieldForType", "Quiz component cannot specify article 'blocks[]'.", ErrorType.Validation);
 
-        return await AddQuestionsFromSpecsAsync(comp.Quiz!, storageDir, compSpec.Questions ?? [], jsonDir, usedRefs, addedQuestions, ct);
+        return await AddQuestionsFromSpecsAsync(comp.Quiz!, storageDir, compSpec.Questions ?? [], compAssetDir, specRootDir, cwd, usedRefs, addedQuestions, ct);
     }
 
     private async Task<Result> AddBlocksFromSpecsAsync(
         SessionComponent comp,
         string storageDir,
         IReadOnlyList<DeclarativeArticleBlockSpec> blocks,
-        string jsonDir,
+        string compAssetDir,
+        string specRootDir,
+        string cwd,
         HashSet<string> usedRefs,
         List<string> addedBlocks,
         CancellationToken ct)
@@ -551,8 +618,11 @@ public sealed class ApplySpecHandler(
             ArticleBlock created;
             if (bKind == "text")
             {
-                if (!string.IsNullOrWhiteSpace(b.ImagePath))
-                    return new Error("Json.InvalidFieldForType", "Article text block cannot specify 'imagePath'.", ErrorType.Validation);
+                if (!string.IsNullOrWhiteSpace(b.ImagePath) || !string.IsNullOrWhiteSpace(b.Caption) ||
+                    !string.IsNullOrWhiteSpace(b.Alt) || !string.IsNullOrWhiteSpace(b.Tone) || !string.IsNullOrWhiteSpace(b.Title))
+                {
+                    return new Error("Json.InvalidFieldForType", "Article text block only supports 'kind', 'text', and optional 'ref'.", ErrorType.Validation);
+                }
 
                 var res = comp.AddTextBlock(blockId, b.Text ?? string.Empty);
                 if (!res.IsSuccess) return res.Error!;
@@ -560,23 +630,36 @@ public sealed class ApplySpecHandler(
             }
             else if (bKind == "image")
             {
-                if (!string.IsNullOrWhiteSpace(b.Text))
-                    return new Error("Json.InvalidFieldForType", "Article image block cannot specify 'text'.", ErrorType.Validation);
+                if (!string.IsNullOrWhiteSpace(b.Text) || !string.IsNullOrWhiteSpace(b.Tone) || !string.IsNullOrWhiteSpace(b.Title))
+                    return new Error("Json.InvalidFieldForType", "Article image block cannot specify 'text', 'tone', or 'title'.", ErrorType.Validation);
                 if (string.IsNullOrWhiteSpace(b.ImagePath))
                     return new Error("Json.InvalidSpec", "Article image block requires 'imagePath'.", ErrorType.Validation);
 
-                var imgRes = await JsonQuestionMaterializer.CopyConfinedImageAsync(b.ImagePath, jsonDir, storageDir, contentInspector, ct);
+                var imgRes = await JsonQuestionMaterializer.CopyConfinedImageAsync(b.ImagePath, compAssetDir, storageDir, contentInspector, ct, specRootDir, cwd);
                 if (!imgRes.IsSuccess) return imgRes.Error!;
                 if (string.IsNullOrWhiteSpace(imgRes.Value))
                     return new Error("Json.InvalidSpec", "Article image block requires a valid 'imagePath'.", ErrorType.Validation);
 
-                var res = comp.AddImageBlock(blockId, imgRes.Value);
+                var res = comp.AddImageBlock(blockId, imgRes.Value, caption: b.Caption, alt: b.Alt);
+                if (!res.IsSuccess) return res.Error!;
+                created = res.Value;
+            }
+            else if (bKind == "callout")
+            {
+                if (!string.IsNullOrWhiteSpace(b.ImagePath) || !string.IsNullOrWhiteSpace(b.Caption) || !string.IsNullOrWhiteSpace(b.Alt))
+                    return new Error("Json.InvalidFieldForType", "Article callout block cannot specify 'imagePath', 'caption', or 'alt'.", ErrorType.Validation);
+
+                CalloutTone tone = CalloutTone.Pearl;
+                if (!string.IsNullOrWhiteSpace(b.Tone) && !ArticleBlock.TryParseCalloutTone(b.Tone, out tone))
+                    return ArticleErrors.InvalidCalloutTone(b.Tone);
+
+                var res = comp.AddCalloutBlock(blockId, tone, b.Text ?? string.Empty, b.Title);
                 if (!res.IsSuccess) return res.Error!;
                 created = res.Value;
             }
             else
             {
-                return new Error("Json.InvalidSpec", $"Unsupported article block kind '{b.Kind}'. Use 'text' or 'image'.", ErrorType.Validation);
+                return new Error("Json.InvalidSpec", $"Unsupported article block kind '{b.Kind}'. Use 'text', 'image', or 'callout'.", ErrorType.Validation);
             }
 
             if (!string.IsNullOrWhiteSpace(b.Ref))
@@ -596,7 +679,9 @@ public sealed class ApplySpecHandler(
         Quiz quiz,
         string storageDir,
         IReadOnlyList<JsonQuestionSpec> questions,
-        string jsonDir,
+        string compAssetDir,
+        string specRootDir,
+        string cwd,
         HashSet<string> usedRefs,
         List<string> addedQuestions,
         CancellationToken ct)
@@ -605,7 +690,7 @@ public sealed class ApplySpecHandler(
         {
             var qId = idGenerator.NewQuestionId();
             var matRes = await JsonQuestionMaterializer.MaterializeAsync(
-                qId, quiz.Id, quiz.Questions.Count + 1, qSpec, jsonDir, storageDir, contentInspector, ct);
+                qId, quiz.Id, quiz.Questions.Count + 1, qSpec, compAssetDir, storageDir, contentInspector, ct, specRootDir, cwd);
             if (!matRes.IsSuccess) return matRes.Error!;
 
             if (matRes.Value.RefKey is not null && !usedRefs.Add(matRes.Value.RefKey))
@@ -616,6 +701,13 @@ public sealed class ApplySpecHandler(
             addedQuestions.Add(qId);
         }
         return Result.Success();
+    }
+
+    private static IReadOnlyList<string>? CompactIds(List<string> ids, bool quiet, bool verbose)
+    {
+        if (quiet || ids.Count == 0) return null;
+        if (!verbose && ids.Count > 10) return null;
+        return ids;
     }
 
     internal static HashSet<string> CollectSessionRefs(StudySession session)

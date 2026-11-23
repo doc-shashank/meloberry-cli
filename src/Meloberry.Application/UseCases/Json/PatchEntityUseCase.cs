@@ -36,7 +36,8 @@ public sealed class PatchEntityHandler(
         ["quiz"] = new(StringComparer.OrdinalIgnoreCase) { "name", "description" },
         ["component"] = new(StringComparer.OrdinalIgnoreCase) { "title", "ref", "layoutOverrides" },
         ["articleBlock:text"] = new(StringComparer.OrdinalIgnoreCase) { "text", "ref" },
-        ["articleBlock:image"] = new(StringComparer.OrdinalIgnoreCase) { "imagePath", "ref" },
+        ["articleBlock:image"] = new(StringComparer.OrdinalIgnoreCase) { "imagePath", "caption", "alt", "ref" },
+        ["articleBlock:callout"] = new(StringComparer.OrdinalIgnoreCase) { "tone", "title", "text", "ref" },
         ["question:mcq"] = new(StringComparer.OrdinalIgnoreCase) { "text", "imagePath", "explanation", "isMultiCorrect", "maxOptions", "options", "ref", "layoutOverrides" },
         ["question:flashcard"] = new(StringComparer.OrdinalIgnoreCase) { "front", "back", "ref", "layoutOverrides" }
     };
@@ -169,7 +170,12 @@ public sealed class PatchEntityHandler(
 
     private static string GetSchemaKey(ResolvedEntity target) => target.EntityKind switch
     {
-        "articleBlock" => target.ArticleBlock!.Kind == ArticleBlockKind.Text ? "articleBlock:text" : "articleBlock:image",
+        "articleBlock" => target.ArticleBlock!.Kind switch
+        {
+            ArticleBlockKind.Image => "articleBlock:image",
+            ArticleBlockKind.Callout => "articleBlock:callout",
+            _ => "articleBlock:text"
+        },
         "question" => target.Question is McqQuestion ? "question:mcq" : "question:flashcard",
         _ => target.EntityKind
     };
@@ -295,7 +301,25 @@ public sealed class PatchEntityHandler(
         {
             if (textNode is null || textNode.GetValueKind() != JsonValueKind.String)
                 return new Error("Patch.InvalidValue", "'text' must be a non-empty string.", ErrorType.Validation, Path: "text");
-            var res = block.UpdateText(textNode.GetValue<string>());
+            var res = block.Kind == ArticleBlockKind.Callout
+                ? block.UpdateCallout(null, textNode.GetValue<string>(), null)
+                : block.UpdateText(textNode.GetValue<string>());
+            if (!res.IsSuccess) return res.Error!;
+        }
+        if (TryGetProp(patch, "tone", out var toneNode))
+        {
+            if (toneNode is null || toneNode.GetValueKind() != JsonValueKind.String)
+                return new Error("Patch.InvalidValue", "'tone' must be 'pearl', 'clinical', or 'warning'.", ErrorType.Validation, Path: "tone");
+            if (!ArticleBlock.TryParseCalloutTone(toneNode.GetValue<string>(), out var tone))
+                return ArticleErrors.InvalidCalloutTone(toneNode.GetValue<string>());
+            var res = block.UpdateCallout(tone, null, null);
+            if (!res.IsSuccess) return res.Error!;
+        }
+        if (TryGetProp(patch, "title", out var titleNode))
+        {
+            if (titleNode is not null && titleNode.GetValueKind() != JsonValueKind.String)
+                return new Error("Patch.InvalidValue", "'title' must be a string or null.", ErrorType.Validation, Path: "title");
+            var res = block.UpdateCallout(null, null, titleNode?.GetValue<string>(), updateTitle: true);
             if (!res.IsSuccess) return res.Error!;
         }
         if (TryGetProp(patch, "imagePath", out var imgNode))
@@ -305,6 +329,20 @@ public sealed class PatchEntityHandler(
             var imgRes = await JsonQuestionMaterializer.CopyConfinedImageAsync(imgNode.GetValue<string>(), jsonDir, storageDir, contentInspector, ct);
             if (!imgRes.IsSuccess) return imgRes.Error!;
             var res = block.UpdateImage(imgRes.Value!);
+            if (!res.IsSuccess) return res.Error!;
+        }
+        if (TryGetProp(patch, "caption", out var capNode))
+        {
+            if (capNode is not null && capNode.GetValueKind() != JsonValueKind.String)
+                return new Error("Patch.InvalidValue", "'caption' must be a string or null.", ErrorType.Validation, Path: "caption");
+            var res = block.SetImageCaption(capNode?.GetValue<string>());
+            if (!res.IsSuccess) return res.Error!;
+        }
+        if (TryGetProp(patch, "alt", out var altNode))
+        {
+            if (altNode is not null && altNode.GetValueKind() != JsonValueKind.String)
+                return new Error("Patch.InvalidValue", "'alt' must be a string or null.", ErrorType.Validation, Path: "alt");
+            var res = block.SetImageAlt(altNode?.GetValue<string>());
             if (!res.IsSuccess) return res.Error!;
         }
         return Result.Success();

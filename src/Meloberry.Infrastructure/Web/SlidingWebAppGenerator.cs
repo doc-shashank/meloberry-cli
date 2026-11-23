@@ -86,9 +86,21 @@ public sealed class SlidingWebAppGenerator(ICliToolMetadataProvider metadataProv
     private static SlideRenderModel BuildArticleSlide(SessionComponent comp, IReadOnlyDictionary<string, LayoutProfile> layouts) =>
         new(comp.Id, "article", MergeProfile(layouts, "article", comp.LayoutOverrides, null), null, null,
             comp.ArticleBlocks.Select(b => new ArticleBlockRenderModel(
-                b.Id, b.Kind.ToString().ToLowerInvariant(),
-                b.Kind == ArticleBlockKind.Text && !string.IsNullOrWhiteSpace(b.TextContent) ? RenderSafeMarkdownHtml(b.TextContent) : null,
-                EncodeAssetPath(b.ImagePath))).ToList(), null, comp.Title);
+                b.Id,
+                b.Kind switch
+                {
+                    ArticleBlockKind.Image => "image",
+                    ArticleBlockKind.Callout => "callout",
+                    _ => "text"
+                },
+                (b.Kind is ArticleBlockKind.Text or ArticleBlockKind.Callout) && !string.IsNullOrWhiteSpace(b.TextContent)
+                    ? RenderSafeMarkdownHtml(b.TextContent)
+                    : null,
+                EncodeAssetPath(b.ImagePath),
+                !string.IsNullOrWhiteSpace(b.Caption) ? RenderSafeMarkdownHtml(b.Caption) : null,
+                b.Alt,
+                b.CalloutTone.HasValue ? ArticleBlock.CalloutToneToString(b.CalloutTone.Value) : null,
+                b.CalloutTitle)).ToList(), null, comp.Title);
 
     private static SlideRenderModel BuildQuestionSlide(
         Question question, IReadOnlyDictionary<string, LayoutProfile> layouts, IReadOnlyDictionary<string, string>? componentOverrides)
@@ -135,7 +147,7 @@ public sealed class SlidingWebAppGenerator(ICliToolMetadataProvider metadataProv
     {
         var outDir = !string.IsNullOrWhiteSpace(outputDirectory)
             ? Path.GetFullPath(outputDirectory)
-            : Path.Combine(Directory.GetParent(storageDirectory)?.FullName ?? Directory.GetCurrentDirectory(), $"{id}_web");
+            : Path.Combine(Packaging.MbypkgExporter.ResolveDefaultOutputBaseDirectory(storageDirectory), $"{id}_web");
         Directory.CreateDirectory(outDir);
 
         var dstAssets = Path.Combine(outDir, "assets");
@@ -169,7 +181,7 @@ public sealed class SlidingWebAppGenerator(ICliToolMetadataProvider metadataProv
     {
         static bool HasMath(string? html) => !string.IsNullOrEmpty(html) && html.Contains("class=\"math\"", StringComparison.Ordinal);
 
-        if (slide.ArticleBlocks is not null && slide.ArticleBlocks.Any(b => HasMath(b.TextHtml))) return true;
+        if (slide.ArticleBlocks is not null && slide.ArticleBlocks.Any(b => HasMath(b.TextHtml) || HasMath(b.CaptionHtml))) return true;
         if (slide.Mcq is not null && (HasMath(slide.Mcq.PromptHtml) || HasMath(slide.Mcq.ExplanationHtml) || slide.Mcq.Options.Any(o => HasMath(o.TextHtml)))) return true;
         if (slide.Flashcard is not null && (HasMath(slide.Flashcard.Front.TextHtml) || HasMath(slide.Flashcard.Back.TextHtml))) return true;
         return slide.Questions is not null && slide.Questions.Any(SlideContainsMath);
@@ -209,6 +221,7 @@ public sealed class SlidingWebAppGenerator(ICliToolMetadataProvider metadataProv
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="generator" content="{{WebUtility.HtmlEncode($"{toolMeta.ProductName} ({toolMeta.ExecutableName}) {toolMeta.Version}")}}" />
   <title>{{WebUtility.HtmlEncode(title)}} — Meloberry</title>
+  <link rel="icon" href="data:," />
   {{(includeKatex ? "<link rel=\"stylesheet\" href=\"katex/katex.min.css\" />\n  " : string.Empty)}}<link rel="stylesheet" href="styles.css" />
 </head>
 <body>
@@ -220,7 +233,10 @@ public sealed class SlidingWebAppGenerator(ICliToolMetadataProvider metadataProv
           <h1 id="greetingTitle" class="mby-greeting-title">{{WebUtility.HtmlEncode(title)}}</h1>
           <p id="greetingDesc" class="mby-greeting-desc">{{WebUtility.HtmlEncode(description ?? string.Empty)}}</p>
           <div id="greetingMeta" class="mby-greeting-meta"></div>
-          <button id="startSessionBtn" class="mby-nav-btn primary mby-start-btn" type="button">Start Session →</button>
+          <div class="mby-greeting-actions">
+            <button id="startSessionBtn" class="mby-nav-btn primary mby-start-btn" type="button">Start Session →</button>
+            <button id="greetingSearchBtn" class="mby-nav-btn mby-start-search-btn" type="button" title="Search study materials (Ctrl+K)">🔍 Search</button>
+          </div>
         </div>
         <div id="greetingGeneratorFooter" class="mby-generator-footer"></div>
       </div>
@@ -230,7 +246,10 @@ public sealed class SlidingWebAppGenerator(ICliToolMetadataProvider metadataProv
         <button id="backToSlidesBtn" class="mby-icon-btn hidden" type="button" title="Back to slides">←</button>
         <div class="mby-brand-wrap"><div id="topbarTitle" class="mby-brand">{{WebUtility.HtmlEncode(title)}}</div></div>
       </div>
-      <div class="mby-topbar-actions"><span id="topbarModeHint" class="mby-mode-hint"></span></div>
+      <div class="mby-topbar-actions">
+        <button id="topbarSearchBtn" class="mby-search-trigger" type="button" title="Search (Ctrl+K or /)">🔍 Search <kbd>Ctrl+K</kbd></button>
+        <span id="topbarModeHint" class="mby-mode-hint"></span>
+      </div>
     </header>
     <main id="playerViewport" class="mby-viewport hidden">
       <div id="slidesTrack" class="mby-slides-track"></div>
@@ -272,6 +291,16 @@ public sealed class SlidingWebAppGenerator(ICliToolMetadataProvider metadataProv
     </div>
     <div id="zoomStage" class="mby-zoom-stage"><img id="zoomTargetImg" class="mby-zoom-img" alt="Zoomed diagram" draggable="false" /></div>
   </div>
+  <div id="searchModal" class="mby-modal mby-search-modal hidden" role="dialog" aria-modal="true" aria-label="Search study materials">
+    <div class="mby-search-card">
+      <div class="mby-search-header">
+        <input id="searchInput" class="mby-search-input" type="search" placeholder="Search concepts, figures, tables, callouts, questions..." autocomplete="off" />
+        <button id="searchCloseBtn" class="mby-icon-btn" type="button" aria-label="Close search">✕</button>
+      </div>
+      <div id="searchMeta" class="mby-search-meta"></div>
+      <div id="searchResults" class="mby-search-results" role="listbox"></div>
+    </div>
+  </div>
   {{(includeKatex ? "<script src=\"katex/katex.min.js\"></script>\n  " : string.Empty)}}<script src="app.js"></script>
 </body>
 </html>
@@ -286,9 +315,14 @@ html, body { height: 100%; overflow: hidden; }
 .mby-greeting-title { margin: 0; font-size: 26px; font-weight: 800; letter-spacing: -0.02em; color: var(--text); }
 .mby-greeting-desc { margin: 0; font-size: 15px; line-height: 1.55; color: var(--muted); }
 .mby-greeting-meta { font-size: 13px; font-weight: 600; color: var(--accent); }
-.mby-start-btn { align-self: flex-start; margin-top: 6px; padding: 12px 24px !important; font-size: 15px; }
+.mby-greeting-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
+.mby-start-btn { padding: 12px 24px !important; font-size: 15px; }
+.mby-start-search-btn { padding: 11px 18px !important; font-size: 14px; }
 .mby-topbar { flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 24px; border-bottom: 1px solid var(--border); background: var(--surface); }
-.mby-topbar-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.mby-topbar-left, .mby-topbar-actions { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.mby-search-trigger { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); color: var(--muted); font-size: 13px; font-weight: 600; cursor: pointer; }
+.mby-search-trigger:hover { border-color: var(--accent); color: var(--accent); }
+.mby-search-trigger kbd { font-family: ui-monospace, Consolas, monospace; font-size: 11px; padding: 1px 6px; border-radius: 5px; border: 1px solid var(--border); background: var(--surface); color: var(--muted); }
 .mby-brand-wrap { display: flex; flex-direction: column; min-width: 0; }
 .mby-brand { font-weight: 800; font-size: 18px; color: var(--accent); letter-spacing: -0.02em; }
 .mby-icon-btn { width: 34px; height: 34px; border-radius: 9px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 16px; font-weight: 700; cursor: pointer; }
@@ -367,6 +401,20 @@ html, body { height: 100%; overflow: hidden; }
 .mby-zoom-stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; cursor: grab; }
 .mby-zoom-stage:active { cursor: grabbing; }
 .mby-zoom-img { max-width: 90vw; max-height: 82vh; object-fit: contain; user-select: none; transform-origin: center center; }
+.mby-search-modal { align-items: flex-start; padding-top: 9vh; z-index: 55; }
+.mby-search-card { width: 100%; max-width: 660px; background: var(--surface); border: 1px solid var(--border); border-radius: 18px; box-shadow: 0 24px 60px rgba(0, 0, 0, 0.28); overflow: hidden; display: flex; flex-direction: column; max-height: 76vh; }
+.mby-search-header { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--border); background: var(--bg); }
+.mby-search-input { flex: 1; padding: 10px 14px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface); color: var(--text); font-size: 15px; outline: none; }
+.mby-search-input:focus { border-color: var(--accent); }
+.mby-search-meta { padding: 8px 16px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--border); }
+.mby-search-results { overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+.mby-search-item { width: 100%; text-align: left; padding: 11px 14px; border-radius: 12px; border: 1px solid transparent; background: transparent; color: var(--text); cursor: pointer; display: flex; flex-direction: column; gap: 4px; }
+.mby-search-item:hover, .mby-search-item.active { background: var(--accent-soft); border-color: var(--border); }
+.mby-search-item-title { font-size: 12px; font-weight: 800; color: var(--accent); text-transform: uppercase; letter-spacing: 0.03em; }
+.mby-search-item-snippet { font-size: 13px; line-height: 1.45; color: var(--text); }
+.mby-search-item-snippet mark { background: var(--accent-soft); color: var(--accent); font-weight: 700; padding: 0 2px; border-radius: 3px; }
+.mby-search-empty { padding: 24px 16px; text-align: center; color: var(--muted); font-size: 14px; }
+.mby-search-pulse { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 10px; transition: outline-color 400ms ease; }
 """;
 
     private static string BuildJs(string payloadJson) => $$"""
@@ -379,6 +427,7 @@ const startSessionBtn = $('startSessionBtn'), playerTopbar = $('playerTopbar'), 
 const backToSlidesBtn = $('backToSlidesBtn'), topbarModeHint = $('topbarModeHint'), prevBtn = $('prevBtn'), prevCompMenu = $('prevCompMenu'), prevCompMenuItem = $('prevCompMenuItem');
 const nextBtn = $('nextBtn'), finishBtn = $('finishBtn'), continueSessionBtn = $('continueSessionBtn'), earlyFinishModal = $('earlyFinishModal'), dotsNav = $('dotsNav');
 const imageZoomModal = $('imageZoomModal'), zoomTargetImg = $('zoomTargetImg'), zoomStage = $('zoomStage'), zoomPercentBadge = $('zoomPercentBadge');
+const searchModal = $('searchModal'), searchInput = $('searchInput'), searchResultsEl = $('searchResults'), searchMetaEl = $('searchMeta'), topbarSearchBtn = $('topbarSearchBtn'), greetingSearchBtn = $('greetingSearchBtn'), searchCloseBtn = $('searchCloseBtn');
 const SAVE_ICON_SVG = '<svg class="mby-save-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm-5 16c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3zm3-10H5V5h10v4z"/></svg>';
 
 let currentIndex = 0, isFinished = false, sessionStartedAt = new Date(), activeLeafEnterMs = null, autoSaveSent = false;
@@ -420,7 +469,7 @@ function updateZoomTransform() {
   zoomPercentBadge.textContent = `${Math.round(zoomScale * 100)}%`;
   $('zoomResetBtn').classList.toggle('hidden', zoomScale <= 1.01);
 }
-function openZoomLightbox(src) { zoomTargetImg.src = src; zoomScale = 1; zoomTx = 0; zoomTy = 0; updateZoomTransform(); imageZoomModal.classList.remove('hidden'); }
+function openZoomLightbox(src, alt) { zoomTargetImg.src = src; zoomTargetImg.alt = alt || 'Zoomed diagram'; zoomScale = 1; zoomTx = 0; zoomTy = 0; updateZoomTransform(); imageZoomModal.classList.remove('hidden'); }
 function closeZoomLightbox() { imageZoomModal.classList.add('hidden'); }
 $('zoomInBtn').addEventListener('click', () => { zoomScale = Math.min(5, zoomScale + 0.5); updateZoomTransform(); });
 $('zoomOutBtn').addEventListener('click', () => { zoomScale = Math.max(1, zoomScale - 0.5); updateZoomTransform(); });
@@ -432,7 +481,18 @@ zoomStage.addEventListener('pointerdown', e => { if (zoomScale <= 1) return; isD
 zoomStage.addEventListener('pointermove', e => { if (!isDraggingZoom) return; zoomTx = e.clientX - dragStartX; zoomTy = e.clientY - dragStartY; updateZoomTransform(); });
 zoomStage.addEventListener('pointerup', () => { isDraggingZoom = false; });
 
-const makeZoomImg = src => createZoomableImageNode(src, openZoomLightbox, () => requestAnimationFrame(updateScrollDownHint));
+const makeZoomImg = (src, alt) => createZoomableImageNode(src, openZoomLightbox, () => requestAnimationFrame(updateScrollDownHint), alt);
+function htmlToPlainText(html) {
+  if (!html) return '';
+  const d = document.createElement('div');
+  d.innerHTML = html;
+  return (d.textContent || d.innerText || '').replace(/\s+/g, ' ').trim();
+}
+function calloutDefaultTitle(tone) {
+  if (tone === 'clinical') return 'Clinical Correlation';
+  if (tone === 'warning') return 'Warning';
+  return 'High-Yield Pearl';
+}
 function renderMathIn(root) {
   if (!root || typeof katex === 'undefined') return;
   root.querySelectorAll('.math').forEach(el => {
@@ -812,8 +872,38 @@ function renderSlides() {
     if (slide.kind === 'article') {
       const card = mk('div', 'mby-card', null, [createUpperTab(slide.title ? 'ARTICLE • ' + slide.title : 'ARTICLE')]); applySlideLayoutVars(card, slide.layout);
       const stack = mk('div', 'mby-article-blocks', null, (slide.articleBlocks || []).map(b => {
-        if (b.kind === 'text' && b.textHtml) { const d = mk('div'); d.innerHTML = b.textHtml; renderMathIn(d); return d; }
-        return b.imagePath ? makeZoomImg(b.imagePath) : null;
+        if (b.kind === 'text' && b.textHtml) {
+          const d = mk('div');
+          d.dataset.blockId = b.id;
+          d.innerHTML = b.textHtml;
+          renderMathIn(d);
+          return d;
+        }
+        if (b.kind === 'callout' && b.textHtml) {
+          const tone = b.tone || 'pearl';
+          const hdr = mk('div', 'mby-callout-header', b.title || calloutDefaultTitle(tone));
+          const body = mk('div', 'mby-callout-body');
+          body.innerHTML = b.textHtml;
+          renderMathIn(body);
+          const aside = mk('aside', `mby-callout mby-callout-${tone}`, null, [hdr, body]);
+          aside.setAttribute('role', 'note');
+          aside.dataset.blockId = b.id;
+          return aside;
+        }
+        if (b.imagePath) {
+          const plainCap = htmlToPlainText(b.captionHtml);
+          const figChildren = [makeZoomImg(b.imagePath, b.alt || plainCap)];
+          if (b.captionHtml) {
+            const figCap = mk('figcaption', 'mby-figcaption');
+            figCap.innerHTML = b.captionHtml;
+            renderMathIn(figCap);
+            figChildren.push(figCap);
+          }
+          const fig = mk('figure', 'mby-figure', null, figChildren);
+          fig.dataset.blockId = b.id;
+          return fig;
+        }
+        return null;
       }));
       card.appendChild(mk('div', 'mby-card-body', null, [stack]));
       slideEl.appendChild(card);
@@ -857,7 +947,172 @@ document.addEventListener('click', e => { if (!prevCompMenu.classList.contains('
 bindLongPress(nextBtn, { delayMs: 550, preventContextMenu: false, canTrigger: () => !isAtFinalSaveStep(), onLongPress: () => earlyFinishModal.classList.remove('hidden'), onClick: navigateNext });
 continueSessionBtn.addEventListener('click', () => earlyFinishModal.classList.add('hidden'));
 finishBtn.addEventListener('click', () => { earlyFinishModal.classList.add('hidden'); openFinishScreen(true); });
+const SEARCH_INDEX = (() => {
+  const entries = [];
+  DATA.slides.forEach((slide, slideIdx) => {
+    const slideName = getComponentDisplayName(slide);
+    if (slide.kind === 'article') {
+      (slide.articleBlocks || []).forEach(b => {
+        const parts = [];
+        if (slide.title) parts.push(slide.title);
+        if (b.title) parts.push(b.title);
+        if (b.textHtml) parts.push(htmlToPlainText(b.textHtml));
+        if (b.captionHtml) parts.push(htmlToPlainText(b.captionHtml));
+        if (b.alt) parts.push(b.alt);
+        const rawText = parts.join(' ').replace(/\s+/g, ' ').trim();
+        if (rawText) entries.push({ slideIdx, qIdx: null, blockId: b.id, title: `${slideName} • ${b.kind.toUpperCase()}`, rawText, lower: rawText.toLowerCase() });
+      });
+    } else if (slide.kind === 'quiz' && Array.isArray(slide.questions)) {
+      slide.questions.forEach((q, qIdx) => {
+        const parts = [slideName];
+        if (q.mcq) {
+          parts.push(htmlToPlainText(q.mcq.promptHtml));
+          q.mcq.options.forEach(o => { if (o.textHtml) parts.push(htmlToPlainText(o.textHtml)); });
+          if (q.mcq.explanationHtml) parts.push(htmlToPlainText(q.mcq.explanationHtml));
+        } else if (q.flashcard) {
+          parts.push(htmlToPlainText(q.flashcard.front.textHtml));
+          parts.push(htmlToPlainText(q.flashcard.back.textHtml));
+        }
+        const rawText = parts.join(' ').replace(/\s+/g, ' ').trim();
+        if (rawText) entries.push({ slideIdx, qIdx, blockId: null, title: `${slideName} • Q${qIdx + 1}`, rawText, lower: rawText.toLowerCase() });
+      });
+    } else if (slide.mcq || slide.flashcard) {
+      const parts = [slideName];
+      if (slide.mcq) {
+        parts.push(htmlToPlainText(slide.mcq.promptHtml));
+        slide.mcq.options.forEach(o => { if (o.textHtml) parts.push(htmlToPlainText(o.textHtml)); });
+        if (slide.mcq.explanationHtml) parts.push(htmlToPlainText(slide.mcq.explanationHtml));
+      } else if (slide.flashcard) {
+        parts.push(htmlToPlainText(slide.flashcard.front.textHtml));
+        parts.push(htmlToPlainText(slide.flashcard.back.textHtml));
+      }
+      const rawText = parts.join(' ').replace(/\s+/g, ' ').trim();
+      if (rawText) entries.push({ slideIdx, qIdx: null, blockId: null, title: slideName, rawText, lower: rawText.toLowerCase() });
+    }
+  });
+  return entries;
+})();
+
+let activeSearchIdx = 0;
+let currentSearchMatches = [];
+
+function highlightMatchSnippet(rawText, tokens) {
+  let center = 0;
+  const lower = rawText.toLowerCase();
+  for (const t of tokens) {
+    const pos = lower.indexOf(t);
+    if (pos >= 0) { center = pos; break; }
+  }
+  const start = Math.max(0, center - 45);
+  const end = Math.min(rawText.length, start + 165);
+  let slice = (start > 0 ? '...' : '') + rawText.slice(start, end) + (end < rawText.length ? '...' : '');
+  const escaped = escapeHtml(slice);
+  if (tokens.length === 0) return escaped;
+  const pattern = tokens.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+  return escaped.replace(new RegExp(`(${pattern})`, 'gi'), '<mark>$1</mark>');
+}
+
+function renderSearchResults() {
+  const q = (searchInput?.value || '').trim().toLowerCase();
+  const tokens = q.split(/\s+/).filter(Boolean);
+  currentSearchMatches = tokens.length === 0
+    ? SEARCH_INDEX.slice(0, 20)
+    : SEARCH_INDEX.filter(item => tokens.every(t => item.lower.includes(t))).slice(0, 40);
+  if (activeSearchIdx >= currentSearchMatches.length) activeSearchIdx = Math.max(0, currentSearchMatches.length - 1);
+  if (searchMetaEl) searchMetaEl.textContent = tokens.length === 0 ? `Showing ${currentSearchMatches.length} of ${SEARCH_INDEX.length} indexed item(s)` : `${currentSearchMatches.length} match(es) for "${searchInput.value.trim()}"`;
+  searchResultsEl.innerHTML = '';
+  if (currentSearchMatches.length === 0) {
+    searchResultsEl.appendChild(mk('div', 'mby-search-empty', 'No matching study blocks or questions found.'));
+    return;
+  }
+  currentSearchMatches.forEach((item, idx) => {
+    const btn = mk('button', 'mby-search-item' + (idx === activeSearchIdx ? ' active' : ''));
+    btn.type = 'button';
+    btn.appendChild(mk('div', 'mby-search-item-title', item.title));
+    const snip = mk('div', 'mby-search-item-snippet');
+    snip.innerHTML = highlightMatchSnippet(item.rawText, tokens);
+    btn.appendChild(snip);
+    btn.addEventListener('click', () => jumpToSearchEntry(item));
+    searchResultsEl.appendChild(btn);
+  });
+}
+
+function openSearchModal() {
+  if (!searchModal) return;
+  searchModal.classList.remove('hidden');
+  activeSearchIdx = 0;
+  renderSearchResults();
+  requestAnimationFrame(() => { searchInput?.focus(); searchInput?.select(); });
+}
+function closeSearchModal() { if (searchModal) searchModal.classList.add('hidden'); }
+function jumpToSearchEntry(item) {
+  closeSearchModal();
+  if (!greetingScreen.classList.contains('hidden')) {
+    greetingScreen.classList.add('hidden'); playerTopbar.classList.remove('hidden'); playerViewport.classList.remove('hidden'); playerControls.classList.remove('hidden');
+    sessionStartedAt = new Date(); activeLeafEnterMs = null;
+  } else if (isFinished) {
+    returnToSlides();
+  }
+  goToSlide(item.slideIdx);
+  if (item.qIdx !== null) {
+    const slide = DATA.slides[item.slideIdx];
+    quizControllers.get(slide?.id)?.selectQuestion(item.qIdx);
+  }
+  if (item.blockId) {
+    requestAnimationFrame(() => {
+      const targetEl = track.children[item.slideIdx]?.querySelector(`[data-block-id="${CSS.escape(item.blockId)}"]`);
+      if (targetEl) {
+        targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        targetEl.classList.add('mby-search-pulse');
+        setTimeout(() => targetEl.classList.remove('mby-search-pulse'), 1600);
+      }
+    });
+  }
+}
+
+topbarSearchBtn?.addEventListener('click', openSearchModal);
+greetingSearchBtn?.addEventListener('click', openSearchModal);
+searchCloseBtn?.addEventListener('click', closeSearchModal);
+searchModal?.addEventListener('click', e => { if (e.target === searchModal) closeSearchModal(); });
+searchInput?.addEventListener('input', () => { activeSearchIdx = 0; renderSearchResults(); });
+
 document.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) {
+    e.preventDefault();
+    if (searchModal && !searchModal.classList.contains('hidden')) closeSearchModal();
+    else openSearchModal();
+    return;
+  }
+  if (!searchModal?.classList.contains('hidden')) {
+    if (e.key === 'Escape') { e.preventDefault(); closeSearchModal(); return; }
+    if (e.key === 'ArrowDown' && currentSearchMatches.length > 0) {
+      e.preventDefault();
+      activeSearchIdx = Math.min(currentSearchMatches.length - 1, activeSearchIdx + 1);
+      Array.from(searchResultsEl.children).forEach((el, i) => el.classList.toggle('active', i === activeSearchIdx));
+      searchResultsEl.children[activeSearchIdx]?.scrollIntoView({ block: 'nearest' });
+      return;
+    }
+    if (e.key === 'ArrowUp' && currentSearchMatches.length > 0) {
+      e.preventDefault();
+      activeSearchIdx = Math.max(0, activeSearchIdx - 1);
+      Array.from(searchResultsEl.children).forEach((el, i) => el.classList.toggle('active', i === activeSearchIdx));
+      searchResultsEl.children[activeSearchIdx]?.scrollIntoView({ block: 'nearest' });
+      return;
+    }
+    if (e.key === 'Enter' && currentSearchMatches[activeSearchIdx]) {
+      e.preventDefault();
+      jumpToSearchEntry(currentSearchMatches[activeSearchIdx]);
+      return;
+    }
+    return;
+  }
+  const tag = (e.target?.tagName || '').toLowerCase();
+  const isTyping = tag === 'input' || tag === 'textarea' || e.target?.isContentEditable;
+  if (e.key === '/' && !isTyping && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    openSearchModal();
+    return;
+  }
   if (!imageZoomModal.classList.contains('hidden')) { if (e.key === 'Escape') closeZoomLightbox(); return; }
   if (!earlyFinishModal.classList.contains('hidden')) { if (e.key === 'Escape') earlyFinishModal.classList.add('hidden'); return; }
   if (!prevCompMenu.classList.contains('hidden') && e.key === 'Escape') { closePrevCompMenu(); return; }
@@ -869,7 +1124,7 @@ renderSlides();
     private sealed record WebBundlePayload(string Id, string Title, string? Description, string ThemeMode, string SlideTransitionMs, WebGeneratorInfoModel Generator, List<SlideRenderModel> Slides);
     private sealed record WebGeneratorInfoModel(string ToolName, string Executable, string Version, string Runtime, string GeneratedAtUtc);
     private sealed record SlideRenderModel(string Id, string Kind, Dictionary<string, string> Layout, McqRenderModel? Mcq, FlashcardRenderModel? Flashcard, List<ArticleBlockRenderModel>? ArticleBlocks, List<SlideRenderModel>? Questions, string? Title = null);
-    private sealed record ArticleBlockRenderModel(string Id, string Kind, string? TextHtml, string? ImagePath);
+    private sealed record ArticleBlockRenderModel(string Id, string Kind, string? TextHtml, string? ImagePath, string? CaptionHtml = null, string? Alt = null, string? Tone = null, string? Title = null);
     private sealed record McqRenderModel(string PromptHtml, bool IsMultiCorrect, List<McqOptionRenderModel> Options, string? ImagePath = null, string? ExplanationHtml = null);
     private sealed record McqOptionRenderModel(int Index, string? TextHtml, string? ImagePath, bool IsCorrect);
     private sealed record FlashcardRenderModel(FlashcardSideRenderModel Front, FlashcardSideRenderModel Back);

@@ -35,8 +35,13 @@ public sealed class SqliteWorkspaceRepository(
                         foreach (var b in comp.ArticleBlocks)
                         {
                             ownedIds.Add(b.Id);
-                            await ExecAsync(conn, tx, "INSERT INTO ArticleBlocks (Id, ComponentId, SortIndex, BlockKind, TextContent, ImagePath, RefKey) VALUES ($id, $cid, $idx, $kind, $txt, $img, $ref);",
-                                cancellationToken, ("$id", b.Id), ("$cid", b.ComponentId), ("$idx", b.Index), ("$kind", b.Kind.ToString()), ("$txt", b.TextContent), ("$img", b.ImagePath), ("$ref", b.RefKey));
+                            string? toneStr = b.CalloutTone.HasValue ? ArticleBlock.CalloutToneToString(b.CalloutTone.Value) : null;
+                            await ExecAsync(conn, tx,
+                                "INSERT INTO ArticleBlocks (Id, ComponentId, SortIndex, BlockKind, TextContent, ImagePath, RefKey, Caption, Alt, CalloutTone, CalloutTitle) VALUES ($id, $cid, $idx, $kind, $txt, $img, $ref, $cap, $alt, $tone, $ctitle);",
+                                cancellationToken,
+                                ("$id", b.Id), ("$cid", b.ComponentId), ("$idx", b.Index), ("$kind", b.Kind.ToString()),
+                                ("$txt", b.TextContent), ("$img", b.ImagePath), ("$ref", b.RefKey),
+                                ("$cap", b.Caption), ("$alt", b.Alt), ("$tone", toneStr), ("$ctitle", b.CalloutTitle));
                         }
                     }
                     else if (comp.Quiz is not null)
@@ -271,15 +276,23 @@ public sealed class SqliteWorkspaceRepository(
 
     private async Task ScanDirectoryForWorkspacesAsync(string rootDir, CancellationToken ct)
     {
-        if (!Directory.Exists(rootDir)) return;
-        foreach (var subDir in Directory.EnumerateDirectories(rootDir))
+        var dirsToScan = new List<string> { rootDir };
+        var meloberryWorkspaces = Path.Combine(rootDir, ".meloberry", "workspaces");
+        if (Directory.Exists(meloberryWorkspaces))
+            dirsToScan.Add(meloberryWorkspaces);
+
+        foreach (var scanDir in dirsToScan)
         {
-            var dirName = Path.GetFileName(subDir);
-            if (!dirName.StartsWith("Session_", StringComparison.Ordinal) && !dirName.StartsWith("Set_", StringComparison.Ordinal))
-                continue;
-            var candidateDb = Path.Combine(subDir, $"{dirName}.db");
-            if (!File.Exists(candidateDb)) continue;
-            try { await IndexExternalDatabaseAsync(candidateDb, subDir, ct); } catch { }
+            if (!Directory.Exists(scanDir)) continue;
+            foreach (var subDir in Directory.EnumerateDirectories(scanDir))
+            {
+                var dirName = Path.GetFileName(subDir);
+                if (!dirName.StartsWith("Session_", StringComparison.Ordinal) && !dirName.StartsWith("Set_", StringComparison.Ordinal))
+                    continue;
+                var candidateDb = Path.Combine(subDir, $"{dirName}.db");
+                if (!File.Exists(candidateDb)) continue;
+                try { await IndexExternalDatabaseAsync(candidateDb, subDir, ct); } catch { }
+            }
         }
     }
 
@@ -353,13 +366,13 @@ public sealed class SqliteWorkspaceRepository(
         await ExecAsync(conn, null, """
             CREATE TABLE IF NOT EXISTS WorkspaceMeta (Id TEXT PRIMARY KEY, Kind TEXT NOT NULL, SubType TEXT NOT NULL, ActiveComponentId TEXT NULL, Name TEXT NULL, Description TEXT NULL);
             CREATE TABLE IF NOT EXISTS Components (Id TEXT PRIMARY KEY, SortIndex INTEGER NOT NULL, Kind TEXT NOT NULL, QuizType TEXT NULL, LayoutOverridesJson TEXT NULL, Title TEXT NULL, RefKey TEXT NULL);
-            CREATE TABLE IF NOT EXISTS ArticleBlocks (Id TEXT PRIMARY KEY, ComponentId TEXT NOT NULL, SortIndex INTEGER NOT NULL, BlockKind TEXT NOT NULL, TextContent TEXT NULL, ImagePath TEXT NULL, RefKey TEXT NULL);
+            CREATE TABLE IF NOT EXISTS ArticleBlocks (Id TEXT PRIMARY KEY, ComponentId TEXT NOT NULL, SortIndex INTEGER NOT NULL, BlockKind TEXT NOT NULL, TextContent TEXT NULL, ImagePath TEXT NULL, RefKey TEXT NULL, Caption TEXT NULL, Alt TEXT NULL, CalloutTone TEXT NULL, CalloutTitle TEXT NULL);
             CREATE TABLE IF NOT EXISTS Questions (Id TEXT PRIMARY KEY, ContainerId TEXT NOT NULL, SortIndex INTEGER NOT NULL, QuestionType TEXT NOT NULL, PromptText TEXT NULL, MaxOptions INTEGER NOT NULL, IsMultiCorrect INTEGER NOT NULL, FrontText TEXT NULL, FrontImagePath TEXT NULL, FrontPosition TEXT NULL, BackText TEXT NULL, BackImagePath TEXT NULL, BackPosition TEXT NULL, LayoutOverridesJson TEXT NULL, PromptImagePath TEXT NULL, Explanation TEXT NULL, RefKey TEXT NULL);
             CREATE TABLE IF NOT EXISTS McqOptions (QuestionId TEXT NOT NULL, OptionIndex INTEGER NOT NULL, OptionText TEXT NULL, ImagePath TEXT NULL, IsCorrect INTEGER NOT NULL, PRIMARY KEY (QuestionId, OptionIndex));
             """, ct);
         await EnsureTableColumnsAsync(conn, ct, "WorkspaceMeta", "Name", "Description");
         await EnsureTableColumnsAsync(conn, ct, "Components", "Title", "RefKey");
-        await EnsureTableColumnsAsync(conn, ct, "ArticleBlocks", "RefKey");
+        await EnsureTableColumnsAsync(conn, ct, "ArticleBlocks", "RefKey", "Caption", "Alt", "CalloutTone", "CalloutTitle");
         await EnsureTableColumnsAsync(conn, ct, "Questions", "PromptImagePath", "Explanation", "RefKey");
     }
 
@@ -418,7 +431,7 @@ public sealed class SqliteWorkspaceRepository(
         await conn.OpenAsync(ct);
         await EnsureTableColumnsAsync(conn, ct, "WorkspaceMeta", "Name", "Description");
         await EnsureTableColumnsAsync(conn, ct, "Components", "Title", "RefKey");
-        await EnsureTableColumnsAsync(conn, ct, "ArticleBlocks", "RefKey");
+        await EnsureTableColumnsAsync(conn, ct, "ArticleBlocks", "RefKey", "Caption", "Alt", "CalloutTone", "CalloutTitle");
         await EnsureTableColumnsAsync(conn, ct, "Questions", "PromptImagePath", "Explanation", "RefKey");
 
         string sessionId; string? activeId, name, desc;
@@ -490,14 +503,27 @@ public sealed class SqliteWorkspaceRepository(
     {
         var map = new Dictionary<string, List<ArticleBlock>>(StringComparer.Ordinal);
         await using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT Id, ComponentId, SortIndex, BlockKind, TextContent, ImagePath, RefKey FROM ArticleBlocks ORDER BY SortIndex;";
+        cmd.CommandText = "SELECT Id, ComponentId, SortIndex, BlockKind, TextContent, ImagePath, RefKey, Caption, Alt, CalloutTone, CalloutTitle FROM ArticleBlocks ORDER BY SortIndex;";
         await using var r = await cmd.ExecuteReaderAsync(ct);
         while (await r.ReadAsync(ct))
         {
             var compId = r.GetString(1);
             var kind = Enum.TryParse<ArticleBlockKind>(r.GetString(3), true, out var bk) ? bk : ArticleBlockKind.Text;
-            var block = ArticleBlock.Rehydrate(r.GetString(0), compId, Math.Max(1, r.GetInt32(2)), kind,
-                r.IsDBNull(4) ? null : r.GetString(4), r.IsDBNull(5) ? null : r.GetString(5), r.IsDBNull(6) ? null : r.GetString(6));
+            CalloutTone? calloutTone = null;
+            if (!r.IsDBNull(9) && ArticleBlock.TryParseCalloutTone(r.GetString(9), out var parsedTone))
+                calloutTone = parsedTone;
+            else if (kind == ArticleBlockKind.Callout)
+                calloutTone = CalloutTone.Pearl;
+
+            var block = ArticleBlock.Rehydrate(
+                r.GetString(0), compId, Math.Max(1, r.GetInt32(2)), kind,
+                r.IsDBNull(4) ? null : r.GetString(4),
+                r.IsDBNull(5) ? null : r.GetString(5),
+                r.IsDBNull(6) ? null : r.GetString(6),
+                r.IsDBNull(7) ? null : r.GetString(7),
+                r.IsDBNull(8) ? null : r.GetString(8),
+                calloutTone,
+                r.IsDBNull(10) ? null : r.GetString(10));
             (map.TryGetValue(compId, out var list) ? list : map[compId] = []).Add(block);
         }
         return map;

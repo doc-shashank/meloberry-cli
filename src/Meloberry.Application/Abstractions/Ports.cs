@@ -27,7 +27,15 @@ public sealed record JsonQuestionSpec(
     string? Explanation = null,
     string? Ref = null);
 
-public sealed record DeclarativeArticleBlockSpec(string Kind, string? Text, string? ImagePath, string? Ref = null);
+public sealed record DeclarativeArticleBlockSpec(
+    string Kind,
+    string? Text,
+    string? ImagePath,
+    string? Ref = null,
+    string? Caption = null,
+    string? Alt = null,
+    string? Tone = null,
+    string? Title = null);
 
 public sealed record DeclarativeComponentSpec(
     string Kind,
@@ -36,7 +44,8 @@ public sealed record DeclarativeComponentSpec(
     IReadOnlyList<DeclarativeArticleBlockSpec>? Blocks,
     IReadOnlyList<JsonQuestionSpec>? Questions,
     Dictionary<string, string>? LayoutOverrides,
-    string? Ref = null);
+    string? Ref = null,
+    string? SourceDirectory = null);
 
 public sealed record DeclarativeApplySpec(
     string? Kind,
@@ -47,12 +56,13 @@ public sealed record DeclarativeApplySpec(
     IReadOnlyList<DeclarativeComponentSpec>? Components,
     IReadOnlyList<DeclarativeArticleBlockSpec>? Blocks,
     IReadOnlyList<JsonQuestionSpec>? Questions,
-    Dictionary<string, string>? LayoutOverrides);
+    Dictionary<string, string>? LayoutOverrides,
+    string? AssetBaseDirectory = null);
 
 public interface IDeclarativeSpecLoader
 {
-    Task<Result<DeclarativeApplySpec>> LoadAsync(string jsonFilePath, CancellationToken cancellationToken = default);
-    Task<Result<DeclarativeApplySpec>> LoadFromTextAsync(string rawJson, CancellationToken cancellationToken = default);
+    Task<Result<DeclarativeApplySpec>> LoadAsync(string specPath, CancellationToken cancellationToken = default);
+    Task<Result<DeclarativeApplySpec>> LoadFromTextAsync(string rawText, CancellationToken cancellationToken = default);
 }
 
 public sealed record SessionLookupContext(StudySession Session, string StorageDirectory);
@@ -166,6 +176,27 @@ public interface IWebAppGenerator
 }
 
 public sealed record SavedAnalysisFiles(string JsonPath, string MarkdownPath, SessionAnalysisReport Report);
+
+public sealed record WebAppVerificationReport(
+    bool Passed,
+    string WebDir,
+    string Engine,
+    int SlidesChecked,
+    int ImagesChecked,
+    IReadOnlyList<string> ConsoleErrors,
+    IReadOnlyList<string> BrokenAssets,
+    IReadOnlyList<string> OverflowIssues,
+    IReadOnlyList<string> KatexErrors,
+    string? ReportPath);
+
+public interface IHeadlessWebAppVerifier
+{
+    Task<Result<WebAppVerificationReport>> VerifyAsync(
+        string webDirectory,
+        bool staticOnly = false,
+        int timeoutSeconds = 30,
+        CancellationToken cancellationToken = default);
+}
 
 public interface IAnalysisReportStore
 {

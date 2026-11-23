@@ -202,7 +202,9 @@ public sealed partial class BatchOperationsHandler(
                 if (string.IsNullOrWhiteSpace(addr))
                     return (false, null, null, new Error("Batch.InvalidOp", "'build' requires 'addr'.", ErrorType.Validation));
                 var outDir = GetString(obj, "out");
-                var res = await buildHandler.HandleAsync(new BuildWebAppCommand(addr, outDir), ct);
+                bool verify = GetBool(obj, "verify");
+                bool staticOnly = GetBool(obj, "staticOnly");
+                var res = await buildHandler.HandleAsync(new BuildWebAppCommand(addr, outDir, Verify: verify, StaticVerifyOnly: staticOnly), ct);
                 return res.IsSuccess
                     ? (true, res.Value, res.Value.TargetId, null)
                     : (false, null, null, res.Error);

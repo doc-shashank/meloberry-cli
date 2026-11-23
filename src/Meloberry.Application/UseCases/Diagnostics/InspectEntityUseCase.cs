@@ -38,7 +38,11 @@ public sealed record InspectArticleBlockDto(
     string? Ref = null,
     string? Snippet = null,
     string? TextContent = null,
-    string? ImagePath = null);
+    string? ImagePath = null,
+    string? Caption = null,
+    string? Alt = null,
+    string? Tone = null,
+    string? Title = null);
 
 public sealed record InspectComponentDto(
     string Id,
@@ -181,14 +185,26 @@ public sealed class InspectEntityHandler(EntityAddressResolver addressResolver)
 
     private static InspectArticleBlockDto MapBlock(ArticleBlock block, string path, InspectViewMode view)
     {
-        string kind = block.Kind == ArticleBlockKind.Text ? "text" : "image";
+        string kind = block.Kind switch
+        {
+            ArticleBlockKind.Image => "image",
+            ArticleBlockKind.Callout => "callout",
+            _ => "text"
+        };
+        string? toneStr = block.CalloutTone.HasValue ? ArticleBlock.CalloutToneToString(block.CalloutTone.Value) : null;
+
         if (view == InspectViewMode.Ids)
             return new(Id: block.Id, Index: block.Index, Kind: kind, Path: path, Ref: block.RefKey);
 
         if (view == InspectViewMode.Outline)
         {
-            var raw = block.Kind == ArticleBlockKind.Text ? block.TextContent : block.ImagePath;
-            return new(Id: block.Id, Index: block.Index, Kind: kind, Path: path, Ref: block.RefKey, Snippet: MakeSnippet(raw));
+            var raw = block.Kind switch
+            {
+                ArticleBlockKind.Image => string.IsNullOrWhiteSpace(block.Caption) ? block.ImagePath : $"{block.ImagePath} ({block.Caption})",
+                ArticleBlockKind.Callout => $"[{toneStr ?? "pearl"}] {(string.IsNullOrWhiteSpace(block.CalloutTitle) ? "" : block.CalloutTitle + ": ")}{block.TextContent}",
+                _ => block.TextContent
+            };
+            return new(Id: block.Id, Index: block.Index, Kind: kind, Path: path, Ref: block.RefKey, Snippet: MakeSnippet(raw), Tone: toneStr);
         }
 
         return new(
@@ -198,7 +214,11 @@ public sealed class InspectEntityHandler(EntityAddressResolver addressResolver)
             Path: path,
             Ref: block.RefKey,
             TextContent: block.TextContent,
-            ImagePath: block.ImagePath);
+            ImagePath: block.ImagePath,
+            Caption: block.Caption,
+            Alt: block.Alt,
+            Tone: toneStr,
+            Title: block.CalloutTitle);
     }
 
     private static InspectQuestionDto MapQuestion(Question question, string path, InspectViewMode view)

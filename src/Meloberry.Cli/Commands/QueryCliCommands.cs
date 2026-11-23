@@ -134,9 +134,15 @@ public sealed class CheckCliCommand : CliCommand
     public CheckCliCommand()
         : base(new CommandDescriptor(
             Verb: "check",
-            Usage: "check <addr>",
+            Usage: "check <addr> [--quiet] [--verbose]",
             Description: "Runs mandatory lint validation on a workspace or sub-entity.",
-            HandlerType: typeof(Handler)))
+            HandlerType: typeof(Handler),
+            OptionsHelp:
+            [
+                "--quiet    Omit empty issues array when lint is clean.",
+                "--verbose  Include full issue details."
+            ],
+            Examples: ["mby check Session_2026... --quiet --json"]))
     {
     }
 
@@ -147,7 +153,9 @@ public sealed class CheckCliCommand : CliCommand
             if (context.PositionalArgs.Count != 1)
                 return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: check <addr>", context.GlobalOptions.Json);
 
-            var result = await useCase.HandleAsync(new LintCommand(context.PositionalArgs[0]), context.CancellationToken);
+            var result = await useCase.HandleAsync(
+                new LintCommand(context.PositionalArgs[0], context.GlobalOptions.Quiet, context.GlobalOptions.Verbose),
+                context.CancellationToken);
             if (!result.IsSuccess) return result.ToExitCode(context.Console, context.GlobalOptions.Json);
 
             var report = result.Value;

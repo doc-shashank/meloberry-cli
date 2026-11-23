@@ -1,13 +1,13 @@
 # Meloberry CLI (`mby`)
 
-Stateless, AI-agent-first compiler for deterministic study helper WebApps. Agents supply content and organization via strict JSON; `mby` owns themes, layout bounds, validation, and rendering.
+Stateless, AI-agent-first compiler for deterministic study helper WebApps. Agents supply content and organization via JSON, Markdown (`.md` + frontmatter), or modular directories; `mby` owns themes, layout bounds, validation, and rendering.
 
 ## Docs
 
 - [COMMANDS.md](COMMANDS.md) — Command reference
 - [AI_AGENT_PLAYBOOK.md](AI_AGENT_PLAYBOOK.md) — Minimal-token agent workflows
-- [JSON_AND_PACKAGES.md](JSON_AND_PACKAGES.md) — Strict JSON schemas & `.mbypkg` v1.0
-- [LAYOUTS_LINT_AND_WEBAPP.md](LAYOUTS_LINT_AND_WEBAPP.md) — Layout bounds, lint rules & telemetry
+- [JSON_AND_PACKAGES.md](JSON_AND_PACKAGES.md) — Strict JSON/Markdown specs & `.mbypkg` v1.0
+- [LAYOUTS_LINT_AND_WEBAPP.md](LAYOUTS_LINT_AND_WEBAPP.md) — Layout bounds, lint rules, search & headless verification
 
 ## Entity IDs & Addressing
 
@@ -15,9 +15,11 @@ Stateless, AI-agent-first compiler for deterministic study helper WebApps. Agent
 | :--- | :--- | :--- |
 | `Session_<YYYYMMDD_HHMMSS_fff>` | Study Session | `<dir>/<id>/<id>.db` + `assets/` |
 | `Component_<YYYYMMDD_HHMMSS_fff>` | Session Component (`article` \| `quiz`) | Parent session SQLite DB |
-| `ArtComp_<YYYYMMDD_HHMMSS_fff>` | Article Block (`text` \| `image`) | Parent session SQLite DB |
+| `ArtComp_<YYYYMMDD_HHMMSS_fff>` | Article Block (`text` \| `image` \| `callout`) | Parent session SQLite DB |
 | `Set_<YYYYMMDD_HHMMSS_fff>` | Standalone Quiz (`mcq` \| `flashcard` \| `mixed`) | `<dir>/<id>/<id>.db` + `assets/` |
 | `Q_<YYYYMMDD_HHMMSS_fff>` | Question (`mcq` \| `flashcard`) | Parent quiz/component |
+
+Unless `-o` is specified, new workspace DB folders default under `.meloberry/workspaces/<id>/`, while `ls` discovers both CWD and `.meloberry/workspaces/`. Component `ref` slugs (`^[a-z0-9][a-z0-9_-]{0,31}$`) are deterministically auto-generated from `title`/filename if omitted.
 
 All read, patch, lint, and delete commands accept either a direct ID or a workspace path/slug:
 - `<wsId>#c<n>` — 1-based component in session
@@ -33,6 +35,7 @@ All read, patch, lint, and delete commands accept either a direct ID or a worksp
 | `--json` | Minified single-line JSON on stdout/stderr |
 | `--app-data <dir>` | Override `app_settings.db` & `.mby_id_clock` directory |
 | `-o`, `--out <dir>` | Output directory |
+| `--quiet` / `--verbose` | Minimal summary output vs full lists/reports |
 | `--` | End of options |
 | `MBY_AGENT=1` | Implicitly enables `--json` |
 | `MBY_APP_DATA=<dir>` | Default `--app-data` directory |

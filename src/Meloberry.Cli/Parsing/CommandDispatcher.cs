@@ -1,3 +1,5 @@
+using System.Text;
+using System.Text.Json;
 using Meloberry.Cli.Abstractions;
 using Meloberry.Cli.Commands;
 using Meloberry.Cli.Hosting;
@@ -11,12 +13,13 @@ public sealed class CommandDispatcher(
 {
     private static readonly HashSet<string> GlobalKnownValueOptions = new(StringComparer.OrdinalIgnoreCase)
     {
-        "app-data", "out", "build", "export", "view", "set", "move"
+        "app-data", "out", "build", "export", "view", "set", "move", "timeout"
     };
 
     private static readonly HashSet<string> GlobalKnownFlagOptions = new(StringComparer.OrdinalIgnoreCase)
     {
-        "json", "help", "version", "dry-run", "preview", "no-wait", "include-layout", "all", "live"
+        "json", "help", "version", "dry-run", "preview", "no-wait", "include-layout", "all", "live",
+        "quiet", "verbose", "headless", "verify", "static-only"
     };
 
     private readonly Dictionary<string, CliCommand> _commands =
@@ -31,7 +34,7 @@ public sealed class CommandDispatcher(
                         string.Equals(Environment.GetEnvironmentVariable("MBY_AGENT"), "true", StringComparison.OrdinalIgnoreCase);
         string? envAppData = Environment.GetEnvironmentVariable("MBY_APP_DATA");
 
-        if (!TryParseArgs(args, envAgent, envAppData, out var verb, out var positional, out var named, out var globals, out var showPrime, out var showVersion, out var parseErr))
+        if (!TryParseArgs(args, envAgent, envAppData, out var verb, out var positional, out var named, out var globals, out var showHelp, out var showVersion, out var parseErr))
         {
             return CliResultExtensions.WriteValidationError(console, "Cli.ParseError", parseErr!, globals.Json);
         }
@@ -39,16 +42,43 @@ public sealed class CommandDispatcher(
         if (showVersion)
             return await InvokeCommandAsync(_commands["version"], console, globals, positional, named, cancellationToken);
 
-        if (showPrime || string.IsNullOrWhiteSpace(verb) || string.Equals(verb, "help", StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(verb, "help", StringComparison.OrdinalIgnoreCase))
+        {
+            if (positional.Count == 0)
+                return await InvokeCommandAsync(_commands["prime"], console, globals, positional, named, cancellationToken);
+
+            if (!_commands.TryGetValue(positional[0], out var helpTarget))
+            {
+                return CliResultExtensions.WriteValidationError(
+                    console,
+                    "Cli.UnknownCommand",
+                    $"Unknown command '{positional[0]}'. Run 'mby prime' for supported commands.",
+                    globals.Json);
+            }
+
+            WriteCommandHelp(helpTarget, console, globals.Json);
+            return ExitCodes.Success;
+        }
+
+        if (string.IsNullOrWhiteSpace(verb))
             return await InvokeCommandAsync(_commands["prime"], console, globals, positional, named, cancellationToken);
 
         if (!_commands.TryGetValue(verb, out var cliCommand))
         {
+            if (showHelp)
+                return await InvokeCommandAsync(_commands["prime"], console, globals, positional, named, cancellationToken);
+
             return CliResultExtensions.WriteValidationError(
                 console,
                 "Cli.UnknownCommand",
                 $"Unknown command '{verb}'. Run 'mby prime' for supported commands.",
                 globals.Json);
+        }
+
+        if (showHelp)
+        {
+            WriteCommandHelp(cliCommand, console, globals.Json);
+            return ExitCodes.Success;
         }
 
         foreach (var (optName, values) in named)
@@ -69,6 +99,51 @@ public sealed class CommandDispatcher(
         }
 
         return await InvokeCommandAsync(cliCommand, console, globals, positional, named, cancellationToken);
+    }
+
+    private static void WriteCommandHelp(CliCommand command, IConsole console, bool json)
+    {
+        var d = command.Descriptor;
+        if (json)
+        {
+            var payload = new
+            {
+                verb = d.Verb,
+                usage = d.Usage,
+                description = d.Description,
+                prerequisites = d.Prerequisites,
+                options = d.OptionsHelp,
+                examples = d.Examples
+            };
+            console.Out.WriteLine(JsonSerializer.Serialize(new { success = true, data = payload }, CliCommandHelpers.JsonOptions));
+            return;
+        }
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"mby {d.Usage}");
+        sb.AppendLine();
+        sb.AppendLine(d.Description);
+        if (!string.IsNullOrWhiteSpace(d.Prerequisites))
+        {
+            sb.AppendLine();
+            sb.AppendLine("Prerequisites:");
+            sb.AppendLine($"  {d.Prerequisites}");
+        }
+        if (d.OptionsHelp is { Count: > 0 })
+        {
+            sb.AppendLine();
+            sb.AppendLine("Options:");
+            foreach (var opt in d.OptionsHelp)
+                sb.AppendLine($"  {opt}");
+        }
+        if (d.Examples is { Count: > 0 })
+        {
+            sb.AppendLine();
+            sb.AppendLine("Examples:");
+            foreach (var ex in d.Examples)
+                sb.AppendLine($"  {ex}");
+        }
+        console.Out.WriteLine(sb.ToString().TrimEnd());
     }
 
     private async Task<int> InvokeCommandAsync(
@@ -120,6 +195,8 @@ public sealed class CommandDispatcher(
 
         bool json = envAgent;
         string? appDataDir = string.IsNullOrWhiteSpace(envAppData) ? null : envAppData;
+        bool quiet = false;
+        bool verbose = false;
         bool endOfOptions = false;
         var rawPositionals = new List<string>();
 
@@ -148,7 +225,7 @@ public sealed class CommandDispatcher(
             {
                 if (i + 1 >= args.Length)
                 {
-                    globals = new GlobalCliOptions(json, appDataDir);
+                    globals = new GlobalCliOptions(json, appDataDir, quiet, verbose);
                     errorMessage = "Option '-o' requires a directory path.";
                     return false;
                 }
@@ -164,6 +241,12 @@ public sealed class CommandDispatcher(
                     case "json":
                         json = true;
                         break;
+                    case "quiet":
+                        quiet = true;
+                        break;
+                    case "verbose":
+                        verbose = true;
+                        break;
                     case "help":
                         showPrime = true;
                         break;
@@ -173,7 +256,7 @@ public sealed class CommandDispatcher(
                     case "app-data":
                         if (i + 1 >= args.Length)
                         {
-                            globals = new GlobalCliOptions(json, appDataDir);
+                            globals = new GlobalCliOptions(json, appDataDir, quiet, verbose);
                             errorMessage = "Option '--app-data' requires a directory path.";
                             return false;
                         }
@@ -188,7 +271,7 @@ public sealed class CommandDispatcher(
                         {
                             if (i + 1 >= args.Length)
                             {
-                                globals = new GlobalCliOptions(json, appDataDir);
+                                globals = new GlobalCliOptions(json, appDataDir, quiet, verbose);
                                 errorMessage = $"Option '--{opt}' requires a value.";
                                 return false;
                             }
@@ -196,7 +279,7 @@ public sealed class CommandDispatcher(
                         }
                         else
                         {
-                            globals = new GlobalCliOptions(json, appDataDir);
+                            globals = new GlobalCliOptions(json, appDataDir, quiet, verbose);
                             errorMessage = $"Unknown option '--{opt}'.";
                             return false;
                         }
@@ -209,7 +292,7 @@ public sealed class CommandDispatcher(
             }
         }
 
-        globals = new GlobalCliOptions(json, appDataDir);
+        globals = new GlobalCliOptions(json, appDataDir, quiet, verbose);
         if (rawPositionals.Count == 0)
             return true;
 

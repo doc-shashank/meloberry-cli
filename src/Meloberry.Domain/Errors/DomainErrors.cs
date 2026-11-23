@@ -29,6 +29,8 @@ public static class ArticleErrors
     public static Error BlockNotFound(string artCompId) => new("ArticleBlock.NotFound", $"Article block '{artCompId}' was not found.", ErrorType.NotFound);
     public static Error WrongBlockKind(string artCompId, string expectedKind) => new("ArticleBlock.WrongKind", $"Article block '{artCompId}' is not a {expectedKind} block.", ErrorType.Conflict);
     public static Error EmptyContent() => new("ArticleBlock.EmptyContent", "Article text block content cannot be empty.", ErrorType.Validation);
+    public static Error InvalidCalloutTone(string rawTone) => new("ArticleBlock.InvalidCalloutTone", $"Invalid callout tone '{rawTone}'. Supported tones: 'pearl', 'clinical', 'warning'.", ErrorType.Validation, Hint: "Set tone to 'pearl', 'clinical', or 'warning'.");
+    public static Error EmptyCalloutContent() => new("ArticleBlock.EmptyCalloutContent", "Callout block text content cannot be empty.", ErrorType.Validation);
 }
 
 public static class QuizErrors
@@ -75,6 +77,13 @@ public static class AddressErrors
 {
     public static Error InvalidAddress(string address) => new("Address.Invalid", $"Invalid entity address '{address}'. Use <id> or <wsId>#c<n>[.b<m>|.q<m>] | <setId>#q<m> | <wsId>#<ref>.", ErrorType.Validation);
     public static Error NotFound(string address) => new("Address.NotFound", $"Entity at address '{address}' was not found.", ErrorType.NotFound);
-    public static Error InvalidRef(string rawRef) => new("Address.InvalidRef", $"Invalid ref '{rawRef}'. Use 1..32 lowercase chars matching ^[a-z0-9][a-z0-9_-]*$.", ErrorType.Validation);
+    public static Error InvalidRef(string rawRef, string? suggestedSlug = null) =>
+        new(
+            "Address.InvalidRef",
+            $"Invalid ref '{rawRef}' (length {rawRef.Trim().Length}, max 32). Must match pattern ^[a-z0-9][a-z0-9_-]{{0,31}}$ (lowercase ASCII letters, digits, '-' or '_').",
+            ErrorType.Validation,
+            Hint: string.IsNullOrWhiteSpace(suggestedSlug)
+                ? "Shorten to <=32 lowercase chars matching ^[a-z0-9][a-z0-9_-]{0,31}$, or omit ref to auto-generate on components."
+                : $"Use suggested valid ref '{suggestedSlug}' (<=32 chars), or omit ref on components to auto-generate.");
     public static Error DuplicateRef(string refKey) => new("Address.DuplicateRef", $"Duplicate ref '{refKey}' within workspace.", ErrorType.Conflict);
 }

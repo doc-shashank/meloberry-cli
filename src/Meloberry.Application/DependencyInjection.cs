@@ -23,6 +23,7 @@ public static class DependencyInjection
         typeof(GetPrimeGuideHandler),
         typeof(GetSchemaHandler),
         typeof(AnalyzeWebAppHandler),
+        typeof(VerifyWebAppHandler),
         typeof(GetLayoutBoundsHandler),
         typeof(SetLayoutPropertyHandler),
         typeof(SetEntityLayoutHandler),

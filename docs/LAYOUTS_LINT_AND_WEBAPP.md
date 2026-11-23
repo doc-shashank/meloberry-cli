@@ -39,6 +39,8 @@ Three global profiles (`article`, `mcq`, `flashcard`) persist in `<app-data>/app
 | `Lint.BrokenAssetDirectory` | Error | Workspace or `assets/` directory is missing |
 | `Lint.BrokenImageFile` | Error | Referenced image is missing, escapes workspace, or fails magic-byte check |
 
-## Generated WebApp & Telemetry
+## Generated WebApp, Search & Headless Verification
 
-`build` emits `index.html`, `styles.css`, `app.js`, `assets/`, and offline `katex/` assets when math is detected. Markdown renders with `.DisableHtml()` and dangerous URI sanitization. `analyze --live` captures `POST /api/analysis` into `<webDir>/reports/` and aggregates recurring weak items.
+`build` emits `index.html`, `styles.css`, `app.js`, `assets/`, and offline `katex/` assets when math is detected (including captions & callouts). Articles render semantic `<figure>/<figcaption>` pairs and `pearl`/`clinical`/`warning` callout cards, plus client-side `Ctrl+K` / `/` full-text search across all slides and quiz questions.
+- `mby analyze <webDir> --headless [--static-only]` runs zero-touch DOM/image/overflow/KaTeX/search/console verification and writes `reports/verify.latest.json`.
+- `mby analyze <webDir> --live` captures interactive `POST /api/analysis` telemetry into `<webDir>/reports/*.analysis.json`.

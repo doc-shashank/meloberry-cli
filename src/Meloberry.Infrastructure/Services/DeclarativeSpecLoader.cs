@@ -19,24 +19,234 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
     private static readonly string[] KnownSchemaKeys =
     [
         "kind", "name", "description", "title", "quizType", "components", "blocks", "questions",
-        "layoutOverrides", "ref", "text", "imagePath", "type", "explanation", "maxOptions",
-        "isMultiCorrect", "options", "index", "isCorrect", "front", "back", "position", "textPosition"
+        "layoutOverrides", "ref", "text", "imagePath", "caption", "alt", "tone",
+        "type", "explanation", "maxOptions", "isMultiCorrect", "options", "index", "isCorrect",
+        "front", "back", "position", "textPosition"
     ];
 
     [GeneratedRegex(@"property\s+'(?<prop>[^']+)'", RegexOptions.IgnoreCase)]
     private static partial Regex UnmappedPropertyRegex();
 
-    public async Task<Result<DeclarativeApplySpec>> LoadAsync(string jsonFilePath, CancellationToken cancellationToken = default)
+    public async Task<Result<DeclarativeApplySpec>> LoadAsync(string specPath, CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrWhiteSpace(jsonFilePath) || !File.Exists(jsonFilePath))
-            return new Error("Json.FileNotFound", $"JSON file '{jsonFilePath}' was not found.", ErrorType.NotFound);
+        if (string.IsNullOrWhiteSpace(specPath))
+            return new Error("Json.FileNotFound", "Input path cannot be empty.", ErrorType.NotFound);
 
-        var rawJson = await File.ReadAllTextAsync(jsonFilePath, cancellationToken);
-        return ParseSpec(rawJson, jsonFilePath);
+        var cleaned = NormalizeInputPath(specPath);
+        if (Directory.Exists(cleaned))
+            return await LoadDirectoryAsync(cleaned, cancellationToken);
+
+        if (!File.Exists(cleaned))
+            return new Error("Json.FileNotFound", $"Input file or directory '{specPath}' was not found.", ErrorType.NotFound);
+
+        var rawText = await File.ReadAllTextAsync(cleaned, cancellationToken);
+        var baseDir = Path.GetDirectoryName(Path.GetFullPath(cleaned));
+        if (IsMarkdownFile(cleaned))
+            return MarkdownSpecParser.ParseSingleSpec(rawText, cleaned, cleaned);
+
+        var res = ParseSpec(rawText, cleaned);
+        return res.IsSuccess ? res.Value with { AssetBaseDirectory = baseDir } : res.Error!;
     }
 
-    public Task<Result<DeclarativeApplySpec>> LoadFromTextAsync(string rawJson, CancellationToken cancellationToken = default) =>
-        Task.FromResult(ParseSpec(rawJson, "<stdin>"));
+    public Task<Result<DeclarativeApplySpec>> LoadFromTextAsync(string rawText, CancellationToken cancellationToken = default)
+    {
+        if (MarkdownSpecParser.LooksLikeMarkdown(rawText))
+            return Task.FromResult(MarkdownSpecParser.ParseSingleSpec(rawText, "<stdin>"));
+
+        return Task.FromResult(ParseSpec(rawText, "<stdin>"));
+    }
+
+    private static async Task<Result<DeclarativeApplySpec>> LoadDirectoryAsync(string directoryPath, CancellationToken ct)
+    {
+        var fullDir = Path.GetFullPath(directoryPath);
+        string? sessionName = null;
+        string? sessionDescription = null;
+        IReadOnlyList<string>? explicitOrder = null;
+        IReadOnlyList<DeclarativeComponentSpec>? manifestComponents = null;
+
+        var sessionMdPath = Path.Combine(fullDir, "_session.md");
+        var sessionJsonPath = Path.Combine(fullDir, "session.json");
+        if (File.Exists(sessionMdPath))
+        {
+            var raw = await File.ReadAllTextAsync(sessionMdPath, ct);
+            var parsed = MarkdownSpecParser.ParseDocument(raw, sessionMdPath, isSessionManifest: true);
+            if (!parsed.IsSuccess) return parsed.Error!;
+            sessionName = parsed.Value.Name ?? parsed.Value.Title;
+            sessionDescription = parsed.Value.Description;
+            explicitOrder = parsed.Value.Order;
+        }
+        else if (File.Exists(sessionJsonPath))
+        {
+            var raw = await File.ReadAllTextAsync(sessionJsonPath, ct);
+            var parsed = ParseSpec(raw, sessionJsonPath);
+            if (!parsed.IsSuccess) return parsed.Error!;
+            sessionName = parsed.Value.Name ?? parsed.Value.Title;
+            sessionDescription = parsed.Value.Description;
+            manifestComponents = parsed.Value.Components;
+        }
+
+        var discoveredFiles = Directory.EnumerateFiles(fullDir)
+            .Where(f =>
+            {
+                var name = Path.GetFileName(f);
+                if (name.StartsWith('_')) return false;
+                if (string.Equals(name, "session.json", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(name, "manifest.json", StringComparison.OrdinalIgnoreCase))
+                    return false;
+                return IsMarkdownFile(f) || string.Equals(Path.GetExtension(f), ".json", StringComparison.OrdinalIgnoreCase);
+            })
+            .ToList();
+
+        discoveredFiles.Sort((a, b) => CompareComponentFiles(Path.GetFileName(a), Path.GetFileName(b), explicitOrder));
+
+        if (discoveredFiles.Count == 0 && manifestComponents is { Count: > 0 })
+        {
+            return new DeclarativeApplySpec(
+                "session",
+                sessionName ?? MarkdownSpecParser.HumanizeFileStem(fullDir) ?? "Study Session",
+                sessionDescription,
+                null, null,
+                manifestComponents.Select(c => c with { SourceDirectory = fullDir }).ToList(),
+                null, null, null,
+                AssetBaseDirectory: fullDir);
+        }
+
+        if (discoveredFiles.Count == 0)
+            return new Error("Json.InvalidSpec", $"Directory '{directoryPath}' contains no component '.md' or '.json' files.", ErrorType.Validation);
+
+        var components = new List<DeclarativeComponentSpec>(discoveredFiles.Count);
+        foreach (var file in discoveredFiles)
+        {
+            var raw = await File.ReadAllTextAsync(file, ct);
+            if (IsMarkdownFile(file))
+            {
+                var mdRes = MarkdownSpecParser.ParseComponent(raw, file);
+                if (!mdRes.IsSuccess) return mdRes.Error!;
+                components.Add(mdRes.Value);
+                continue;
+            }
+
+            var jsonRes = ParseSpec(raw, file);
+            if (!jsonRes.IsSuccess) return jsonRes.Error!;
+            var spec = jsonRes.Value;
+            if (spec.Components is { Count: > 0 })
+            {
+                foreach (var c in spec.Components)
+                    components.Add(c with { SourceDirectory = fullDir });
+            }
+            else if (spec.Blocks is { Count: > 0 } || string.Equals(spec.Kind, "article", StringComparison.OrdinalIgnoreCase))
+            {
+                components.Add(new DeclarativeComponentSpec(
+                    "article",
+                    spec.Title ?? spec.Name ?? MarkdownSpecParser.HumanizeFileStem(file),
+                    null,
+                    spec.Blocks,
+                    null,
+                    spec.LayoutOverrides,
+                    SourceDirectory: fullDir));
+            }
+            else if (spec.Questions is { Count: > 0 } || spec.Kind?.ToLowerInvariant() is "quiz" or "mcq" or "flashcard" or "mixed")
+            {
+                var qType = !string.IsNullOrWhiteSpace(spec.QuizType)
+                    ? spec.QuizType
+                    : (spec.Kind?.Equals("quiz", StringComparison.OrdinalIgnoreCase) == false ? spec.Kind : "mixed");
+                components.Add(new DeclarativeComponentSpec(
+                    "quiz",
+                    spec.Title ?? spec.Name ?? MarkdownSpecParser.HumanizeFileStem(file),
+                    qType,
+                    null,
+                    spec.Questions,
+                    spec.LayoutOverrides,
+                    SourceDirectory: fullDir));
+            }
+            else
+            {
+                return new Error("Json.InvalidSpec", $"Component JSON '{Path.GetFileName(file)}' must define article 'blocks' or quiz 'questions'.", ErrorType.Validation);
+            }
+        }
+
+        return new DeclarativeApplySpec(
+            Kind: "session",
+            Name: sessionName ?? MarkdownSpecParser.HumanizeFileStem(fullDir) ?? "Study Session",
+            Description: sessionDescription,
+            Title: null,
+            QuizType: null,
+            Components: components,
+            Blocks: null,
+            Questions: null,
+            LayoutOverrides: null,
+            AssetBaseDirectory: fullDir);
+    }
+
+    private static string NormalizeInputPath(string rawPath)
+    {
+        var trimmed = rawPath.Trim();
+        var root = Path.GetPathRoot(trimmed);
+        if (!string.IsNullOrEmpty(root) && string.Equals(trimmed, root, StringComparison.Ordinal))
+            return trimmed;
+        return trimmed.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+    }
+
+    private static bool IsMarkdownFile(string filePath)
+    {
+        var ext = Path.GetExtension(filePath);
+        return string.Equals(ext, ".md", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(ext, ".markdown", StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal static int CompareComponentFiles(string nameA, string nameB, IReadOnlyList<string>? explicitOrder)
+    {
+        if (explicitOrder is { Count: > 0 })
+        {
+            int idxA = FindOrderIndex(nameA, explicitOrder);
+            int idxB = FindOrderIndex(nameB, explicitOrder);
+            if (idxA >= 0 && idxB >= 0 && idxA != idxB) return idxA.CompareTo(idxB);
+            if (idxA >= 0 && idxB < 0) return -1;
+            if (idxA < 0 && idxB >= 0) return 1;
+        }
+        return CompareNaturalOrdinal(nameA, nameB);
+    }
+
+    private static int FindOrderIndex(string fileName, IReadOnlyList<string> order)
+    {
+        for (int i = 0; i < order.Count; i++)
+        {
+            var entry = order[i].Trim();
+            if (string.Equals(fileName, entry, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(Path.GetFileNameWithoutExtension(fileName), entry, StringComparison.OrdinalIgnoreCase))
+                return i;
+        }
+        return -1;
+    }
+
+    private static int CompareNaturalOrdinal(string a, string b)
+    {
+        int ia = 0, ib = 0;
+        while (ia < a.Length && ib < b.Length)
+        {
+            if (char.IsDigit(a[ia]) && char.IsDigit(b[ib]))
+            {
+                int sa = ia; while (ia < a.Length && char.IsDigit(a[ia])) ia++;
+                int sb = ib; while (ib < b.Length && char.IsDigit(b[ib])) ib++;
+                var numA = a.AsSpan(sa, ia - sa).TrimStart('0');
+                var numB = b.AsSpan(sb, ib - sb).TrimStart('0');
+                int lenCmp = numA.Length.CompareTo(numB.Length);
+                if (lenCmp != 0) return lenCmp;
+                int valCmp = numA.CompareTo(numB, StringComparison.Ordinal);
+                if (valCmp != 0) return valCmp;
+                int leadCmp = (ia - sa).CompareTo(ib - sb);
+                if (leadCmp != 0) return leadCmp;
+            }
+            else
+            {
+                int chCmp = char.ToUpperInvariant(a[ia]).CompareTo(char.ToUpperInvariant(b[ib]));
+                if (chCmp != 0) return chCmp;
+                ia++;
+                ib++;
+            }
+        }
+        return (a.Length - ia).CompareTo(b.Length - ib);
+    }
 
     private static Result<DeclarativeApplySpec> ParseSpec(string rawJson, string sourceLabel)
     {
@@ -149,7 +359,7 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
             var b = rawBlocks[i];
             if (b is null || string.IsNullOrWhiteSpace(b.Kind))
                 return new Error("Json.InvalidSpec", $"Article block at index {i} must be a non-null object with a 'kind' field.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
-            list.Add(new DeclarativeArticleBlockSpec(b.Kind, b.Text, b.ImagePath, b.Ref));
+            list.Add(new DeclarativeArticleBlockSpec(b.Kind, b.Text, b.ImagePath, b.Ref, b.Caption, b.Alt, b.Tone, b.Title));
         }
         return Result<IReadOnlyList<DeclarativeArticleBlockSpec>?>.Success(list);
     }
@@ -208,6 +418,10 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
         public string? Ref { get; set; }
         public string? Text { get; set; }
         public string? ImagePath { get; set; }
+        public string? Caption { get; set; }
+        public string? Alt { get; set; }
+        public string? Tone { get; set; }
+        public string? Title { get; set; }
     }
 
     private sealed class ApplyQuestionDto

@@ -3,8 +3,16 @@
 ## Strict JSON Rules
 
 - UTF-8 JSON with camelCase keys; unrecognized properties fail with exit `2` (`Json.ParseError` + typo `hint` when applicable).
-- `imagePath` fields must be relative paths confined to the JSON file directory (or CWD when reading `stdin`), validated via image magic bytes (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`, `.svg`) and copied to `<workspace>/assets/`.
-- Optional `ref` slugs (`^[a-z0-9][a-z0-9_-]{0,31}$`) must be unique within a workspace.
+- `imagePath` fields must be relative paths confined to the input directory/workspace root, validated via image magic bytes (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`, `.svg`) and copied to `<workspace>/assets/`.
+- Optional `ref` slugs (`^[a-z0-9][a-z0-9_-]{0,31}$`) must be unique within a workspace; omitted component `ref` values auto-generate deterministic slugs from `title`/filename. Explicit invalid `ref` values fail strictly with `Address.InvalidRef` + suggested valid slug.
+
+## Markdown + Frontmatter & Modular Directories
+
+Pass a `.md` file or directory (`./articles/`) directly to `mby apply` or `mby build`:
+- Optional YAML frontmatter (`kind`, `title`, `ref`, `name`, `description`, `order`, `layoutOverrides`).
+- Standalone image syntax `![alt](assets/fig_2.1.png "Caption")` compiles to `image` block with `caption` + `alt` (`<figure><figcaption>`).
+- Fenced callout blocks `:::callout{tone="clinical" title="Clinical Correlation"} ... :::` (or `:::pearl`, `:::clinical`, `:::warning`) compile to `callout` blocks.
+- Directories combine `_session.md`/`session.json` + naturally sorted `*.md` and `*.json` component files.
 
 ## Declarative Session Spec (`apply` / `build`)
 
@@ -20,7 +28,8 @@
       "title": "Equations of Motion",
       "blocks": [
         { "kind": "text", "text": "# Kinematics\n\n$$v = u + at$$" },
-        { "kind": "image", "imagePath": "images/velocity.png" }
+        { "kind": "image", "imagePath": "images/velocity.png", "caption": "Velocity vs time", "alt": "Velocity graph" },
+        { "kind": "callout", "tone": "pearl", "title": "Key Formula", "text": "Area under $v(t)$ equals displacement." }
       ]
     },
     {
@@ -56,7 +65,7 @@
 
 - `session` / `quiz`: `{ name?, description? }`
 - `component`: `{ title?, ref?, layoutOverrides? }`
-- `articleBlock` (`text`): `{ text?, ref? }` | (`image`): `{ imagePath?, ref? }`
+- `articleBlock` (`text`): `{ text?, ref? }` | (`image`): `{ imagePath?, caption?, alt?, ref? }` | (`callout`): `{ tone?, title?, text?, ref? }`
 - `question` (`mcq`): `{ text?, imagePath?, explanation?, isMultiCorrect?, maxOptions?, options?, ref?, layoutOverrides? }`
 - `question` (`flashcard`): `{ front?: { text?, imagePath?, position? }, back?: { ... }, ref?, layoutOverrides? }`
 - Set any `layoutOverrides.<key>` to `null` to remove an override; pass `--move <index>:<shift|exchange>` to reorder.

@@ -96,12 +96,21 @@ public sealed class SessionComponent : IIndexedEntity
         return insertResult.IsSuccess ? blockResult.Value : insertResult.Error!;
     }
 
-    public Result<ArticleBlock> AddImageBlock(string artCompId, string imagePath, int? targetIndex = null)
+    public Result<ArticleBlock> AddImageBlock(string artCompId, string imagePath, int? targetIndex = null, string? caption = null, string? alt = null)
     {
         if (Kind != ComponentKind.Article) return ComponentErrors.WrongKind(Id, "article");
-        var block = ArticleBlock.CreateImage(artCompId, Id, imagePath);
+        var block = ArticleBlock.CreateImage(artCompId, Id, imagePath, caption, alt);
         var insertResult = IndexedListReorderer.InsertAt(_articleBlocks, block, targetIndex);
         return insertResult.IsSuccess ? block : insertResult.Error!;
+    }
+
+    public Result<ArticleBlock> AddCalloutBlock(string artCompId, CalloutTone tone, string textContent, string? title = null, int? targetIndex = null)
+    {
+        if (Kind != ComponentKind.Article) return ComponentErrors.WrongKind(Id, "article");
+        var blockResult = ArticleBlock.CreateCallout(artCompId, Id, tone, textContent, title);
+        if (!blockResult.IsSuccess) return blockResult.Error!;
+        var insertResult = IndexedListReorderer.InsertAt(_articleBlocks, blockResult.Value, targetIndex);
+        return insertResult.IsSuccess ? blockResult.Value : insertResult.Error!;
     }
 
     public Result ReorderBlock(string artCompId, int targetIndex, ReorderMode mode) =>

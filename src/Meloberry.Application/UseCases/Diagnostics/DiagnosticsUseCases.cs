@@ -8,7 +8,7 @@ using Meloberry.Domain.Sessions;
 
 namespace Meloberry.Application.UseCases.Diagnostics;
 
-public sealed record LintCommand(string Address);
+public sealed record LintCommand(string Address, bool Quiet = false, bool Verbose = false);
 public sealed record LintIssue(string Severity, string Code, string TargetId, string Message);
 public sealed record LintReportResponse(string TargetId, bool IsClean, int ErrorCount, int WarningCount, IReadOnlyList<LintIssue> Issues);
 
@@ -51,7 +51,10 @@ public sealed class LintHandler(
                 break;
         }
 
-        return BuildReport(entity.EntityId, issues);
+        var report = BuildReport(entity.EntityId, issues);
+        if (command.Quiet && report.ErrorCount == 0 && !command.Verbose)
+            return report with { Issues = [] };
+        return report;
     }
 
     internal async Task<Result<ResolvedWorkspaceLint>> LintAndResolveWorkspaceAsync(
@@ -156,6 +159,12 @@ public sealed class LintHandler(
         {
             if (string.IsNullOrWhiteSpace(block.TextContent))
                 issues.Add(new LintIssue("Error", "Lint.EmptyArticleBlock", block.Id, "Article text block is empty."));
+            return Task.CompletedTask;
+        }
+        if (block.Kind == ArticleBlockKind.Callout)
+        {
+            if (string.IsNullOrWhiteSpace(block.TextContent))
+                issues.Add(new LintIssue("Error", "Lint.EmptyArticleBlock", block.Id, "Article callout block is empty."));
             return Task.CompletedTask;
         }
         return CheckImageAssetAsync(storageDirectory, block.ImagePath, block.Id, issues, ct);

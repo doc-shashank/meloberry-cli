@@ -15,7 +15,9 @@ internal static class JsonQuestionMaterializer
         string jsonBaseDirectory,
         string storageDirectory,
         IContentInspector contentInspector,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? specRootDirectory = null,
+        string? workspaceCwdDirectory = null)
     {
         var typeNormalized = spec.Type?.Trim().ToLowerInvariant();
         if (typeNormalized == "mcq")
@@ -36,7 +38,7 @@ internal static class JsonQuestionMaterializer
             }
             if (!string.IsNullOrWhiteSpace(spec.ImagePath))
             {
-                var promptImg = await CopyConfinedImageAsync(spec.ImagePath, jsonBaseDirectory, storageDirectory, contentInspector, cancellationToken);
+                var promptImg = await CopyConfinedImageAsync(spec.ImagePath, jsonBaseDirectory, storageDirectory, contentInspector, cancellationToken, specRootDirectory, workspaceCwdDirectory);
                 if (!promptImg.IsSuccess) return promptImg.Error!;
                 mcq.SetImage(promptImg.Value);
             }
@@ -53,7 +55,7 @@ internal static class JsonQuestionMaterializer
 
             foreach (var opt in spec.Options)
             {
-                var imgRes = await CopyConfinedImageAsync(opt.ImagePath, jsonBaseDirectory, storageDirectory, contentInspector, cancellationToken);
+                var imgRes = await CopyConfinedImageAsync(opt.ImagePath, jsonBaseDirectory, storageDirectory, contentInspector, cancellationToken, specRootDirectory, workspaceCwdDirectory);
                 if (!imgRes.IsSuccess) return imgRes.Error!;
 
                 var optRes = mcq.SetOption(opt.Index, opt.Text, imgRes.Value);
@@ -84,12 +86,12 @@ internal static class JsonQuestionMaterializer
             }
             if (spec.Front is not null)
             {
-                var frontRes = await ApplySideAsync(card, FlashcardFace.Front, spec.Front, jsonBaseDirectory, storageDirectory, contentInspector, cancellationToken);
+                var frontRes = await ApplySideAsync(card, FlashcardFace.Front, spec.Front, jsonBaseDirectory, storageDirectory, contentInspector, cancellationToken, specRootDirectory, workspaceCwdDirectory);
                 if (!frontRes.IsSuccess) return frontRes.Error!;
             }
             if (spec.Back is not null)
             {
-                var backRes = await ApplySideAsync(card, FlashcardFace.Back, spec.Back, jsonBaseDirectory, storageDirectory, contentInspector, cancellationToken);
+                var backRes = await ApplySideAsync(card, FlashcardFace.Back, spec.Back, jsonBaseDirectory, storageDirectory, contentInspector, cancellationToken, specRootDirectory, workspaceCwdDirectory);
                 if (!backRes.IsSuccess) return backRes.Error!;
             }
 
@@ -118,7 +120,9 @@ internal static class JsonQuestionMaterializer
         string jsonBaseDirectory,
         string storageDirectory,
         IContentInspector contentInspector,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? specRootDirectory = null,
+        string? workspaceCwdDirectory = null)
     {
         if (!string.IsNullOrWhiteSpace(sideSpec.Text))
         {
@@ -126,7 +130,7 @@ internal static class JsonQuestionMaterializer
             if (!textRes.IsSuccess) return textRes.Error!;
         }
 
-        var imgCopy = await CopyConfinedImageAsync(sideSpec.ImagePath, jsonBaseDirectory, storageDirectory, contentInspector, cancellationToken);
+        var imgCopy = await CopyConfinedImageAsync(sideSpec.ImagePath, jsonBaseDirectory, storageDirectory, contentInspector, cancellationToken, specRootDirectory, workspaceCwdDirectory);
         if (!imgCopy.IsSuccess) return imgCopy.Error!;
         if (imgCopy.Value is not null)
         {
@@ -156,16 +160,56 @@ internal static class JsonQuestionMaterializer
 
     internal static async Task<Result<string?>> CopyConfinedImageAsync(
         string? rawPath,
-        string jsonBaseDirectory,
+        string componentBaseDirectory,
         string storageDirectory,
         IContentInspector contentInspector,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? specRootDirectory = null,
+        string? workspaceCwdDirectory = null)
     {
         if (string.IsNullOrWhiteSpace(rawPath)) return (string?)null;
-        if (!PathConfinement.TryResolveInside(jsonBaseDirectory, rawPath, out var resolvedPath))
-            return new Error("Asset.InvalidPath", $"JSON imagePath '{rawPath}' must be relative and stay inside the JSON directory.", ErrorType.Validation);
+
+        string? resolvedPath = null;
+        if (PathConfinement.TryResolveInside(componentBaseDirectory, rawPath, out var compCandidate))
+        {
+            resolvedPath = compCandidate;
+        }
+        else if (!string.IsNullOrWhiteSpace(specRootDirectory) &&
+                 PathConfinement.TryResolveInside(specRootDirectory, rawPath, out var rootCandidate))
+        {
+            resolvedPath = rootCandidate;
+        }
+        else
+        {
+            return new Error("Asset.InvalidPath", $"JSON imagePath '{rawPath}' must be relative and stay inside the input directory.", ErrorType.Validation);
+        }
+
+        // If the asset path wasn't found inside the component/spec folder (e.g. ./articles/ referencing ./assets/fig_1.png),
+        // also check specRootDirectory and immediate workspaceCwdDirectory (only for non-traversal relative paths).
+        if (!File.Exists(resolvedPath) && !StartsWithParentTraversal(rawPath))
+        {
+            if (!string.IsNullOrWhiteSpace(specRootDirectory) &&
+                PathConfinement.TryResolveInside(specRootDirectory, rawPath, out var rootFallback) &&
+                File.Exists(rootFallback))
+            {
+                resolvedPath = rootFallback;
+            }
+            else if (!string.IsNullOrWhiteSpace(workspaceCwdDirectory) &&
+                     PathConfinement.TryResolveInside(workspaceCwdDirectory, rawPath, out var cwdFallback) &&
+                     File.Exists(cwdFallback))
+            {
+                resolvedPath = cwdFallback;
+            }
+        }
 
         var copyRes = await contentInspector.CopyAndVerifyImageAsync(resolvedPath, storageDirectory, cancellationToken);
         return copyRes.IsSuccess ? copyRes.Value : copyRes.Error!;
+    }
+
+    private static bool StartsWithParentTraversal(string rawPath)
+    {
+        var normalized = rawPath.Trim().Replace('/', '\\');
+        return normalized.Equals("..", StringComparison.Ordinal) ||
+               normalized.StartsWith("..\\", StringComparison.Ordinal);
     }
 }

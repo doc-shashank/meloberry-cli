@@ -6,17 +6,33 @@ namespace Meloberry.Cli.Commands;
 
 public sealed class ApplyCliCommand : CliCommand
 {
-    private static readonly HashSet<string> AllowedFlags = new(StringComparer.OrdinalIgnoreCase) { "dry-run" };
-    private static readonly HashSet<string> AllowedValues = new(StringComparer.OrdinalIgnoreCase) { "out", "build", "export" };
+    private static readonly HashSet<string> AllowedFlags = new(StringComparer.OrdinalIgnoreCase) { "dry-run", "verify", "static-only" };
+    private static readonly HashSet<string> AllowedValues = new(StringComparer.OrdinalIgnoreCase) { "out", "build", "export", "timeout" };
 
     public ApplyCliCommand()
         : base(new CommandDescriptor(
             Verb: "apply",
-            Usage: "apply [addr] <file|-> [-o dir] [--build dir] [--export plat:path] [--dry-run]",
-            Description: "Creates or appends to a session/quiz/component from JSON file or stdin ('-').",
+            Usage: "apply [addr] <file|dir|-> [-o dir] [--build dir] [--verify] [--export plat:path] [--dry-run] [--quiet|--verbose]",
+            Description: "Creates or appends to a session/quiz/component from JSON, Markdown (.md), a modular directory, or stdin ('-').",
             HandlerType: typeof(Handler),
             AllowedFlagOptions: AllowedFlags,
-            AllowedValueOptions: AllowedValues))
+            AllowedValueOptions: AllowedValues,
+            OptionsHelp:
+            [
+                "-o, --out <dir>          Base workspace folder (defaults to .meloberry/workspaces).",
+                "--build <webDir>         Also compile the study WebApp into <webDir>.",
+                "--verify                 Run headless verification on --build output.",
+                "--static-only            Run static asset/DATA check when --verify is set.",
+                "--timeout <sec>          Timeout for headless verification (default 30).",
+                "--export <plat[:path]>   Also export desktop/android .mbypkg archive.",
+                "--dry-run                Validate and lint in memory without writing workspace DB."
+            ],
+            Examples:
+            [
+                "mby apply ./articles/ --json",
+                "mby apply ./session.json --build ./study_web --verify --json",
+                "mby apply Session_... ./extra_chapter.md --json"
+            ]))
     {
     }
 
@@ -26,6 +42,11 @@ public sealed class ApplyCliCommand : CliCommand
         {
             if (context.PositionalArgs.Count is < 1 or > 2)
                 return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Usage: {new ApplyCliCommand().Descriptor.Usage}", context.GlobalOptions.Json);
+
+            int timeout = 30;
+            var rawTimeout = context.GetOptionValue("timeout");
+            if (!string.IsNullOrWhiteSpace(rawTimeout) && (!int.TryParse(rawTimeout, out timeout) || timeout < 5))
+                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Invalid --timeout '{rawTimeout}'. Pass integer seconds >= 5.", context.GlobalOptions.Json);
 
             string? targetAddr = context.PositionalArgs.Count == 2 ? context.PositionalArgs[0] : null;
             string fileOrDash = context.PositionalArgs.Count == 2 ? context.PositionalArgs[1] : context.PositionalArgs[0];
@@ -40,7 +61,12 @@ public sealed class ApplyCliCommand : CliCommand
                 WorkingDirectory: context.GetOptionValue("out"),
                 DryRun: context.HasFlag("dry-run"),
                 BuildOutDir: context.GetOptionValue("build"),
-                ExportSpec: context.GetOptionValue("export"));
+                ExportSpec: context.GetOptionValue("export"),
+                Quiet: context.GlobalOptions.Quiet,
+                Verbose: context.GlobalOptions.Verbose,
+                VerifyWeb: context.HasFlag("verify"),
+                StaticVerifyOnly: context.HasFlag("static-only"),
+                VerifyTimeoutSeconds: timeout);
 
             return await CliCommandHelpers.FinishAsync(
                 context,

@@ -36,7 +36,7 @@ public sealed class TestConsole(string? inputText = null) : IConsole
     public void SetInput(string inputText) { _in = new StringReader(inputText); IsInputRedirected = true; }
 }
 
-public sealed record GlobalCliOptions(bool Json, string? AppDataDirectory = null);
+public sealed record GlobalCliOptions(bool Json, string? AppDataDirectory = null, bool Quiet = false, bool Verbose = false);
 
 public sealed class CliInvocationContext(
     IConsole console,
@@ -71,7 +71,10 @@ public sealed record CommandDescriptor(
     string Description,
     Type HandlerType,
     IReadOnlySet<string>? AllowedFlagOptions = null,
-    IReadOnlySet<string>? AllowedValueOptions = null);
+    IReadOnlySet<string>? AllowedValueOptions = null,
+    IReadOnlyList<string>? OptionsHelp = null,
+    string? Prerequisites = null,
+    IReadOnlyList<string>? Examples = null);
 
 public abstract class CliCommand(CommandDescriptor descriptor)
 {

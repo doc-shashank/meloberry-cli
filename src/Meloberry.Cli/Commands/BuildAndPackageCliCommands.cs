@@ -8,17 +8,32 @@ namespace Meloberry.Cli.Commands;
 
 public sealed class BuildCliCommand : CliCommand
 {
-    private static readonly HashSet<string> AllowedFlags = new(StringComparer.OrdinalIgnoreCase) { "preview", "no-wait" };
-    private static readonly HashSet<string> AllowedValues = new(StringComparer.OrdinalIgnoreCase) { "out" };
+    private static readonly HashSet<string> AllowedFlags = new(StringComparer.OrdinalIgnoreCase) { "preview", "no-wait", "verify", "static-only" };
+    private static readonly HashSet<string> AllowedValues = new(StringComparer.OrdinalIgnoreCase) { "out", "timeout" };
 
     public BuildCliCommand()
         : base(new CommandDescriptor(
             Verb: "build",
-            Usage: "build <addr|spec.json|-> [-o dir] [--preview] [--no-wait]",
-            Description: "Runs mandatory lint and emits the deterministic study WebApp (supports one-shot JSON/stdin).",
+            Usage: "build <addr|spec.json|article.md|dir|-> [-o webDir] [--verify] [--static-only] [--timeout 30] [--preview] [--no-wait]",
+            Description: "Runs mandatory lint and emits the deterministic study WebApp (supports one-shot JSON, Markdown, directories, or stdin).",
             HandlerType: typeof(Handler),
             AllowedFlagOptions: AllowedFlags,
-            AllowedValueOptions: AllowedValues))
+            AllowedValueOptions: AllowedValues,
+            Prerequisites: "Workspace ID must already exist in CWD or .meloberry/workspaces, or pass a spec file/dir/'-' for one-shot compile.",
+            OptionsHelp:
+            [
+                "-o, --out <webDir>   Output WebApp directory (default: <id>_web or ./mby_web for one-shot).",
+                "--verify             Run automated runtime verification after building (exits 2 on failure).",
+                "--static-only        Check static HTML/JS/CSS/asset integrity during --verify without launching a browser.",
+                "--timeout <sec>      Headless browser verification timeout in seconds (default 30).",
+                "--preview            Serve built WebApp locally.",
+                "--no-wait            Exit immediately after printing preview URL (useful with --preview)."
+            ],
+            Examples:
+            [
+                "mby build ./articles/ -o ./study_web --verify --json",
+                "mby build Session_2026... -o ./study_web --json"
+            ]))
     {
     }
 
@@ -36,18 +51,33 @@ public sealed class BuildCliCommand : CliCommand
             var outDir = context.GetOptionValue("out");
             bool preview = context.HasFlag("preview");
             bool noWait = context.HasFlag("no-wait");
+            bool verify = context.HasFlag("verify");
+            bool staticOnly = context.HasFlag("static-only");
+            int timeout = 30;
+            var rawTimeout = context.GetOptionValue("timeout");
+            if (!string.IsNullOrWhiteSpace(rawTimeout) && (!int.TryParse(rawTimeout, out timeout) || timeout < 5))
+                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Invalid --timeout '{rawTimeout}'. Pass integer seconds >= 5.", context.GlobalOptions.Json);
 
             string webOutDir;
             if (string.Equals(target, "-", StringComparison.Ordinal) ||
-                (!IsWorkspaceId(target) && File.Exists(target)))
+                (!IsWorkspaceId(target) && (File.Exists(target) || Directory.Exists(target))))
             {
                 var (filePath, inlineJson, errExit) = await CliCommandHelpers.ReadJsonInputAsync(context, target);
                 if (errExit is not null) return errExit.Value;
 
-                var applyOutDir = outDir is null ? null : (Path.GetDirectoryName(Path.GetFullPath(outDir)) ?? Path.GetFullPath(outDir));
                 var effectiveBuildOut = outDir ?? Path.Combine(Directory.GetCurrentDirectory(), "mby_web");
                 var applyRes = await applyHandler.HandleAsync(
-                    new ApplySpecCommand(null, filePath, inlineJson, WorkingDirectory: applyOutDir, BuildOutDir: effectiveBuildOut),
+                    new ApplySpecCommand(
+                        null,
+                        filePath,
+                        inlineJson,
+                        WorkingDirectory: null,
+                        BuildOutDir: effectiveBuildOut,
+                        Quiet: context.GlobalOptions.Quiet,
+                        Verbose: context.GlobalOptions.Verbose,
+                        VerifyWeb: verify,
+                        StaticVerifyOnly: staticOnly,
+                        VerifyTimeoutSeconds: timeout),
                     context.CancellationToken);
                 if (!applyRes.IsSuccess) return applyRes.ToExitCode(context.Console, context.GlobalOptions.Json);
 
@@ -60,7 +90,9 @@ public sealed class BuildCliCommand : CliCommand
             }
             else
             {
-                var buildRes = await buildWebHandler.HandleAsync(new BuildWebAppCommand(target, outDir), context.CancellationToken);
+                var buildRes = await buildWebHandler.HandleAsync(
+                    new BuildWebAppCommand(target, outDir, verify, context.GlobalOptions.Verbose, context.GlobalOptions.Quiet, staticOnly, timeout),
+                    context.CancellationToken);
                 if (!buildRes.IsSuccess) return buildRes.ToExitCode(context.Console, context.GlobalOptions.Json);
 
                 webOutDir = buildRes.Value.OutputDirectory;
@@ -86,10 +118,20 @@ public sealed class PkgCliCommand : CliCommand
     public PkgCliCommand()
         : base(new CommandDescriptor(
             Verb: "pkg",
-            Usage: "pkg <export|import> ...",
+            Usage: "pkg <export <wsId> <desktop|android> [outPath] [--include-layout] | import <file.mbypkg> [destDir]>",
             Description: "Exports (content-only default, non-interactive) or imports .mbypkg v1.0 archives.",
             HandlerType: typeof(Handler),
-            AllowedFlagOptions: AllowedFlags))
+            AllowedFlagOptions: AllowedFlags,
+            Prerequisites: "Runs mandatory lint before export; default output writes <wsId>.mbypkg into CWD unless [outPath] is given.",
+            OptionsHelp:
+            [
+                "--include-layout   Bundle non-default global layout profiles & entity layoutOverrides inside the .mbypkg."
+            ],
+            Examples:
+            [
+                "mby pkg export Session_2026... android ./chapter2.mbypkg --json",
+                "mby pkg import ./chapter2.mbypkg ./.meloberry/workspaces --json"
+            ]))
     {
     }
 
@@ -201,32 +243,80 @@ public sealed class LayoutCliCommand : CliCommand
 
 public sealed class AnalyzeCliCommand : CliCommand
 {
-    private static readonly HashSet<string> AllowedFlags = new(StringComparer.OrdinalIgnoreCase) { "all", "live", "no-wait" };
+    private static readonly HashSet<string> AllowedFlags = new(StringComparer.OrdinalIgnoreCase) { "all", "live", "no-wait", "headless", "static-only" };
+    private static readonly HashSet<string> AllowedValues = new(StringComparer.OrdinalIgnoreCase) { "timeout" };
 
     public AnalyzeCliCommand()
         : base(new CommandDescriptor(
             Verb: "analyze",
-            Usage: "analyze <webDir> [--all] [--live] [--no-wait]",
-            Description: "Analyzes completed WebApp telemetry reports or serves a live capture endpoint.",
+            Usage: "analyze <webDir|report.json> [--headless] [--static-only] [--timeout 30] [--all] [--live] [--no-wait]",
+            Description: "Runs zero-touch headless browser/static verification (--headless/--static-only) or analyzes captured *.analysis.json telemetry reports.",
             HandlerType: typeof(Handler),
-            AllowedFlagOptions: AllowedFlags))
+            AllowedFlagOptions: AllowedFlags,
+            AllowedValueOptions: AllowedValues,
+            Prerequisites: "For --headless: Edge or Chrome installed (or MBY_BROWSER_PATH set). For telemetry mode (without --headless/--static-only): requires reports/*.analysis.json from a prior --live or --preview browser run.",
+            OptionsHelp:
+            [
+                "--headless     Launch headless Edge/Chrome via CDP, step every slide/question, check images/overflow/KaTeX/console, write reports/verify.latest.json.",
+                "--static-only  Verify HTML/JS/CSS, DATA JSON, and referenced local image assets on disk without launching a browser.",
+                "--timeout <n>  Timeout in seconds for --headless (default 30, range 5..180).",
+                "--live         Start preview server + /__mby_analysis receiver to save runtime session telemetry.",
+                "--all          Aggregate all saved *.analysis.json telemetry files in <webDir>/reports.",
+                "--no-wait      Exit immediately after printing URL in --live mode."
+            ],
+            Examples:
+            [
+                "mby analyze ./study_web --headless --json",
+                "mby analyze ./study_web --static-only --json",
+                "mby analyze ./study_web --all --no-wait --json"
+            ]))
     {
     }
 
     public sealed class Handler(
         AnalyzeWebAppHandler useCase,
+        VerifyWebAppHandler verifyUseCase,
         ILocalPreviewHost previewHost) : ICommandHandler
     {
-        public Task<int> InvokeAsync(CliInvocationContext context)
+        public async Task<int> InvokeAsync(CliInvocationContext context)
         {
             if (context.PositionalArgs.Count != 1)
-                return Task.FromResult(CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: analyze <webDir> [--all] [--live] [--no-wait]", context.GlobalOptions.Json));
+                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Usage: {new AnalyzeCliCommand().Descriptor.Usage}", context.GlobalOptions.Json);
 
             var targetPath = context.PositionalArgs[0];
-            if (context.HasFlag("live"))
-                return previewHost.ServeForLiveAnalysisAsync(targetPath, context.Console, context.HasFlag("no-wait"), context.GlobalOptions.Json, context.CancellationToken);
+            bool headless = context.HasFlag("headless");
+            bool staticOnly = context.HasFlag("static-only");
 
-            return CliCommandHelpers.FinishAsync(
+            if (headless || staticOnly)
+            {
+                int timeout = 30;
+                var rawTimeout = context.GetOptionValue("timeout");
+                if (!string.IsNullOrWhiteSpace(rawTimeout) && (!int.TryParse(rawTimeout, out timeout) || timeout < 5))
+                    return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Invalid --timeout '{rawTimeout}'. Pass integer seconds >= 5.", context.GlobalOptions.Json);
+
+                var verRes = await verifyUseCase.HandleAsync(new VerifyWebAppCommand(targetPath, staticOnly, timeout), context.CancellationToken);
+                if (!verRes.IsSuccess) return verRes.ToExitCode(context.Console, context.GlobalOptions.Json);
+
+                var report = verRes.Value;
+                var summary = $"Verify {(report.Passed ? "PASSED" : "FAILED")} ({report.Engine}): slides={report.SlidesChecked}, images={report.ImagesChecked}, consoleErrors={report.ConsoleErrors.Count}, brokenAssets={report.BrokenAssets.Count}, overflow={report.OverflowIssues.Count}, katexErrors={report.KatexErrors.Count}";
+
+                if (!report.Passed)
+                {
+                    if (context.GlobalOptions.Json)
+                        CliCommandHelpers.WriteOutput(context, report, string.Empty);
+                    else
+                        context.Console.Error.WriteLine(summary);
+                    return ExitCodes.ValidationError;
+                }
+
+                CliCommandHelpers.WriteOutput(context, report, summary);
+                return ExitCodes.Success;
+            }
+
+            if (context.HasFlag("live"))
+                return await previewHost.ServeForLiveAnalysisAsync(targetPath, context.Console, context.HasFlag("no-wait"), context.GlobalOptions.Json, context.CancellationToken);
+
+            return await CliCommandHelpers.FinishAsync(
                 context,
                 useCase.HandleAsync(new AnalyzeWebAppQuery(targetPath, context.HasFlag("all")), context.CancellationToken),
                 v => v.MarkdownSummary);

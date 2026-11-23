@@ -1,5 +1,6 @@
 using Meloberry.Application.Abstractions;
 using Meloberry.Application.UseCases.Diagnostics;
+using Meloberry.Application.UseCases.Json;
 using Meloberry.Domain.Common;
 using Meloberry.Domain.Layouts;
 
@@ -9,8 +10,8 @@ public sealed record ExportPackageCommand(string Address, string? OutputPath = n
 public sealed record ExportPackageResponse(string TargetId, string PackagePath, LintReportResponse LintReport, string TargetPlatform = "desktop", bool IncludedLayout = false, IReadOnlyList<string>? Warnings = null);
 public sealed record ImportPackageCommand(string PackagePath, string? DestinationDirectory = null);
 public sealed record ImportPackageResponse(string ImportedId, string Kind, string StorageDirectory);
-public sealed record BuildWebAppCommand(string Address, string? OutputDirectory = null);
-public sealed record BuildWebAppResponse(string TargetId, string OutputDirectory, string IndexHtmlPath, LintReportResponse LintReport);
+public sealed record BuildWebAppCommand(string Address, string? OutputDirectory = null, bool Verify = false, bool Verbose = false, bool Quiet = false, bool StaticVerifyOnly = false, int VerifyTimeoutSeconds = 30);
+public sealed record BuildWebAppResponse(string TargetId, string OutputDirectory, string IndexHtmlPath, ApplyLintSummary Lint, LintReportResponse? LintReport = null, WebAppVerificationReport? Verify = null);
 
 public sealed class ExportPackageHandler(
     ILayoutRepository layoutRepository,
@@ -81,7 +82,8 @@ public sealed class ImportPackageHandler(IWorkingDirectoryProvider workingDirect
 public sealed class BuildWebAppHandler(
     ILayoutRepository layoutRepository,
     LintHandler lintHandler,
-    IWebAppGenerator webAppGenerator)
+    IWebAppGenerator webAppGenerator,
+    VerifyWebAppHandler? verifyHandler = null)
 {
     public async Task<Result<BuildWebAppResponse>> HandleAsync(BuildWebAppCommand command, CancellationToken cancellationToken = default)
     {
@@ -97,6 +99,32 @@ public sealed class BuildWebAppHandler(
             : await webAppGenerator.GenerateForQuizAsync(ws.Quiz!, ws.StorageDirectory, layouts, command.OutputDirectory, cancellationToken);
 
         if (!webRes.IsSuccess) return webRes.Error!;
-        return new BuildWebAppResponse(wsId, Path.GetDirectoryName(webRes.Value) ?? webRes.Value, webRes.Value, ws.Report);
+        var webDir = Path.GetDirectoryName(webRes.Value) ?? webRes.Value;
+        var lintSummary = new ApplyLintSummary(ws.Report.IsClean, ws.Report.ErrorCount, ws.Report.WarningCount);
+        LintReportResponse? detailedLint = command.Verbose ? ws.Report : null;
+
+        WebAppVerificationReport? verifyReport = null;
+        if (command.Verify)
+        {
+            if (verifyHandler is null)
+                return new Error("Verify.Unavailable", "Headless WebApp verifier is not configured.", ErrorType.Validation);
+
+            var verRes = await verifyHandler.HandleAsync(
+                new VerifyWebAppCommand(webDir, command.StaticVerifyOnly, command.VerifyTimeoutSeconds),
+                cancellationToken);
+            if (!verRes.IsSuccess) return verRes.Error!;
+
+            verifyReport = verRes.Value;
+            if (!verifyReport.Passed)
+            {
+                return new Error(
+                    "Verify.Failed",
+                    $"WebApp runtime verification failed: {verifyReport.BrokenAssets.Count} broken asset(s), {verifyReport.ConsoleErrors.Count} console error(s), {verifyReport.OverflowIssues.Count} overflow issue(s), {verifyReport.KatexErrors.Count} KaTeX error(s).",
+                    ErrorType.Validation,
+                    Hint: string.IsNullOrWhiteSpace(verifyReport.ReportPath) ? null : $"Inspect verification details at '{verifyReport.ReportPath}'.");
+            }
+        }
+
+        return new BuildWebAppResponse(wsId, webDir, webRes.Value, lintSummary, detailedLint, verifyReport);
     }
 }

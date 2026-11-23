@@ -4,11 +4,11 @@ Minimal-token execution rules for driving `mby` deterministically.
 
 ## Conventions
 
-1. **Discover lazily**: Run `mby prime` once (~350 tokens). Query `mby spec <type...>` only for needed schemas (e.g. `mby spec article mcq`).
-2. **Use `MBY_AGENT=1` or `--json`**: Receive single-line minified JSON on stdout/stderr.
-3. **Pipe via `stdin` (`-`)**: Avoid temporary JSON files when authoring or patching.
-4. **Address with `#path` or `#ref`**: Set `"ref": "slug"` in JSON specs, or address positionally via `<wsId>#c1.b2` / `<wsId>#c2.q1`.
-5. **Inspect with `outline` first**: `mby get <wsId> --json` defaults to compact snippets; pass `--view full` only when full text is needed.
+1. **Discover lazily**: Run `mby prime` once or `mby <cmd> --help`. Query `mby spec <type...>` (including `callout`, `markdown`, `analyze`, `pkg`, `build`) for exact limits and schemas.
+2. **Use `MBY_AGENT=1` or `--json`**: Receive single-line minified JSON (`--quiet` omits large ID arrays).
+3. **Prefer Markdown & Modular Directories**: Author `./articles/*.md` (YAML frontmatter + `![alt](path "caption")` + `:::callout` + GFM tables) + quiz `.json` files instead of escaping long prose inside JSON strings.
+4. **Address with `#path` or `#ref`**: Component `ref` values auto-slugify cleanly when omitted, or set explicit `"ref": "slug"` (`<=32` chars).
+5. **Close QA in one command**: Run `mby build ./articles/ -o ./dist_web --verify --json` or `mby analyze ./dist_web --headless --json` for zero-touch runtime verification.
 
 ## Recipes
 

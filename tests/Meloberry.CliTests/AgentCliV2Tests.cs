@@ -5,6 +5,7 @@ using Xunit;
 
 namespace Meloberry.CliTests;
 
+[Collection("CwdTests")]
 public sealed class AgentCliV2Tests : IDisposable
 {
     private readonly string _tempDir = Path.Combine(Path.GetTempPath(), $"mby_v2_tests_{Guid.NewGuid():N}");
