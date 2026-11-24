@@ -526,6 +526,16 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
                 for (const child of children) {
                   const tag = child.tagName?.toLowerCase();
                   if (tag === 'table' || tag === 'pre' || child.classList?.contains('math')) continue;
+                  if (child.classList?.contains('mby-native-table')) {
+                    for (const sub of child.querySelectorAll('.mby-table-toolbar, .mby-table-caption, .mby-table-footnote'))
+                      checkOverflowOnElement(sub, cardRect, sIdx, qLabel);
+                    continue;
+                  }
+                  if (child.classList?.contains('mby-diff-wrap')) {
+                    for (const sub of child.querySelectorAll('.mby-diff-title, .mby-diff-bank, .mby-no-error-row'))
+                      checkOverflowOnElement(sub, cardRect, sIdx, qLabel);
+                    continue;
+                  }
                   if (child.parentElement?.classList?.contains('mby-article-blocks') && tag === 'div' && child.querySelector?.('table, pre, .math')) {
                     for (const sub of child.children)
                       checkOverflowOnElement(sub, cardRect, sIdx, qLabel);
@@ -566,13 +576,56 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
                 const card = scopeEl.querySelector('.mby-card, .mby-flashcard-scene');
                 checkCardOverflow(card, sIdx, qLabel);
 
-                // Reveal MCQ explanation box if present and verify its layout as well
-                const expBox = card?.querySelector('.mby-explanation-box.hidden');
+                // Verify Relabel image stage dimensions & mask box bounds (within 4px tolerance)
+                const relabelStages = card?.querySelectorAll('.mby-relabel-stage') || [];
+                for (const stage of relabelStages) {
+                  const stageImg = stage.querySelector('.mby-relabel-img');
+                  const imgRect = stageImg?.getBoundingClientRect();
+                  if (!imgRect || imgRect.width <= 0 || imgRect.height <= 0) {
+                    out.brokenAssets.push(`Relabel stage image has zero dimensions on slide ${sIdx + 1}${qLabel}`);
+                    continue;
+                  }
+                  for (const box of stage.querySelectorAll('.mby-mask-box')) {
+                    const br = box.getBoundingClientRect();
+                    if (br.left < imgRect.left - 4 || br.top < imgRect.top - 4 ||
+                        br.right > imgRect.right + 4 || br.bottom > imgRect.bottom + 4) {
+                      out.overflowIssues.push(`Relabel mask box out of image bounds on slide ${sIdx + 1}${qLabel}`);
+                    }
+                  }
+                }
+
+                // Exercise interactive mechanism chips before grading so sequence slots & canonical order are also checked
+                const mechChips = card?.querySelectorAll('.mby-mech-chip') || [];
+                if (mechChips.length > 0) {
+                  mechChips[0].click();
+                  await sleep(20);
+                }
+
+                // Exercise interactive relabel mask overlay clicks to verify zero runtime console errors
+                const maskBoxes = card?.querySelectorAll('.mby-mask-box') || [];
+                if (maskBoxes.length > 0) {
+                  maskBoxes[0].click();
+                  await sleep(20);
+                }
+
+                // Trigger Check Answer for graded questions (with or without explanation) and verify post-check layout
                 const checkBtn = card?.querySelector('.mby-check-btn');
-                if (expBox && checkBtn) {
+                if (checkBtn) {
                   checkBtn.click();
                   await sleep(30);
-                  checkCardOverflow(card, sIdx, `${qLabel} (Explanation)`);
+                  checkCardOverflow(card, sIdx, `${qLabel} (Checked)`);
+                  const postKErrors = scopeEl.querySelectorAll('.katex-error');
+                  if (postKErrors.length > 0)
+                    out.katexErrors.push(`${postKErrors.length} post-check KaTeX parse error(s) on slide ${sIdx + 1}${qLabel}`);
+                }
+
+                // Exercise Native Table hide/show toggles if present
+                const tblBtns = card?.querySelectorAll('.mby-table-toggle-btn') || [];
+                for (const tb of tblBtns) {
+                  tb.click();
+                  await sleep(15);
+                  tb.click();
+                  await sleep(15);
                 }
 
                 // Flip flashcards to verify back-face layout as well
@@ -662,6 +715,14 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
                  errOuter.TryGetProperty("exceptionDetails", out var exDet))
         {
             finalConsoleErrors.Add($"Verification script exception: {exDet}");
+        }
+        else if (evalResp.TryGetProperty("error", out var cdpErr))
+        {
+            finalConsoleErrors.Add($"CDP Runtime.evaluate protocol error: {cdpErr}");
+        }
+        else
+        {
+            finalConsoleErrors.Add($"CDP Runtime.evaluate returned unexpected payload without value: {evalResp}");
         }
 
         return new CdpInspectionOutcome(slidesChecked, imagesChecked, finalConsoleErrors, finalBrokenAssets, overflowIssues, katexErrors);

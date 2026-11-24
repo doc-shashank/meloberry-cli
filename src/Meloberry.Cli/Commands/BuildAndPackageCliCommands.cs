@@ -63,8 +63,8 @@ public sealed partial class BuildCliCommand : CliCommand
             bool ephemeral = context.HasFlag("ephemeral");
             int timeout = 30;
             var rawTimeout = context.GetOptionValue("timeout");
-            if (!string.IsNullOrWhiteSpace(rawTimeout) && (!int.TryParse(rawTimeout, out timeout) || timeout < 5))
-                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Invalid --timeout '{rawTimeout}'. Pass integer seconds >= 5.", context.GlobalOptions.Json);
+            if (!string.IsNullOrWhiteSpace(rawTimeout) && (!int.TryParse(rawTimeout, out timeout) || timeout is < 5 or > 180))
+                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Invalid --timeout '{rawTimeout}'. Pass integer seconds between 5 and 180.", context.GlobalOptions.Json);
 
             bool isStdin = string.Equals(target, "-", StringComparison.Ordinal);
             bool isExistingFile = !isStdin && File.Exists(target);
@@ -107,11 +107,15 @@ public sealed partial class BuildCliCommand : CliCommand
                 if (ephemeral)
                     return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Option '--ephemeral' is only supported for one-shot spec/file/dir/'-' builds.", context.GlobalOptions.Json);
 
+                var trimmedTarget = target.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
                 var effectiveWsId = isWorkspaceDbFolder
-                    ? Path.GetFileName(target.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
+                    ? Path.GetFileName(trimmedTarget)
                     : target;
+                var workspaceParentDir = isWorkspaceDbFolder
+                    ? Path.GetDirectoryName(Path.GetFullPath(trimmedTarget))
+                    : null;
                 var buildRes = await buildWebHandler.HandleAsync(
-                    new BuildWebAppCommand(effectiveWsId, outDir, verify, context.GlobalOptions.Verbose, context.GlobalOptions.Quiet, staticOnly, timeout),
+                    new BuildWebAppCommand(effectiveWsId, outDir, verify, context.GlobalOptions.Verbose, context.GlobalOptions.Quiet, staticOnly, timeout, workspaceParentDir),
                     context.CancellationToken);
                 if (!buildRes.IsSuccess) return buildRes.ToExitCode(context.Console, context.GlobalOptions.Json);
 
@@ -154,7 +158,7 @@ public sealed class PkgCliCommand : CliCommand
         : base(new CommandDescriptor(
             Verb: "pkg",
             Usage: "pkg <export <wsId> <desktop|android> [outPath] [--include-layout] | import <file.mbypkg> [destDir]>",
-            Description: "Exports (content-only default, non-interactive) or imports .mbypkg v1.0 archives.",
+            Description: "Exports (content-only default, non-interactive) or imports .mbypkg v2.0 archives (backward-compatible with v1.0).",
             HandlerType: typeof(Handler),
             AllowedFlagOptions: AllowedFlags,
             Prerequisites: "Runs mandatory lint before export; default export writes <wsId>.mbypkg into the workspace's project root (for .meloberry/workspaces) or parent directory unless [outPath] is given. Import defaults to CWD unless [destDir] is given.",
@@ -337,8 +341,8 @@ public sealed class AnalyzeCliCommand : CliCommand
             {
                 int timeout = 30;
                 var rawTimeout = context.GetOptionValue("timeout");
-                if (!string.IsNullOrWhiteSpace(rawTimeout) && (!int.TryParse(rawTimeout, out timeout) || timeout < 5))
-                    return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Invalid --timeout '{rawTimeout}'. Pass integer seconds >= 5.", context.GlobalOptions.Json);
+                if (!string.IsNullOrWhiteSpace(rawTimeout) && (!int.TryParse(rawTimeout, out timeout) || timeout is < 5 or > 180))
+                    return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Invalid --timeout '{rawTimeout}'. Pass integer seconds between 5 and 180.", context.GlobalOptions.Json);
 
                 var verRes = await verifyUseCase.HandleAsync(new VerifyWebAppCommand(targetPath, staticOnly, timeout), context.CancellationToken);
                 if (!verRes.IsSuccess) return verRes.ToExitCode(context.Console, context.GlobalOptions.Json);

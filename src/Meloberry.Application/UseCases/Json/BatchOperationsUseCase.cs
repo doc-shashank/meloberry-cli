@@ -145,11 +145,14 @@ public sealed partial class BatchOperationsHandler(
                 bool dryRun = GetBool(obj, "dryRun");
                 bool verify = GetBool(obj, "verify");
                 bool staticOnly = GetBool(obj, "staticOnly");
-                int timeout = GetInt(obj, "timeout") ?? 30;
+                if (!TryResolveTimeout(obj, out int timeout, out var timeoutErr))
+                    return (false, null, null, timeoutErr);
                 var specNode = GetNode(obj, "spec");
 
                 if (specNode is null && string.IsNullOrWhiteSpace(file))
                     return (false, null, null, new Error("Batch.InvalidOp", "'apply' requires 'spec' object or 'file' path.", ErrorType.Validation));
+                if (specNode is not null && !string.IsNullOrWhiteSpace(file))
+                    return (false, null, null, new Error("Batch.InvalidOp", "Specify either 'spec' or 'file' in an 'apply' batch step, not both.", ErrorType.Validation));
 
                 var res = await applyHandler.HandleAsync(
                     new ApplySpecCommand(target, file, specNode?.ToJsonString(), outDir, dryRun, buildOut, exportSpec, VerifyWeb: verify, StaticVerifyOnly: staticOnly, VerifyTimeoutSeconds: timeout), ct);
@@ -166,6 +169,8 @@ public sealed partial class BatchOperationsHandler(
 
                 var file = GetString(obj, "file");
                 var dataNode = GetNode(obj, "data") ?? GetNode(obj, "patch");
+                if (dataNode is not null && !string.IsNullOrWhiteSpace(file))
+                    return (false, null, null, new Error("Batch.InvalidOp", "Specify either 'data'/'patch' or 'file' in a 'patch' batch step, not both.", ErrorType.Validation));
                 var move = GetString(obj, "move");
                 List<string>? sets = null;
                 var rawSetNode = GetNode(obj, "set");
@@ -221,7 +226,8 @@ public sealed partial class BatchOperationsHandler(
                 var outDir = GetString(obj, "out");
                 bool verify = GetBool(obj, "verify");
                 bool staticOnly = GetBool(obj, "staticOnly");
-                int timeout = GetInt(obj, "timeout") ?? 30;
+                if (!TryResolveTimeout(obj, out int timeout, out var timeoutErr))
+                    return (false, null, null, timeoutErr);
                 var res = await buildHandler.HandleAsync(new BuildWebAppCommand(addr, outDir, Verify: verify, StaticVerifyOnly: staticOnly, VerifyTimeoutSeconds: timeout), ct);
                 return res.IsSuccess
                     ? (true, res.Value, res.Value.TargetId, null)
@@ -278,9 +284,21 @@ public sealed partial class BatchOperationsHandler(
         return node is JsonValue v && v.TryGetValue<bool>(out bool b) && b;
     }
 
-    private static int? GetInt(JsonObject obj, string name)
+    private static bool TryResolveTimeout(JsonObject obj, out int timeout, out Error? error)
     {
-        var node = GetNode(obj, name);
-        return node is JsonValue v && v.TryGetValue<int>(out int n) ? n : null;
+        timeout = 30;
+        error = null;
+        var node = GetNode(obj, "timeout");
+        if (node is null)
+            return true;
+
+        if (node is not JsonValue v || !v.TryGetValue<int>(out int parsed) || parsed is < 5 or > 180)
+        {
+            error = new Error("Batch.InvalidOp", "Invalid batch 'timeout'. Pass an integer between 5 and 180 seconds.", ErrorType.Validation, Path: "timeout");
+            return false;
+        }
+
+        timeout = parsed;
+        return true;
     }
 }

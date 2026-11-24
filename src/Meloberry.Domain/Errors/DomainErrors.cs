@@ -32,6 +32,7 @@ public static class ArticleErrors
     public static Error EmptyImagePath() => new("ArticleBlock.EmptyImagePath", "Article image block path cannot be empty.", ErrorType.Validation);
     public static Error InvalidCalloutTone(string rawTone) => new("ArticleBlock.InvalidCalloutTone", $"Invalid callout tone '{rawTone}'. Supported tones: 'pearl', 'clinical', 'warning'.", ErrorType.Validation, Hint: "Set tone to 'pearl', 'clinical', or 'warning'.");
     public static Error EmptyCalloutContent() => new("ArticleBlock.EmptyCalloutContent", "Callout block text content cannot be empty.", ErrorType.Validation);
+    public static Error InvalidTablePayload(string reason) => new("ArticleBlock.InvalidTablePayload", $"Invalid table block payload: {reason}", ErrorType.Validation);
 }
 
 public static class QuizErrors
@@ -46,7 +47,7 @@ public static class QuizErrors
 public static class QuestionErrors
 {
     public static Error NotFound(string questionId) => new("Question.NotFound", $"Question '{questionId}' was not found.", ErrorType.NotFound);
-    public static Error InvalidType(string type) => new("Question.InvalidType", $"Invalid question type '{type}'. Supported types: 'mcq', 'flashcard'.", ErrorType.Validation);
+    public static Error InvalidType(string type) => new("Question.InvalidType", $"Invalid question type '{type}'. Supported types: 'mcq', 'flashcard', 'fill-blank', 'assertion-reason', 'spot-error', 'diff', 'mechanism', 'relabel'.", ErrorType.Validation);
     public static Error WrongQuestionType(string questionId, string expectedType) => new("Question.WrongType", $"Question '{questionId}' is not a {expectedType} question.", ErrorType.Conflict);
     public static Error InvalidMaxOptions(int requested) => new("Question.InvalidMaxOptions", $"Option count {requested} is invalid. Must be between 2 and 26.", ErrorType.Validation);
     public static Error CannotShrinkOptionNumBelowPopulated(int requested, int highestPopulatedIndex) => new("Question.CannotShrinkOptionNum", $"Cannot set max options to {requested} because option index {highestPopulatedIndex} already exists.", ErrorType.Conflict);

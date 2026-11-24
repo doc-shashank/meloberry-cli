@@ -1,5 +1,6 @@
 using Meloberry.Application.UseCases.Common;
 using Meloberry.Domain.Common;
+using Meloberry.Domain.Payloads;
 using Meloberry.Domain.Questions;
 using Meloberry.Domain.Sessions;
 
@@ -28,7 +29,8 @@ public sealed record InspectQuestionDto(
     InspectFlashcardSideDto? Back = null,
     IReadOnlyDictionary<string, string>? LayoutOverrides = null,
     string? ImagePath = null,
-    string? Explanation = null);
+    string? Explanation = null,
+    string? PayloadJson = null);
 
 public sealed record InspectArticleBlockDto(
     string Id,
@@ -42,7 +44,8 @@ public sealed record InspectArticleBlockDto(
     string? Caption = null,
     string? Alt = null,
     string? Tone = null,
-    string? Title = null);
+    string? Title = null,
+    string? PayloadJson = null);
 
 public sealed record InspectComponentDto(
     string Id,
@@ -189,6 +192,7 @@ public sealed class InspectEntityHandler(EntityAddressResolver addressResolver)
         {
             ArticleBlockKind.Image => "image",
             ArticleBlockKind.Callout => "callout",
+            ArticleBlockKind.Table => "table",
             _ => "text"
         };
         string? toneStr = block.CalloutTone.HasValue ? ArticleBlock.CalloutToneToString(block.CalloutTone.Value) : null;
@@ -202,6 +206,7 @@ public sealed class InspectEntityHandler(EntityAddressResolver addressResolver)
             {
                 ArticleBlockKind.Image => string.IsNullOrWhiteSpace(block.Caption) ? block.ImagePath : $"{block.ImagePath} ({block.Caption})",
                 ArticleBlockKind.Callout => $"[{toneStr ?? "pearl"}] {(string.IsNullOrWhiteSpace(block.CalloutTitle) ? "" : block.CalloutTitle + ": ")}{block.TextContent}",
+                ArticleBlockKind.Table => FormatTableOutline(block),
                 _ => block.TextContent
             };
             return new(Id: block.Id, Index: block.Index, Kind: kind, Path: path, Ref: block.RefKey, Snippet: MakeSnippet(raw), Tone: toneStr);
@@ -218,12 +223,23 @@ public sealed class InspectEntityHandler(EntityAddressResolver addressResolver)
             Caption: block.Caption,
             Alt: block.Alt,
             Tone: toneStr,
-            Title: block.CalloutTitle);
+            Title: block.CalloutTitle,
+            PayloadJson: block.PayloadJson);
+    }
+
+    private static string FormatTableOutline(ArticleBlock block)
+    {
+        if (Phase1PayloadCodec.TryDeserialize<TableBlockPayload>(block.PayloadJson, out var t) && t is not null)
+        {
+            var title = !string.IsNullOrWhiteSpace(t.Title) ? t.Title : (block.CalloutTitle ?? "Table");
+            return $"[table] {title} ({t.Rows?.Count ?? 0}x{t.Headers?.Count ?? 0})";
+        }
+        return "[table]";
     }
 
     private static InspectQuestionDto MapQuestion(Question question, string path, InspectViewMode view)
     {
-        string type = question is McqQuestion ? "mcq" : "flashcard";
+        string type = Question.ToWireString(question.Type);
         if (view == InspectViewMode.Ids)
             return new(Id: question.Id, Index: question.Index, Type: type, Path: path, Ref: question.RefKey);
 
@@ -243,15 +259,26 @@ public sealed class InspectEntityHandler(EntityAddressResolver addressResolver)
                     LayoutOverrides: CopyOverridesOrNull(m.LayoutOverrides));
             }
 
-            var fc = (FlashcardQuestion)question;
+            if (question is FlashcardQuestion fc)
+            {
+                return new(
+                    Id: fc.Id,
+                    Index: fc.Index,
+                    Type: "flashcard",
+                    Path: path,
+                    Ref: fc.RefKey,
+                    Snippet: MakeSnippet(fc.Front.Text ?? fc.Front.ImagePath),
+                    LayoutOverrides: CopyOverridesOrNull(fc.LayoutOverrides));
+            }
+
             return new(
-                Id: fc.Id,
-                Index: fc.Index,
-                Type: "flashcard",
+                Id: question.Id,
+                Index: question.Index,
+                Type: type,
                 Path: path,
-                Ref: fc.RefKey,
-                Snippet: MakeSnippet(fc.Front.Text ?? fc.Front.ImagePath),
-                LayoutOverrides: CopyOverridesOrNull(fc.LayoutOverrides));
+                Ref: question.RefKey,
+                Snippet: MakeSnippet(FormatPayloadQuestionOutline(question)),
+                LayoutOverrides: CopyOverridesOrNull(question.LayoutOverrides));
         }
 
         if (question is McqQuestion mcq)
@@ -271,17 +298,42 @@ public sealed class InspectEntityHandler(EntityAddressResolver addressResolver)
                 Explanation: mcq.Explanation);
         }
 
-        var card = (FlashcardQuestion)question;
+        if (question is FlashcardQuestion card)
+        {
+            return new InspectQuestionDto(
+                Id: card.Id,
+                Index: card.Index,
+                Type: "flashcard",
+                Path: path,
+                Ref: card.RefKey,
+                Front: MapSide(card.Front),
+                Back: MapSide(card.Back),
+                LayoutOverrides: CopyOverridesOrNull(card.LayoutOverrides));
+        }
+
         return new InspectQuestionDto(
-            Id: card.Id,
-            Index: card.Index,
-            Type: "flashcard",
+            Id: question.Id,
+            Index: question.Index,
+            Type: type,
             Path: path,
-            Ref: card.RefKey,
-            Front: MapSide(card.Front),
-            Back: MapSide(card.Back),
-            LayoutOverrides: CopyOverridesOrNull(card.LayoutOverrides));
+            Ref: question.RefKey,
+            LayoutOverrides: CopyOverridesOrNull(question.LayoutOverrides),
+            PayloadJson: question.PayloadJson);
     }
+
+    private static string? FormatPayloadQuestionOutline(Question q) => q.Type switch
+    {
+        QuestionType.FillBlank when Phase1PayloadCodec.TryDeserialize<FillBlankPayload>(q.PayloadJson, out var fb) && fb is not null => fb.Template,
+        QuestionType.AssertionReason when Phase1PayloadCodec.TryDeserialize<AssertionReasonPayload>(q.PayloadJson, out var ar) && ar is not null => $"A: {ar.Assertion} | R: {ar.Reason}",
+        QuestionType.SpotError when Phase1PayloadCodec.TryDeserialize<SpotErrorPayload>(q.PayloadJson, out var se) && se is not null => se.Template,
+        QuestionType.Differentiation when Phase1PayloadCodec.TryDeserialize<DifferentiationPayload>(q.PayloadJson, out var d) && d is not null =>
+            $"[diff:{d.Mode}] {(!string.IsNullOrWhiteSpace(d.Title) ? d.Title : string.Join(" vs ", (d.Headers ?? []).Skip(1)))} ({d.Rows?.Count ?? 0}x{d.Headers?.Count ?? 0})",
+        QuestionType.Mechanism when Phase1PayloadCodec.TryDeserialize<MechanismPayload>(q.PayloadJson, out var m) && m is not null =>
+            $"[mechanism] {(!string.IsNullOrWhiteSpace(m.Title) ? m.Title : (m.Steps ?? []).FirstOrDefault(s => s is not null && !s.IsDistractor)?.Text)} ({(m.Steps ?? []).Count(s => s is not null && !s.IsDistractor)} steps)",
+        QuestionType.RelabelImage when Phase1PayloadCodec.TryDeserialize<RelabelImagePayload>(q.PayloadJson, out var r) && r is not null =>
+            $"[relabel:{r.Mode}/{r.Style}] {(!string.IsNullOrWhiteSpace(r.Prompt) ? r.Prompt : r.ImagePath)} ({r.Boxes?.Count ?? 0} boxes)",
+        _ => q.PayloadJson
+    };
 
     private static InspectFlashcardSideDto MapSide(FlashcardSide side) =>
         new(

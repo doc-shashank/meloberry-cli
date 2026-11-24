@@ -10,7 +10,7 @@ public sealed record ExportPackageCommand(string Address, string? OutputPath = n
 public sealed record ExportPackageResponse(string TargetId, string PackagePath, LintReportResponse LintReport, string TargetPlatform = "desktop", bool IncludedLayout = false, IReadOnlyList<string>? Warnings = null);
 public sealed record ImportPackageCommand(string PackagePath, string? DestinationDirectory = null);
 public sealed record ImportPackageResponse(string ImportedId, string Kind, string StorageDirectory);
-public sealed record BuildWebAppCommand(string Address, string? OutputDirectory = null, bool Verify = false, bool Verbose = false, bool Quiet = false, bool StaticVerifyOnly = false, int VerifyTimeoutSeconds = 30);
+public sealed record BuildWebAppCommand(string Address, string? OutputDirectory = null, bool Verify = false, bool Verbose = false, bool Quiet = false, bool StaticVerifyOnly = false, int VerifyTimeoutSeconds = 30, string? WorkspaceParentDirectory = null);
 public sealed record BuildWebAppResponse(string TargetId, string OutputDirectory, string IndexHtmlPath, ApplyLintSummary Lint, LintReportResponse? LintReport = null, WebAppVerificationReport? Verify = null);
 
 public sealed class ExportPackageHandler(
@@ -83,10 +83,14 @@ public sealed class BuildWebAppHandler(
     ILayoutRepository layoutRepository,
     LintHandler lintHandler,
     IWebAppGenerator webAppGenerator,
-    VerifyWebAppHandler? verifyHandler = null)
+    VerifyWebAppHandler? verifyHandler = null,
+    IWorkspaceRepository? workspaceRepository = null)
 {
     public async Task<Result<BuildWebAppResponse>> HandleAsync(BuildWebAppCommand command, CancellationToken cancellationToken = default)
     {
+        if (!string.IsNullOrWhiteSpace(command.WorkspaceParentDirectory) && workspaceRepository is not null)
+            await workspaceRepository.ListWorkspacesAsync(command.WorkspaceParentDirectory, includeAll: false, cancellationToken);
+
         var resolved = await lintHandler.LintAndResolveWorkspaceAsync(
             command.Address, "BuildWeb.TargetNotFound", $"Target '{command.Address}' must be a valid Session or Quiz ID.", cancellationToken);
         if (!resolved.IsSuccess) return resolved.Error!;

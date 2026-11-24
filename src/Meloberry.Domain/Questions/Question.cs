@@ -3,7 +3,7 @@ using Meloberry.Domain.Layouts;
 
 namespace Meloberry.Domain.Questions;
 
-public enum QuestionType { Mcq, Flashcard }
+public enum QuestionType { Mcq, Flashcard, FillBlank, AssertionReason, SpotError, Differentiation, Mechanism, RelabelImage }
 public enum FlashcardFace { Front, Back }
 public enum MediaPosition { TextBelowImage, TextAboveImage }
 
@@ -11,7 +11,14 @@ public abstract class Question : IIndexedEntity
 {
     private readonly Dictionary<string, string> _layoutOverrides;
 
-    protected Question(string id, string containerId, int index, QuestionType type, Dictionary<string, string>? layoutOverrides = null, string? refKey = null)
+    protected Question(
+        string id,
+        string containerId,
+        int index,
+        QuestionType type,
+        Dictionary<string, string>? layoutOverrides = null,
+        string? refKey = null,
+        string? payloadJson = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(id);
         ArgumentException.ThrowIfNullOrWhiteSpace(containerId);
@@ -22,6 +29,7 @@ public abstract class Question : IIndexedEntity
         Index = index;
         Type = type;
         RefKey = string.IsNullOrWhiteSpace(refKey) ? null : refKey.Trim().ToLowerInvariant();
+        PayloadJson = string.IsNullOrWhiteSpace(payloadJson) ? null : payloadJson.Trim();
         _layoutOverrides = layoutOverrides is not null
             ? new Dictionary<string, string>(layoutOverrides, StringComparer.OrdinalIgnoreCase)
             : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -32,8 +40,26 @@ public abstract class Question : IIndexedEntity
     public int Index { get; private set; }
     public QuestionType Type { get; private set; }
     public string? RefKey { get; private set; }
+    public string? PayloadJson { get; protected set; }
     public IReadOnlyDictionary<string, string> LayoutOverrides => _layoutOverrides;
-    public string LayoutTargetKey => Type == QuestionType.Mcq ? "mcq" : "flashcard";
+    public string LayoutTargetKey => Type switch
+    {
+        QuestionType.Flashcard => "flashcard",
+        _ => "mcq"
+    };
+
+    public static string ToWireString(QuestionType type) => type switch
+    {
+        QuestionType.Mcq => "mcq",
+        QuestionType.Flashcard => "flashcard",
+        QuestionType.FillBlank => "fill-blank",
+        QuestionType.AssertionReason => "assertion-reason",
+        QuestionType.SpotError => "spot-error",
+        QuestionType.Differentiation => "diff",
+        QuestionType.Mechanism => "mechanism",
+        QuestionType.RelabelImage => "relabel",
+        _ => type.ToString().ToLowerInvariant()
+    };
 
     public Result SetRefKey(string? refKey)
     {

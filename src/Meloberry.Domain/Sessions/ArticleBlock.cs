@@ -3,7 +3,7 @@ using Meloberry.Domain.Errors;
 
 namespace Meloberry.Domain.Sessions;
 
-public enum ArticleBlockKind { Text, Image, Callout }
+public enum ArticleBlockKind { Text, Image, Callout, Table }
 
 public enum CalloutTone { Pearl, Clinical, Warning }
 
@@ -20,7 +20,8 @@ public sealed class ArticleBlock : IIndexedEntity
         string? caption = null,
         string? alt = null,
         CalloutTone? calloutTone = null,
-        string? calloutTitle = null)
+        string? calloutTitle = null,
+        string? payloadJson = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(id);
         ArgumentException.ThrowIfNullOrWhiteSpace(componentId);
@@ -36,6 +37,7 @@ public sealed class ArticleBlock : IIndexedEntity
         Alt = string.IsNullOrWhiteSpace(alt) ? null : alt.Trim();
         CalloutTone = calloutTone;
         CalloutTitle = string.IsNullOrWhiteSpace(calloutTitle) ? null : calloutTitle.Trim();
+        PayloadJson = string.IsNullOrWhiteSpace(payloadJson) ? null : payloadJson.Trim();
     }
 
     public string Id { get; private set; }
@@ -49,6 +51,7 @@ public sealed class ArticleBlock : IIndexedEntity
     public string? Alt { get; private set; }
     public CalloutTone? CalloutTone { get; private set; }
     public string? CalloutTitle { get; private set; }
+    public string? PayloadJson { get; private set; }
 
     public static bool TryParseCalloutTone(string? raw, out CalloutTone tone)
     {
@@ -93,6 +96,11 @@ public sealed class ArticleBlock : IIndexedEntity
             ? ArticleErrors.EmptyCalloutContent()
             : new ArticleBlock(id, componentId, 1, ArticleBlockKind.Callout, textContent, null, calloutTone: tone, calloutTitle: title);
 
+    public static Result<ArticleBlock> CreateTable(string id, string componentId, string payloadJson, string? title = null) =>
+        string.IsNullOrWhiteSpace(payloadJson)
+            ? ArticleErrors.InvalidTablePayload("Table payload JSON cannot be empty.")
+            : new ArticleBlock(id, componentId, 1, ArticleBlockKind.Table, null, null, calloutTitle: title, payloadJson: payloadJson);
+
     public static ArticleBlock Rehydrate(
         string id,
         string componentId,
@@ -104,8 +112,9 @@ public sealed class ArticleBlock : IIndexedEntity
         string? caption = null,
         string? alt = null,
         CalloutTone? calloutTone = null,
-        string? calloutTitle = null) =>
-        new(id, componentId, index, kind, textContent, imagePath, refKey, caption, alt, calloutTone, calloutTitle);
+        string? calloutTitle = null,
+        string? payloadJson = null) =>
+        new(id, componentId, index, kind, textContent, imagePath, refKey, caption, alt, calloutTone, calloutTitle, payloadJson);
 
     public Result SetRefKey(string? refKey)
     {
@@ -154,6 +163,22 @@ public sealed class ArticleBlock : IIndexedEntity
             TextContent = textContent;
         }
         if (tone.HasValue) CalloutTone = tone.Value;
+        if (updateTitle || title is not null)
+            CalloutTitle = string.IsNullOrWhiteSpace(title) ? null : title.Trim();
+        return Result.Success();
+    }
+
+    public Result SetPayloadJson(string? payloadJson)
+    {
+        PayloadJson = string.IsNullOrWhiteSpace(payloadJson) ? null : payloadJson.Trim();
+        return Result.Success();
+    }
+
+    public Result UpdateTablePayload(string payloadJson, string? title = null, bool updateTitle = false)
+    {
+        if (Kind != ArticleBlockKind.Table) return ArticleErrors.WrongBlockKind(Id, "table");
+        if (string.IsNullOrWhiteSpace(payloadJson)) return ArticleErrors.InvalidTablePayload("Table payload JSON cannot be empty.");
+        PayloadJson = payloadJson.Trim();
         if (updateTitle || title is not null)
             CalloutTitle = string.IsNullOrWhiteSpace(title) ? null : title.Trim();
         return Result.Success();

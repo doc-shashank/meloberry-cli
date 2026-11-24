@@ -40,19 +40,19 @@ public sealed class SpecCliCommand : CliCommand
     public SpecCliCommand()
         : base(new CommandDescriptor(
             Verb: "spec",
-            Usage: "spec [type...]",
-            Description: "Prints compact schemas for implemented JSON specs and layout bounds.",
+            Usage: "spec [type|@group...]",
+            Description: "Prints compact schemas for implemented specs (Session & Quiz Content Specs vs. Other Specs) and layout bounds.",
             HandlerType: typeof(Handler),
-            Prerequisites: "Stateless; pass one or more topic names (session, article, quiz, text, image, mcq, flashcard, layouts, callout, markdown, analyze, pkg, build, batch, patch) or omit to print all.",
+            Prerequisites: $"Stateless; pass topic names ({string.Join(", ", GetSchemaHandler.SupportedTopics)}) or group selectors ({string.Join(", ", GetSchemaHandler.SupportedGroups)}), or omit to print all.",
             OptionsHelp:
             [
                 "(No command-specific options; supports global --json.)"
             ],
             Examples:
             [
-                "mby spec mcq flashcard",
-                "mby spec batch patch --json",
-                "mby spec layouts --json"
+                "mby spec @questions --json",
+                "mby spec @content @other --json",
+                "mby spec mcq flashcard layouts --json"
             ]))
     {
     }

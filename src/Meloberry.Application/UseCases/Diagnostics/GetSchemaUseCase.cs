@@ -23,7 +23,9 @@ public sealed record SchemaTopicDefinition(
     string Summary,
     bool DisallowUnmappedProperties,
     IReadOnlyList<SchemaFieldSpec> Fields,
-    object Example);
+    object Example,
+    string Scope = "content",
+    string Category = "question");
 
 public sealed record GetSchemaResponse(
     IReadOnlyList<string> RequestedTopics,
@@ -42,26 +44,78 @@ public sealed record SchemaLayoutPropertySpec(
 
 public sealed class GetSchemaHandler
 {
+    public sealed record TopicClassification(string Topic, string Scope, string Category);
+
+    public static readonly IReadOnlyList<TopicClassification> TopicCatalog =
+    [
+        new("session", "content", "container"),
+        new("article", "content", "container"),
+        new("quiz", "content", "container"),
+        new("text", "content", "block"),
+        new("image", "content", "block"),
+        new("callout", "content", "block"),
+        new("table", "content", "block"),
+        new("mcq", "content", "question"),
+        new("flashcard", "content", "question"),
+        new("fill-blank", "content", "question"),
+        new("assertion-reason", "content", "question"),
+        new("spot-error", "content", "question"),
+        new("diff", "content", "question"),
+        new("mechanism", "content", "question"),
+        new("relabel", "content", "question"),
+        new("markdown", "other", "format"),
+        new("layouts", "other", "format"),
+        new("patch", "other", "workflow"),
+        new("batch", "other", "workflow"),
+        new("pkg", "other", "workflow"),
+        new("build", "other", "workflow"),
+        new("analyze", "other", "workflow")
+    ];
+
     public static readonly IReadOnlyList<string> SupportedTopics =
-        ["session", "article", "quiz", "text", "image", "mcq", "flashcard", "layouts", "callout", "markdown", "analyze", "pkg", "build", "batch", "patch"];
+        ["session", "article", "quiz", "text", "image", "mcq", "flashcard", "layouts", "callout", "markdown", "analyze", "pkg", "build", "batch", "patch", "table", "fill-blank", "assertion-reason", "spot-error", "diff", "mechanism", "relabel"];
+
+    public static readonly IReadOnlyList<string> SupportedGroups =
+        ["@content", "@containers", "@blocks", "@questions", "@other", "@formats", "@workflows"];
 
     public Task<Result<GetSchemaResponse>> HandleAsync(GetSchemaQuery query, CancellationToken cancellationToken = default)
     {
-        var requested = (query.Topics ?? [])
+        var rawTokens = (query.Topics ?? [])
             .Where(t => !string.IsNullOrWhiteSpace(t))
             .Select(t => t.Trim().ToLowerInvariant())
-            .Distinct(StringComparer.Ordinal)
             .ToList();
 
-        foreach (var topic in requested)
+        var requested = new List<string>();
+        foreach (var token in rawTokens)
         {
-            if (!SupportedTopics.Contains(topic, StringComparer.Ordinal))
+            if (token.StartsWith('@'))
+            {
+                var expanded = ExpandGroupToken(token);
+                if (expanded is null)
+                {
+                    return Task.FromResult(Result<GetSchemaResponse>.Failure(new Error(
+                        "Schema.TopicNotFound",
+                        $"Unknown spec group '{token}'. Supported groups: {string.Join(", ", SupportedGroups)}. Supported topics: {string.Join(", ", SupportedTopics)}.",
+                        ErrorType.NotFound)));
+                }
+                foreach (var topic in expanded)
+                {
+                    if (!requested.Contains(topic, StringComparer.Ordinal))
+                        requested.Add(topic);
+                }
+                continue;
+            }
+
+            if (!SupportedTopics.Contains(token, StringComparer.Ordinal))
             {
                 return Task.FromResult(Result<GetSchemaResponse>.Failure(new Error(
                     "Schema.TopicNotFound",
-                    $"Unknown spec topic '{topic}'. Supported topics: {string.Join(", ", SupportedTopics)}.",
+                    $"Unknown spec topic '{token}'. Supported topics: {string.Join(", ", SupportedTopics)}. Supported groups: {string.Join(", ", SupportedGroups)}.",
                     ErrorType.NotFound)));
             }
+
+            if (!requested.Contains(token, StringComparer.Ordinal))
+                requested.Add(token);
         }
 
         var activeTopics = requested.Count == 0 ? SupportedTopics.ToList() : requested;
@@ -79,6 +133,13 @@ public sealed class GetSchemaHandler
                 case "mcq": schemas.Add(BuildMcqSchema()); break;
                 case "flashcard": schemas.Add(BuildFlashcardSchema()); break;
                 case "callout": schemas.Add(BuildCalloutSchema()); break;
+                case "table": schemas.Add(BuildTableBlockSchema()); break;
+                case "fill-blank": schemas.Add(BuildFillBlankSchema()); break;
+                case "assertion-reason": schemas.Add(BuildAssertionReasonSchema()); break;
+                case "spot-error": schemas.Add(BuildSpotErrorSchema()); break;
+                case "diff": schemas.Add(BuildDiffSchema()); break;
+                case "mechanism": schemas.Add(BuildMechanismSchema()); break;
+                case "relabel": schemas.Add(BuildRelabelSchema()); break;
                 case "markdown": schemas.Add(BuildMarkdownSchema()); break;
                 case "analyze": schemas.Add(BuildAnalyzeSchema()); break;
                 case "pkg": schemas.Add(BuildPkgSchema()); break;
@@ -90,6 +151,21 @@ public sealed class GetSchemaHandler
 
         var layoutProps = activeTopics.Contains("layouts", StringComparer.Ordinal) ? BuildLayoutSpecs() : null;
         return Task.FromResult(Result<GetSchemaResponse>.Success(new GetSchemaResponse(activeTopics, schemas, layoutProps)));
+    }
+
+    private static IReadOnlyList<string>? ExpandGroupToken(string groupToken)
+    {
+        return groupToken switch
+        {
+            "@content" => TopicCatalog.Where(t => t.Scope == "content").Select(t => t.Topic).ToList(),
+            "@containers" or "@container" => TopicCatalog.Where(t => t.Category == "container").Select(t => t.Topic).ToList(),
+            "@blocks" or "@block" => TopicCatalog.Where(t => t.Category == "block").Select(t => t.Topic).ToList(),
+            "@questions" or "@question" => TopicCatalog.Where(t => t.Category == "question").Select(t => t.Topic).ToList(),
+            "@other" => TopicCatalog.Where(t => t.Scope == "other").Select(t => t.Topic).ToList(),
+            "@formats" or "@format" => TopicCatalog.Where(t => t.Category == "format").Select(t => t.Topic).ToList(),
+            "@workflows" or "@workflow" => TopicCatalog.Where(t => t.Category == "workflow").Select(t => t.Topic).ToList(),
+            _ => null
+        };
     }
 
     private static SchemaTopicDefinition BuildSessionSchema() =>
@@ -120,18 +196,20 @@ public sealed class GetSchemaHandler
                     new { kind = "article", title = "Equations", blocks = new object[] { new { kind = "text", text = "# Kinematics\n\n$$v = u + at$$" } } },
                     new { kind = "quiz", title = "Check", quizType = "mixed", questions = new object[] { new { type = "mcq", text = "SI unit of force?", options = new object[] { new { text = "N", isCorrect = true }, new { text = "J", isCorrect = false } } } } }
                 }
-            });
+            },
+            Scope: "content",
+            Category: "container");
 
     private static SchemaTopicDefinition BuildArticleSchema() =>
         new(
             Topic: "article",
             CompactSignature: """
                 // Article component (ref auto-slugified from title if omitted; max 32, ^[a-z0-9][a-z0-9_-]{0,31}$)
-                { kind:"article", ref?:string, title?:string, layoutOverrides?:Record<string,string>, blocks:[TextBlock|ImageBlock|CalloutBlock] }
+                { kind:"article", ref?:string, title?:string, layoutOverrides?:Record<string,string>, blocks:[TextBlock|ImageBlock|CalloutBlock|TableBlock] }
                 // Ex: {"kind":"article","ref":"core-laws","title":"Basics","blocks":[{"kind":"text","text":"## Law\n$$F=ma$$"}]}
                 """,
             Command: "mby apply <sessionID|componentID> <spec.json|md|->",
-            Summary: "Article component with ordered text/image/callout blocks.",
+            Summary: "Article component with ordered text/image/callout/table blocks.",
             DisallowUnmappedProperties: true,
             Fields:
             [
@@ -139,7 +217,7 @@ public sealed class GetSchemaHandler
                 new("ref", "string", false, "Optional workspace-unique slug (auto-generated from title if omitted).", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
                 new("title", "string", false, "Section title."),
                 new("layoutOverrides", "object<string,string>", false, "Bounded article layout overrides."),
-                new("blocks", "array<block>", true, "Ordered text, image, or callout blocks.")
+                new("blocks", "array<block>", true, "Ordered text, image, callout, or table blocks.")
             ],
             Example: new
             {
@@ -152,17 +230,19 @@ public sealed class GetSchemaHandler
                     new { kind = "image", imagePath = "images/force.png", caption = "Fig. 1: Force diagram", alt = "Force vector diagram" },
                     new { kind = "callout", tone = "pearl", title = "Key Rule", text = "SI unit of force is Newton (N)." }
                 }
-            });
+            },
+            Scope: "content",
+            Category: "container");
 
     private static SchemaTopicDefinition BuildQuizSchema() =>
         new(
             Topic: "quiz",
             CompactSignature: """
                 // Standalone Quiz (Set_*) or Embedded Quiz Component (ref max 32, auto if omitted on component)
-                { kind:"quiz", ref?:string /* max 32, ^[a-z0-9][a-z0-9_-]{0,31}$ */, quizType?:"mcq"|"flashcard"|"mixed", name?:string, description?:string, title?:string, layoutOverrides?:Record<string,string>, questions:[Mcq|Flashcard] }
+                { kind:"quiz", ref?:string /* max 32, ^[a-z0-9][a-z0-9_-]{0,31}$ */, quizType?:"mcq"|"flashcard"|"mixed", name?:string, description?:string, title?:string, layoutOverrides?:Record<string,string>, questions:[Mcq|Flashcard|FillBlank|AssertionReason|SpotError|Differentiation|Mechanism|RelabelImage] }
                 // Ex: {"kind":"quiz","quizType":"mixed","name":"Alg Quiz","questions":[{"type":"flashcard","front":{"text":"O(log n)?"},"back":{"text":"Binary search"}}]}
                 """,
-            Command: "mby apply [<setID|componentID>] <spec.json|-> [-o dir]",
+            Command: "mby apply [<setID|componentID>] <spec.json|md|-> [-o dir]",
             Summary: "Standalone Quiz or embedded Quiz Component.",
             DisallowUnmappedProperties: true,
             Fields:
@@ -174,7 +254,7 @@ public sealed class GetSchemaHandler
                 new("description", "string", false, "Description for standalone Set_*."),
                 new("title", "string", false, "Section title when embedded Component_*."),
                 new("layoutOverrides", "object<string,string>", false, "Bounded layout overrides (component only)."),
-                new("questions", "array<question>", true, "Ordered mcq/flashcard objects.")
+                new("questions", "array<question>", true, "Ordered mcq, flashcard, fill-blank, assertion-reason, spot-error, diff, mechanism, or relabel objects.")
             ],
             Example: new
             {
@@ -185,7 +265,9 @@ public sealed class GetSchemaHandler
                 {
                     new { type = "flashcard", front = new { text = "Binary search complexity?" }, back = new { text = "$O(\\log n)$" } }
                 }
-            });
+            },
+            Scope: "content",
+            Category: "container");
 
     private static SchemaTopicDefinition BuildTextBlockSchema() =>
         new(
@@ -204,7 +286,9 @@ public sealed class GetSchemaHandler
                 new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
                 new("text", "string", true, "Non-empty Markdown/KaTeX text.")
             ],
-            Example: new { kind = "text", text = "# Heading\n\nBody text with $E = mc^2$." });
+            Example: new { kind = "text", text = "# Heading\n\nBody text with $E = mc^2$." },
+            Scope: "content",
+            Category: "block");
 
     private static SchemaTopicDefinition BuildImageBlockSchema() =>
         new(
@@ -225,7 +309,9 @@ public sealed class GetSchemaHandler
                 new("caption", "string", false, "Optional caption rendered atomically inside <figcaption> (supports Markdown/KaTeX)."),
                 new("alt", "string", false, "Optional accessibility alt text.")
             ],
-            Example: new { kind = "image", imagePath = "assets/fig_2.1.png", caption = "Fig. 2.1 Overview", alt = "Overview diagram" });
+            Example: new { kind = "image", imagePath = "assets/fig_2.1.png", caption = "Fig. 2.1 Overview", alt = "Overview diagram" },
+            Scope: "content",
+            Category: "block");
 
     private static SchemaTopicDefinition BuildMcqSchema() =>
         new(
@@ -262,7 +348,9 @@ public sealed class GetSchemaHandler
                     new { text = "3", isCorrect = true },
                     new { text = "4", isCorrect = false }
                 }
-            });
+            },
+            Scope: "content",
+            Category: "question");
 
     private static SchemaTopicDefinition BuildFlashcardSchema() =>
         new(
@@ -288,7 +376,9 @@ public sealed class GetSchemaHandler
                 type = "flashcard",
                 front = new { text = "Binary search worst case?", position = "belowImage" },
                 back = new { text = "$O(\\log n)$" }
-            });
+            },
+            Scope: "content",
+            Category: "question");
 
     private static SchemaTopicDefinition BuildCalloutSchema() =>
         new(
@@ -309,34 +399,49 @@ public sealed class GetSchemaHandler
                 new("text", "string", true, "Non-empty Markdown/KaTeX body."),
                 new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern)
             ],
-            Example: new { kind = "callout", tone = "clinical", title = "Clinical Correlation", text = "Elevated serum troponin indicates cardiac myocyte necrosis." });
+            Example: new { kind = "callout", tone = "clinical", title = "Clinical Correlation", text = "Elevated serum troponin indicates cardiac myocyte necrosis." },
+            Scope: "content",
+            Category: "block");
 
     private static SchemaTopicDefinition BuildMarkdownSchema() =>
         new(
             Topic: "markdown",
             CompactSignature: """
-                // Markdown article / directory input (replaces verbose JSON escaping)
-                // Optional YAML frontmatter: ---\nkind: article\ntitle: "Cell Injury"\nref: cell-injury\n---
-                // Standalone image: ![alt text](assets/fig_2.1.png "Caption text") -> ImageBlock(imagePath, alt, caption)
-                // Callout fence: :::callout{tone="clinical" title="Clinical Note"}\n...\n:::  (or :::pearl Title / :::warning Title)
+                // Markdown article, quiz, or modular directory input (replaces verbose JSON escaping)
+                // Article frontmatter: ---\nkind: article\ntitle: "Cell Injury"\nref: cell-injury\n---
+                //   Standalone image: ![alt](assets/fig_2.1.png "Caption") -> ImageBlock
+                //   Callout fence:    :::callout{ref?="slug" tone="clinical" title="Clinical Note"}\n...\n:::  (or :::pearl / :::clinical / :::warning with optional ref/title)
+                //   Table fence:      :::table{title="..." stickyFirstCol=true hideableCols="2,3"}\n| A | B |\n| --- | --- |\n| 1 | 2 |\n:::footnote\n...\n:::
+                // Quiz frontmatter: ---\nkind: quiz\nquizType: mixed\ntitle: "Chapter Review"\n---
+                //   MCQ fence:              :::mcq{ref?="slug" multi?=false maxOptions?=4 image?="path"}\nPrompt\n- [x] Right\n- [ ] Wrong\n:::explanation\n...\n:::
+                //   Flashcard fence:        :::flashcard{ref?="slug" frontPosition?="belowImage"}\n:::front\n...\n:::back\n...\n:::
+                //   Fill-blank fence:       :::fill-blank{fuzzy?=true caseSensitive?=false}\nText with {{primary | alias}}.\n:::explanation\n...\n:::
+                //   Assertion-Reason fence: :::assertion-reason{answer="both-explain" scheme?="4opt"}\nA: ...\nR: ...\n:::explanation\n...\n:::
+                //   Spot-error fence:       :::spot-error{requireFix?=false allowNoError?=true noError?=false}\nIn [span], x is [~~wrong~~ -> right].\n:::explanation\n...\n:::
+                //   Diff fence:             :::diff{mode="fill"|"spot-wrong"|"rearrange" title?="..." bank?=false fuzzy?=true allowNoError?=false}\n| Feature | A | B |\n|---|---|---|\n| Row | {{ans | alias}} | ~~bad~~ -> fix \| alt |\n:::explanation\n...\n:::
+                //   Mechanism fence:        :::mechanism{title?="..."}\n1. Step one\n2a. Parallel A\n2b. Parallel B\n! Decoy step\n:::explanation\n...\n:::
+                //   Relabel fence:          :::relabel{image="assets/fig.png" masks?="assets/fig.masks.json" mode?="reveal"|"bank"|"recall" style?="solid"|"blur"|"pixelate"|"whiteout"}\nprompt: ...\nboxes:\n  - label: "A"\n    rect: [0.1, 0.2, 0.2, 0.1]\n:::explanation\n...\n:::
                 // Directory mode: mby apply ./articles/  or  mby build ./articles/ -o ./web (reads _session.md|session.json + sorted *.md/*.json)
                 """,
-            Command: "mby apply <article.md|dir|->  |  mby build <dir|article.md> -o <webDir>",
-            Summary: "Author articles in clean Markdown + frontmatter or modular directories.",
+            Command: "mby apply <file.md|dir|->  |  mby build <dir|file.md> -o <webDir>",
+            Summary: "Author articles and quizzes in clean Markdown + frontmatter or modular directories.",
             DisallowUnmappedProperties: false,
             Fields:
             [
                 new("title", "string", false, "YAML frontmatter title (falls back to first # Heading or filename stem)."),
                 new("ref", "string", false, "YAML frontmatter ref (auto-slugified from filename/title if omitted).", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
-                new("kind", "string", false, "'article' (default for .md) or 'session' (in _session.md).", ["article", "session"]),
-                new("name", "string", false, "Session name in _session.md frontmatter."),
+                new("kind", "string", false, "'article' (default for prose .md), 'quiz' ('mcq'|'flashcard'|'mixed'), or 'session' (in _session.md).", ["article", "quiz", "mcq", "flashcard", "mixed", "session"]),
+                new("quizType", "string", false, "Quiz mode when kind is 'quiz' (defaults to 'mixed').", ["mcq", "flashcard", "mixed"]),
+                new("name", "string", false, "Session or standalone quiz name in frontmatter."),
                 new("order", "array<string>", false, "Optional filename order override in _session.md.")
             ],
             Example: new
             {
-                file = "01-intro.md",
-                preview = "---\ntitle: Cellular Responses\n---\n\n# Overview\n\n![Necrosis](assets/fig_2.1.png \"Fig. 2.1 Stages\")\n\n:::clinical Correlation\nReversible swelling precedes lysis.\n:::"
-            });
+                article = "---\ntitle: Cellular Responses\n---\n\n![Necrosis](assets/fig_2.1.png \"Fig. 2.1\")\n\n:::table{title=\"Necrosis vs Apoptosis\" stickyFirstCol=true hideableCols=\"2,3\"}\n| Feature | Necrosis | Apoptosis |\n| --- | --- | --- |\n| Energy | Passive | ATP-dependent |\n:::",
+                quiz = "---\nkind: quiz\nquizType: mixed\ntitle: Quick Check\n---\n\n:::fill-blank{fuzzy=true}\nRate-limiting enzyme of glycolysis: {{phosphofructokinase-1 | PFK-1}}.\n:::\n\n:::assertion-reason{answer=\"both-no-explain\"}\nA: Aspirin is avoided in pediatric viral illness.\nR: Aspirin acetylates COX-1 irreversibly.\n:::\n\n:::spot-error{allowNoError=true}\nIn [hyperparathyroidism], calcium is [high] and phosphate is [~~high~~ -> low].\n:::"
+            },
+            Scope: "other",
+            Category: "format");
 
     private static SchemaTopicDefinition BuildAnalyzeSchema() =>
         new(
@@ -357,13 +462,15 @@ public sealed class GetSchemaHandler
                 new("--live", "boolean", false, "Launch interactive browser preview + /api/analysis endpoint to record *.analysis.json."),
                 new("--all", "boolean", false, "Aggregate all saved *.analysis.json reports in <webDir>/reports.")
             ],
-            Example: new { command = "mby analyze ./study_web --headless --json" });
+            Example: new { command = "mby analyze ./study_web --headless --json" },
+            Scope: "other",
+            Category: "workflow");
 
     private static SchemaTopicDefinition BuildPkgSchema() =>
         new(
             Topic: "pkg",
             CompactSignature: """
-                // Export/Import portable .mbypkg archive (1.0 schema; desktop or android target)
+                // Export/Import portable .mbypkg archive (2.0 schema; imports v1.0 & v2.0; desktop or android target)
                 // Export: mby pkg export <wsId> <desktop|android> [outPath.mbypkg] [--include-layout]
                 // Import: mby pkg import <file.mbypkg> [destDir]
                 """,
@@ -377,7 +484,9 @@ public sealed class GetSchemaHandler
                 new("outputPath", "string", false, "Optional .mbypkg destination path or directory (defaults to <projectRoot>/<wsId>.mbypkg for .meloberry/workspaces, else <workspaceParent>/<wsId>.mbypkg)."),
                 new("destDir", "string", false, "Optional import destination directory (defaults to CWD).")
             ],
-            Example: new { exportCmd = "mby pkg export Session_123 android ./chapter2.mbypkg --json" });
+            Example: new { exportCmd = "mby pkg export Session_123 android ./chapter2.mbypkg --json" },
+            Scope: "other",
+            Category: "workflow");
 
     private static SchemaTopicDefinition BuildBuildSchema() =>
         new(
@@ -400,7 +509,9 @@ public sealed class GetSchemaHandler
                 new("--preview", "boolean", false, "Open interactive local preview server."),
                 new("--no-wait", "boolean", false, "Exit immediately after printing preview URL (with --preview).")
             ],
-            Example: new { buildCmd = "mby build ./articles/ -o ./study_web --verify --json" });
+            Example: new { buildCmd = "mby build ./articles/ -o ./study_web --verify --json" },
+            Scope: "other",
+            Category: "workflow");
 
     private static SchemaTopicDefinition BuildBatchSchema() =>
         new(
@@ -434,7 +545,9 @@ public sealed class GetSchemaHandler
                 new { op = "apply", spec = new { kind = "quiz", quizType = "mcq", name = "Draft" } },
                 new { op = "patch", addr = "$0.id", data = new { name = "Final Quiz" } },
                 new { op = "check", addr = "$0.id" }
-            });
+            },
+            Scope: "other",
+            Category: "workflow");
 
     private static SchemaTopicDefinition BuildPatchSchema() =>
         new(
@@ -443,8 +556,15 @@ public sealed class GetSchemaHandler
                 // Surgical partial update / reorder by ID, #path, or #ref (strict per-entity keys; null clears nullable fields/overrides)
                 // session|quiz: { name?, description? } | component: { title?, ref?, layoutOverrides? }
                 // block(text): { text?, ref? } | block(image): { imagePath?, caption?, alt?, ref? } | block(callout): { tone?, title?, text?, ref? }
+                // block(table): { title?, caption?, stickyFirstCol?, hideableCols?, headers?, alignments?, rows?, footnote?, ref? }
                 // mcq: { text?, imagePath?, explanation?, isMultiCorrect?, maxOptions?, options?, ref?, layoutOverrides? }
                 // flashcard: { front?:{text?,imagePath?,position?}, back?:{text?,imagePath?,position?}, ref?, layoutOverrides? }
+                // fill-blank: { text?, fuzzy?, caseSensitive?, explanation?, ref?, layoutOverrides? }
+                // assertion-reason: { assertion?, reason?, answer?, scheme?, explanation?, ref?, layoutOverrides? }
+                // spot-error: { text?, requireFix?, allowNoError?, noError?, explanation?, ref?, layoutOverrides? }
+                // diff: { mode?, title?, bank?, fuzzy?, caseSensitive?, allowNoError?, headers?, alignments?, rows?, explanation?, ref?, layoutOverrides? }
+                // mechanism: { title?, steps?, explanation?, ref?, layoutOverrides? }
+                // relabel: { imagePath?, prompt?, mode?, style?, boxes?, distractors?, fuzzy?, caseSensitive?, explanation?, ref?, layoutOverrides? }
                 """,
             Command: "mby patch <addr> [file|-] [--set k=v] [--move idx:shift|exchange]",
             Summary: "Updates allowed fields of an existing entity via JSON object and/or repeatable --set k=v, or reorders with --move.",
@@ -459,7 +579,264 @@ public sealed class GetSchemaHandler
             Example: new
             {
                 command = "mby patch Session_123#c2.q1 --set text=\"Updated prompt\" --set layoutOverrides.optionColumns=2 --json"
-            });
+            },
+            Scope: "other",
+            Category: "workflow");
+
+    private static SchemaTopicDefinition BuildTableBlockSchema() =>
+        new(
+            Topic: "table",
+            CompactSignature: """
+                // Article block: table (interactive study table with hideable columns & sticky first column)
+                { kind:"table", ref?:string, title?:string, caption?:string, stickyFirstCol?:bool, hideableCols?:int[], headers:string[], alignments?:("left"|"center"|"right")[], rows:string[][], footnote?:string }
+                // Markdown: :::table{title="..." stickyFirstCol=true hideableCols="2,3"}\n| Col1 | Col2 |\n|---|---|\n| A | B |\n:::footnote\n...\n:::
+                """,
+            Command: "Inside article.blocks[] or :::table{...} in Markdown",
+            Summary: "First-class interactive study table with column masking, sticky first column, caption, and footnote.",
+            DisallowUnmappedProperties: true,
+            Fields:
+            [
+                new("kind", "string", true, "Must be 'table'.", ["table"]),
+                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                new("title", "string", false, "Optional table header toolbar title."),
+                new("caption", "string", false, "Optional Markdown/KaTeX table caption."),
+                new("stickyFirstCol", "boolean", false, "Stick first column during horizontal scroll (default false)."),
+                new("hideableCols", "array<integer>", false, "1-based column indices that can be blurred/masked for active recall."),
+                new("headers", "array<string>", true, "Non-empty column header labels (Markdown/KaTeX supported)."),
+                new("alignments", "array<string>", false, "Optional per-column alignment ('left' | 'center' | 'right')."),
+                new("rows", "array<array<string>>", true, "At least 1 row; each row must match headers.length."),
+                new("footnote", "string", false, "Optional Markdown/KaTeX table footnote.")
+            ],
+            Example: new
+            {
+                kind = "table",
+                title = "Loop vs Thiazide Diuretics",
+                stickyFirstCol = true,
+                hideableCols = new[] { 2, 3 },
+                headers = new[] { "Feature", "Loop", "Thiazide" },
+                rows = new[] { new[] { "Serum Ca2+", "Decreased", "Increased" } },
+                footnote = "Both can cause hypokalemia."
+            },
+            Scope: "content",
+            Category: "block");
+
+    private static SchemaTopicDefinition BuildFillBlankSchema() =>
+        new(
+            Topic: "fill-blank",
+            CompactSignature: """
+                // Question: fill-blank (free recall with {{primary | alias}} slots, fuzzy/Greek matching & self-grade override)
+                { type:"fill-blank", ref?:string, text:string, fuzzy?:bool, caseSensitive?:bool, explanation?:string, layoutOverrides?:Record<string,string> }
+                // Markdown: :::fill-blank{fuzzy=true caseSensitive=false}\nEnzyme is {{phosphofructokinase-1 | PFK-1}}.\n:::explanation\n...\n:::
+                """,
+            Command: "Inside quiz.questions[] or :::fill-blank{...} in Markdown",
+            Summary: "Free-recall fill-in-the-blank question with aliases, Greek/fuzzy tolerance, and self-grade override.",
+            DisallowUnmappedProperties: true,
+            Fields:
+            [
+                new("type", "string", true, "Must be 'fill-blank'.", ["fill-blank"]),
+                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                new("text", "string", true, "Prompt containing >=1 '{{primary | alias}}' blank slot."),
+                new("fuzzy", "boolean", false, "Allow Levenshtein distance <= 1 for answers >= 6 chars (default true)."),
+                new("caseSensitive", "boolean", false, "Require exact letter case match (default false)."),
+                new("explanation", "string", false, "Optional explanation Markdown/KaTeX."),
+                new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
+            ],
+            Example: new
+            {
+                type = "fill-blank",
+                text = "Rate-limiting enzyme of glycolysis is {{phosphofructokinase-1 | PFK-1}}.",
+                fuzzy = true,
+                caseSensitive = false,
+                explanation = "PFK-1 catalyzes the committed step."
+            },
+            Scope: "content",
+            Category: "question");
+
+    private static SchemaTopicDefinition BuildAssertionReasonSchema() =>
+        new(
+            Topic: "assertion-reason",
+            CompactSignature: """
+                // Question: assertion-reason (auto-generates standard 4- or 5-option choices from canonical answer enum)
+                { type:"assertion-reason", ref?:string, assertion:string, reason:string, answer:"both-explain"|"both-no-explain"|"a-true-r-false"|"a-false-r-true"|"both-false", scheme?:"4opt"|"5opt", explanation?:string, layoutOverrides?:Record<string,string> }
+                // Markdown: :::assertion-reason{answer="both-no-explain" scheme="4opt"}\nA: ...\nR: ...\n:::explanation\n...\n:::
+                """,
+            Command: "Inside quiz.questions[] or :::assertion-reason{...} in Markdown",
+            Summary: "Standardized Assertion (A) & Reason (R) question without repetitive option boilerplate.",
+            DisallowUnmappedProperties: true,
+            Fields:
+            [
+                new("type", "string", true, "Must be 'assertion-reason'.", ["assertion-reason"]),
+                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                new("assertion", "string", true, "Assertion (A) statement Markdown/KaTeX."),
+                new("reason", "string", true, "Reason (R) statement Markdown/KaTeX."),
+                new("answer", "string", true, "Canonical answer enum.", ["both-explain", "both-no-explain", "a-true-r-false", "a-false-r-true", "both-false"]),
+                new("scheme", "string", false, "Option scheme (auto-selects '5opt' if answer is 'both-false', else '4opt').", ["4opt", "5opt"]),
+                new("explanation", "string", false, "Optional explanation Markdown/KaTeX."),
+                new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
+            ],
+            Example: new
+            {
+                type = "assertion-reason",
+                assertion = "Aspirin is avoided in children with viral infections.",
+                reason = "Aspirin irreversibly acetylates COX-1 and COX-2.",
+                answer = "both-no-explain",
+                scheme = "4opt",
+                explanation = "Avoidance is specifically due to Reye syndrome risk."
+            },
+            Scope: "content",
+            Category: "question");
+
+    private static SchemaTopicDefinition BuildSpotErrorSchema() =>
+        new(
+            Topic: "spot-error",
+            CompactSignature: """
+                // Question: spot-error (tappable [span] chips with [~~wrong~~ -> correction | alias] error spans)
+                { type:"spot-error", ref?:string, text:string, requireFix?:bool, allowNoError?:bool, noError?:bool, explanation?:string, layoutOverrides?:Record<string,string> }
+                // Markdown: :::spot-error{requireFix=false allowNoError=true}\nIn [condition], calcium is [high] and phosphate is [~~high~~ -> low].\n:::explanation\n...\n:::
+                """,
+            Command: "Inside quiz.questions[] or :::spot-error{...} in Markdown",
+            Summary: "Identify incorrect segment(s) in a statement, with optional correction input and 'No error' trap.",
+            DisallowUnmappedProperties: true,
+            Fields:
+            [
+                new("type", "string", true, "Must be 'spot-error'.", ["spot-error"]),
+                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                new("text", "string", true, "Statement with >=2 '[span]' segments; mark faulty spans as '[~~wrong~~ -> fix | alias]'."),
+                new("requireFix", "boolean", false, "Require typing the correction for tapped error span(s) (default false)."),
+                new("allowNoError", "boolean", false, "Display a 'No error in statement' button (defaults true when noError=true)."),
+                new("noError", "boolean", false, "Statement has zero error spans and 'No error' is the correct answer (default false)."),
+                new("explanation", "string", false, "Optional explanation Markdown/KaTeX."),
+                new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
+            ],
+            Example: new
+            {
+                type = "spot-error",
+                text = "In [primary hyperparathyroidism], serum calcium is [elevated] and phosphate is [~~elevated~~ -> decreased | low].",
+                requireFix = false,
+                allowNoError = true,
+                explanation = "PTH decreases proximal tubular phosphate reabsorption."
+            },
+            Scope: "content",
+            Category: "question");
+
+    private static SchemaTopicDefinition BuildDiffSchema() =>
+        new(
+            Topic: "diff",
+            CompactSignature: """
+                // Question: diff (comparative table drill: mode="fill" | "spot-wrong" | "rearrange")
+                { type:"diff", ref?:string, mode:"fill"|"spot-wrong"|"rearrange", title?:string, bank?:bool, fuzzy?:bool, caseSensitive?:bool, allowNoError?:bool, headers:string[], alignments?:("left"|"center"|"right")[], rows:string[][], explanation?:string, layoutOverrides?:Record<string,string> }
+                // Markdown: :::diff{mode="spot-wrong" title="..."}\n| Prop | A | B |\n|---|---|---|\n| X | ~~wrong~~ -> fix \| alias | {{fix | alias}} |\n:::
+                """,
+            Command: "Inside quiz.questions[] or :::diff{...} in Markdown",
+            Summary: "Comparative differentiation table supporting fill-blanks (with optional bank), spot-wrong cells, and row-wise rearrange.",
+            DisallowUnmappedProperties: true,
+            Fields:
+            [
+                new("type", "string", true, "Must be 'diff'.", ["diff"]),
+                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                new("mode", "string", true, "Interaction mode.", ["fill", "spot-wrong", "rearrange"]),
+                new("title", "string", false, "Optional table prompt/header title (Markdown/KaTeX supported)."),
+                new("bank", "boolean", false, "Show clickable shuffled word bank in 'fill' mode (default false)."),
+                new("fuzzy", "boolean", false, "Allow Levenshtein distance <= 1 in 'fill' mode (default true)."),
+                new("caseSensitive", "boolean", false, "Require exact case match in 'fill' mode (default false)."),
+                new("allowNoError", "boolean", false, "Display 'No error in table' option in 'spot-wrong' mode (default false)."),
+                new("headers", "array<string>", true, ">=2 column headers (>=3 for 'rearrange': col 0 feature + >=2 entities)."),
+                new("alignments", "array<string>", false, "Optional per-column alignment ('left' | 'center' | 'right')."),
+                new("rows", "array<array<string>>", true, ">=1 row; mark 'fill' blanks with '{{ans | alias}}' and 'spot-wrong' faults with '~~wrong~~ -> fix \\| alias' or '~~wrong~~ -> {{fix | alias}}'."),
+                new("explanation", "string", false, "Optional explanation Markdown/KaTeX."),
+                new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
+            ],
+            Example: new
+            {
+                type = "diff",
+                mode = "spot-wrong",
+                title = "Gram-Positive vs Gram-Negative",
+                headers = new[] { "Property", "Gram-Positive", "Gram-Negative" },
+                rows = new[] { new[] { "Outer membrane", "~~Present~~ -> Absent | None", "Present" } },
+                explanation = "Gram-positive bacteria lack an outer lipid membrane."
+            },
+            Scope: "content",
+            Category: "question");
+
+    private static SchemaTopicDefinition BuildMechanismSchema() =>
+        new(
+            Topic: "mechanism",
+            CompactSignature: """
+                // Question: mechanism (pathway/cascade ordering with parallel orderGroup steps & optional distractors)
+                { type:"mechanism", ref?:string, title?:string, steps:[{orderGroup?:int, text:string, isDistractor?:bool}], explanation?:string, layoutOverrides?:Record<string,string> }
+                // Markdown: :::mechanism{title="..."}\n1. Step one\n2a. Parallel A\n2b. Parallel B\n! Decoy step\n:::explanation\n...\n:::
+                """,
+            Command: "Inside quiz.questions[] or :::mechanism{...} in Markdown",
+            Summary: "Pathway and cascade sequencing question supporting parallel/commutative step groups and distractor decoys.",
+            DisallowUnmappedProperties: true,
+            Fields:
+            [
+                new("type", "string", true, "Must be 'mechanism'.", ["mechanism"]),
+                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                new("title", "string", false, "Optional mechanism prompt/title (Markdown/KaTeX supported)."),
+                new("steps", "array<mechanismStep>", true, ">=2 ordered steps (orderGroup >= 1; equal orderGroup = parallel/commutative) plus optional distractors (isDistractor=true)."),
+                new("explanation", "string", false, "Optional explanation Markdown/KaTeX."),
+                new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
+            ],
+            Example: new
+            {
+                type = "mechanism",
+                title = "RAAS Activation",
+                steps = new object[]
+                {
+                    new { orderGroup = 1, text = "Renin cleaves angiotensinogen to Angiotensin I" },
+                    new { orderGroup = 2, text = "ACE converts Angiotensin I to Angiotensin II" },
+                    new { isDistractor = true, text = "ANP converts Angiotensin I to Angiotensin II" }
+                }
+            },
+            Scope: "content",
+            Category: "question");
+
+    private static SchemaTopicDefinition BuildRelabelSchema() =>
+        new(
+            Topic: "relabel",
+            CompactSignature: """
+                // Question: relabel (single unmasked image + normalized [0..1] overlay boxes via inline YAML/JSON, .masks.json, or melomg .meta.json)
+                { type:"relabel", ref?:string, imagePath:string, prompt?:string, mode?:"reveal"|"bank"|"recall", style?:"solid"|"blur"|"pixelate"|"whiteout", masksPath?:string, include?:string[], boxes?:[{label:string,aliases?:string[],rect?:[x,y,w,h],x?:number,y?:number,w?:number,h?:number}], distractors?:string[], fuzzy?:bool, caseSensitive?:bool, explanation?:string, layoutOverrides?:Record<string,string> }
+                // Markdown: :::relabel{image="assets/fig.png" masks?="assets/fig.masks.json" mode="bank" style="blur"}\nprompt: ...\ninclude: ["A","B"]\n:::
+                // melomg handoff: extract unmasked PNG with 'melomg extract ... --no-masks' for image=, and pair with a .masks.json or masked-pass '--mask-all --meta' .meta.json sidecar.
+                """,
+            Command: "Inside quiz.questions[] or :::relabel{...} in Markdown",
+            Summary: "Interactive image-occlusion and diagram relabeling with reveal, word-bank, and typed recall modes over one unmasked image.",
+            DisallowUnmappedProperties: true,
+            Fields:
+            [
+                new("type", "string", true, "Must be 'relabel'.", ["relabel"]),
+                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                new("imagePath", "string", true, "Relative path to the single unmasked diagram image (Markdown attr: image= or imagePath=)."),
+                new("prompt", "string", false, "Optional prompt/instruction Markdown/KaTeX."),
+                new("mode", "string", false, "Interaction mode (default 'bank').", ["reveal", "bank", "recall"]),
+                new("style", "string", false, "Occlusion box style (default 'solid').", ["solid", "blur", "pixelate", "whiteout"]),
+                new("masksPath", "string", false, "Optional sidecar (.masks.json or melomg --mask-all --meta .meta.json; alias: masks). Mutually exclusive with inline 'boxes'."),
+                new("include", "array<string>", false, "Optional label filter applied to sidecar boxes (case-insensitive exact then substring)."),
+                new("boxes", "array<relabelBox>", false, "Inline normalized [0..1] boxes ({label, aliases?, rect:[x,y,w,h] or x/y/w/h}). Mutually exclusive with masksPath."),
+                new("distractors", "array<string>", false, "Optional decoy labels added to the shuffled bank in 'bank' mode."),
+                new("fuzzy", "boolean", false, "Allow Levenshtein distance <= 1 in 'recall' mode (default true)."),
+                new("caseSensitive", "boolean", false, "Require exact case match in 'recall' mode (default false)."),
+                new("explanation", "string", false, "Optional explanation Markdown/KaTeX."),
+                new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
+            ],
+            Example: new
+            {
+                type = "relabel",
+                imagePath = "assets/nephron.png",
+                prompt = "Identify the nephron segments.",
+                mode = "bank",
+                style = "blur",
+                distractors = new[] { "Collecting duct" },
+                boxes = new object[]
+                {
+                    new { label = "Proximal convoluted tubule", aliases = new[] { "PCT" }, rect = new[] { 0.12, 0.24, 0.18, 0.06 } },
+                    new { label = "Glomerulus", rect = new[] { 0.45, 0.15, 0.14, 0.05 } }
+                }
+            },
+            Scope: "content",
+            Category: "question");
 
     private static IReadOnlyList<SchemaLayoutPropertySpec> BuildLayoutSpecs()
     {

@@ -1,9 +1,11 @@
 using System.IO.Compression;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Meloberry.Application.Abstractions;
 using Meloberry.Domain.Common;
 using Meloberry.Domain.Errors;
 using Meloberry.Domain.Layouts;
+using Meloberry.Domain.Payloads;
 using Meloberry.Domain.Questions;
 using Meloberry.Domain.Quizzes;
 using Meloberry.Domain.Sessions;
@@ -19,6 +21,8 @@ public sealed class MbypkgExporter(
 {
     private const long MaxEntryBytes = 50L * 1024 * 1024;
     private const long MaxTotalBytes = 250L * 1024 * 1024;
+    internal const string CurrentPackageVersion = "2.0";
+    private static readonly HashSet<string> SupportedImportPackageVersions = new(StringComparer.Ordinal) { "1.0", "2.0" };
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -56,6 +60,13 @@ public sealed class MbypkgExporter(
         if (!manifestRes.IsSuccess) return manifestRes.Error!;
         totalBytesRead += manifestRes.Value.BytesRead;
         var manifest = manifestRes.Value.Data;
+
+        if (string.IsNullOrWhiteSpace(manifest.PackageVersion) || !SupportedImportPackageVersions.Contains(manifest.PackageVersion.Trim()))
+            return new Error(
+                "Package.UnsupportedVersion",
+                $"Unsupported .mbypkg packageVersion '{manifest.PackageVersion ?? "<missing>"}'. Supported versions: {string.Join(", ", SupportedImportPackageVersions)}.",
+                ErrorType.Validation,
+                Hint: "Import a v1.0 or v2.0 .mbypkg archive, or update mby.");
 
         if (string.IsNullOrWhiteSpace(manifest.Id) || string.IsNullOrWhiteSpace(manifest.Kind))
             return new Error("Package.InvalidManifest", "Package manifest.json is corrupted.", ErrorType.Validation);
@@ -203,7 +214,10 @@ public sealed class MbypkgExporter(
         if (!bytesRes.IsSuccess) return bytesRes.Error!;
         try
         {
-            var data = JsonSerializer.Deserialize<T>(bytesRes.Value, JsonOptions);
+            ReadOnlySpan<byte> span = bytesRes.Value;
+            if (span.Length >= 3 && span[0] == 0xEF && span[1] == 0xBB && span[2] == 0xBF)
+                span = span[3..];
+            var data = JsonSerializer.Deserialize<T>(span, JsonOptions);
             return data is null
                 ? new Error(errorCode, $"Package {entryLabel} is empty or corrupted.", ErrorType.Validation)
                 : (data, (long)bytesRes.Value.Length);
@@ -285,7 +299,7 @@ public sealed class MbypkgExporter(
             resolvedAssets.Add(src);
         }
 
-        var manifest = new PackageManifest("1.0", kind, id, DateTimeOffset.UtcNow.ToString("O"), distinctAssets, normalizedPlatform);
+        var manifest = new PackageManifest(CurrentPackageVersion, kind, id, DateTimeOffset.UtcNow.ToString("O"), distinctAssets, normalizedPlatform);
         var tempOut = Path.Combine(outDir ?? Directory.GetCurrentDirectory(), $".{Path.GetFileName(resolvedOut)}.{Guid.NewGuid():N}.tmp");
 
         try
@@ -378,6 +392,12 @@ public sealed class MbypkgExporter(
                 if (!string.IsNullOrWhiteSpace(card.Front.ImagePath)) assets.Add(card.Front.ImagePath);
                 if (!string.IsNullOrWhiteSpace(card.Back.ImagePath)) assets.Add(card.Back.ImagePath);
             }
+            else if (q is PayloadQuestion pq && pq.Type == QuestionType.RelabelImage &&
+                     Phase1PayloadCodec.TryDeserialize<RelabelImagePayload>(pq.PayloadJson, out var rel) &&
+                     !string.IsNullOrWhiteSpace(rel?.ImagePath))
+            {
+                assets.Add(rel.ImagePath);
+            }
         }
         return assets;
     }
@@ -390,7 +410,8 @@ public sealed class MbypkgExporter(
                 b.Caption, b.Alt,
                 b.CalloutTone.HasValue ? ArticleBlock.CalloutToneToString(b.CalloutTone.Value) : null,
                 b.CalloutTitle,
-                b.RefKey)).ToList(),
+                b.RefKey,
+                b.PayloadJson)).ToList(),
             includeLayouts ? c.LayoutOverrides.ToDictionary(x => x.Key, x => x.Value) : null,
             c.Title,
             c.RefKey)).ToList(),
@@ -402,12 +423,15 @@ public sealed class MbypkgExporter(
             McqQuestion m => new QuestionPackageDto(m.Id, m.Index, "Mcq", m.Text, m.MaxOptions, m.IsMultiCorrect,
                 m.Options.Select(o => new OptionPackageDto(o.Index, o.Text, o.ImagePath, o.IsCorrect)).ToList(),
                 null, null, includeLayouts ? m.LayoutOverrides.ToDictionary(x => x.Key, x => x.Value) : null,
-                m.ImagePath, m.Explanation, m.RefKey),
+                m.ImagePath, m.Explanation, m.RefKey, m.PayloadJson),
             FlashcardQuestion f => new QuestionPackageDto(f.Id, f.Index, "Flashcard", null, 0, false, [],
                 new SidePackageDto(f.Front.Text, f.Front.ImagePath, f.Front.Position.ToString(), f.Front.IsPositionExplicit),
                 new SidePackageDto(f.Back.Text, f.Back.ImagePath, f.Back.Position.ToString(), f.Back.IsPositionExplicit),
                 includeLayouts ? f.LayoutOverrides.ToDictionary(x => x.Key, x => x.Value) : null,
-                null, null, f.RefKey),
+                null, null, f.RefKey, f.PayloadJson),
+            PayloadQuestion p => new QuestionPackageDto(p.Id, p.Index, p.Type.ToString(), null, 0, false, [],
+                null, null, includeLayouts ? p.LayoutOverrides.ToDictionary(x => x.Key, x => x.Value) : null,
+                null, null, p.RefKey, p.PayloadJson),
             _ => throw new InvalidOperationException("Unsupported question type.")
         }).ToList(),
         string.IsNullOrWhiteSpace(quiz.Name) ? null : quiz.Name,
@@ -433,20 +457,26 @@ public sealed class MbypkgExporter(
         {
             if (!IsSafeSingleSegmentId(c.Id) || c.Index < 1)
                 return new Error("Package.InvalidWorkspace", $"Invalid component ID or index in workspace.json: '{c.Id}'.", ErrorType.Validation);
-            if (!Enum.TryParse<ComponentKind>(c.Kind, true, out var kind))
+            if (!Enum.TryParse<ComponentKind>(c.Kind, true, out var kind) || !Enum.IsDefined(kind))
                 return new Error("Package.InvalidWorkspace", $"Unsupported component kind '{c.Kind}'.", ErrorType.Validation);
 
             var compRefRes = ValidateAndRegisterRef(c.RefKey, usedRefs);
             if (!compRefRes.IsSuccess) return compRefRes.Error!;
 
             Quiz? quiz = null;
-            if (c.Quiz is not null)
+            if (kind == ComponentKind.Quiz)
             {
-                if (!IsSafeSingleSegmentId(c.Quiz.Id))
-                    return new Error("Package.InvalidWorkspace", $"Invalid component quiz ID '{c.Quiz.Id}'.", ErrorType.Validation);
+                if (c.Quiz is null)
+                    return new Error("Package.InvalidWorkspace", $"Quiz component '{c.Id}' is missing its quiz payload.", ErrorType.Validation);
+                if (!IsSafeSingleSegmentId(c.Quiz.Id) || !string.Equals(c.Quiz.Id, c.Id, StringComparison.Ordinal))
+                    return new Error("Package.InvalidWorkspace", $"Component quiz ID '{c.Quiz.Id}' must match component ID '{c.Id}'.", ErrorType.Validation);
                 var qRes = RehydrateQuizSafe(c.Quiz, storageDir, usedRefs);
                 if (!qRes.IsSuccess) return qRes.Error!;
                 quiz = qRes.Value;
+            }
+            else if (c.Quiz is not null)
+            {
+                return new Error("Package.InvalidWorkspace", $"Non-quiz component '{c.Id}' ({kind}) cannot contain a quiz payload.", ErrorType.Validation);
             }
 
             var blocks = new List<ArticleBlock>((c.ArticleBlocks ?? []).Count);
@@ -454,7 +484,7 @@ public sealed class MbypkgExporter(
             {
                 if (!IsSafeSingleSegmentId(b.Id) || b.Index < 1)
                     return new Error("Package.InvalidWorkspace", $"Invalid article block ID or index: '{b.Id}'.", ErrorType.Validation);
-                if (!Enum.TryParse<ArticleBlockKind>(b.Kind, true, out var bKind))
+                if (!Enum.TryParse<ArticleBlockKind>(b.Kind, true, out var bKind) || !Enum.IsDefined(bKind))
                     return new Error("Package.InvalidWorkspace", $"Unsupported article block kind '{b.Kind}'.", ErrorType.Validation);
                 if (!IsSafeRelativeAssetPath(b.ImagePath, storageDir))
                     return new Error("Package.InvalidWorkspace", $"Unsafe article imagePath '{b.ImagePath}'.", ErrorType.Validation);
@@ -468,8 +498,35 @@ public sealed class MbypkgExporter(
                 else if (bKind == ArticleBlockKind.Callout)
                     calloutTone = CalloutTone.Pearl;
 
+                string? blockPayloadJson = b.PayloadJson;
+                if (bKind == ArticleBlockKind.Table)
+                {
+                    if (!Phase1PayloadCodec.TryDeserialize<TableBlockPayload>(b.PayloadJson, out var parsedTable) ||
+                        parsedTable is null ||
+                        parsedTable.Headers is not { Count: > 0 } ||
+                        parsedTable.Rows is not { Count: > 0 } ||
+                        parsedTable.Rows.Any(r => r is null))
+                    {
+                        return new Error("Package.InvalidWorkspace", $"Invalid or missing payloadJson for table block '{b.Id}'.", ErrorType.Validation);
+                    }
+
+                    var canonicalAlignments = parsedTable.Alignments is { Count: > 0 }
+                        ? parsedTable.Alignments
+                        : Enumerable.Repeat("left", parsedTable.Headers.Count).ToList();
+                    var canonicalTable = new TableBlockPayload(
+                        parsedTable.Title,
+                        parsedTable.Caption,
+                        parsedTable.StickyFirstCol,
+                        parsedTable.HideableCols ?? [],
+                        parsedTable.Headers,
+                        canonicalAlignments,
+                        parsedTable.Rows,
+                        parsedTable.Footnote);
+                    blockPayloadJson = Phase1PayloadCodec.Serialize(canonicalTable);
+                }
+
                 blocks.Add(ArticleBlock.Rehydrate(b.Id, c.Id, b.Index, bKind, b.TextContent, b.ImagePath,
-                    refKey: blockRefRes.Value, caption: b.Caption, alt: b.Alt, calloutTone: calloutTone, calloutTitle: b.CalloutTitle));
+                    refKey: blockRefRes.Value, caption: b.Caption, alt: b.Alt, calloutTone: calloutTone, calloutTitle: b.CalloutTitle, payloadJson: blockPayloadJson));
             }
 
             IReadOnlyList<string> compTargets = kind == ComponentKind.Article
@@ -486,7 +543,7 @@ public sealed class MbypkgExporter(
 
     private static Result<Quiz> RehydrateQuizSafe(QuizPackageDto dto, string storageDir, HashSet<string>? sharedUsedRefs = null)
     {
-        if (!Enum.TryParse<QuizType>(dto.QuizType, true, out var qType))
+        if (!Enum.TryParse<QuizType>(dto.QuizType, true, out var qType) || !Enum.IsDefined(qType))
             return new Error("Package.InvalidWorkspace", $"Unsupported quiz type '{dto.QuizType}'.", ErrorType.Validation);
 
         var usedRefs = sharedUsedRefs ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -532,6 +589,57 @@ public sealed class MbypkgExporter(
 
                 questions.Add(FlashcardQuestion.Rehydrate(q.Id, dto.Id, q.Index, frontRes.Value, backRes.Value, ovRes.Value, qRefRes.Value));
             }
+            else if (Quiz.TryParseQuestionType(q.QuestionType, out var parsedQType) &&
+                     parsedQType is QuestionType.FillBlank or QuestionType.AssertionReason or QuestionType.SpotError or QuestionType.Differentiation or QuestionType.Mechanism or QuestionType.RelabelImage)
+            {
+                var ovRes = ValidateOverrides(["mcq"], q.LayoutOverrides);
+                if (!ovRes.IsSuccess) return ovRes.Error!;
+                bool validPayload = parsedQType switch
+                {
+                    QuestionType.FillBlank => Phase1PayloadCodec.TryDeserialize<FillBlankPayload>(q.PayloadJson, out var fb) &&
+                        fb is not null &&
+                        !string.IsNullOrWhiteSpace(fb.Template) &&
+                        fb.Blanks is { Count: > 0 } &&
+                        fb.Blanks.All(b => b is not null && b.Answers is { Count: > 0 }),
+                    QuestionType.AssertionReason => Phase1PayloadCodec.TryDeserialize<AssertionReasonPayload>(q.PayloadJson, out var ar) &&
+                        ar is not null &&
+                        ar.Assertion is not null &&
+                        ar.Reason is not null &&
+                        ar.Answer is not null &&
+                        ar.Scheme is not null,
+                    QuestionType.SpotError => Phase1PayloadCodec.TryDeserialize<SpotErrorPayload>(q.PayloadJson, out var se) &&
+                        se is not null &&
+                        !string.IsNullOrWhiteSpace(se.Template) &&
+                        se.Segments is { Count: > 0 } &&
+                        se.Segments.All(s => s is not null && s.Text is not null),
+                    QuestionType.Differentiation => Phase1PayloadCodec.TryDeserialize<DifferentiationPayload>(q.PayloadJson, out var dp) &&
+                        dp is not null &&
+                        Phase2PayloadRules.IsValidDiffMode(dp.Mode) &&
+                        dp.Headers is { Count: >= 2 } &&
+                        dp.Headers.All(h => h is not null) &&
+                        dp.Rows is { Count: >= 1 } &&
+                        dp.Rows.All(r => r is not null && r.Count == dp.Headers.Count && r.All(c => c is not null)) &&
+                        dp.SpecialCells is not null &&
+                        dp.SpecialCells.All(sc => sc is not null),
+                    QuestionType.Mechanism => Phase1PayloadCodec.TryDeserialize<MechanismPayload>(q.PayloadJson, out var mp) &&
+                        mp is not null &&
+                        mp.Steps is { Count: >= 2 } &&
+                        mp.Steps.All(s => s is not null && !string.IsNullOrWhiteSpace(s.Text)),
+                    QuestionType.RelabelImage => Phase1PayloadCodec.TryDeserialize<RelabelImagePayload>(q.PayloadJson, out var rel) &&
+                        rel is not null &&
+                        !string.IsNullOrWhiteSpace(rel.ImagePath) &&
+                        IsSafeRelativeAssetPath(rel.ImagePath, storageDir) &&
+                        Phase2PayloadRules.IsValidRelabelMode(rel.Mode) &&
+                        Phase2PayloadRules.IsValidRelabelStyle(rel.Style) &&
+                        rel.Boxes is { Count: >= 1 } &&
+                        rel.Boxes.All(b => b is not null && Phase2PayloadRules.ValidateRelabelBox(b)),
+                    _ => false
+                };
+                if (!validPayload)
+                    return new Error("Package.InvalidWorkspace", $"Invalid or missing payloadJson for {parsedQType} question '{q.Id}'.", ErrorType.Validation);
+
+                questions.Add(PayloadQuestion.Rehydrate(q.Id, dto.Id, q.Index, parsedQType, q.PayloadJson!, ovRes.Value, qRefRes.Value));
+            }
             else
             {
                 return new Error("Package.InvalidWorkspace", $"Unsupported question type '{q.QuestionType}'.", ErrorType.Validation);
@@ -544,7 +652,7 @@ public sealed class MbypkgExporter(
     private static Result<FlashcardSide> RehydrateSideSafe(SidePackageDto? side, string storageDir)
     {
         if (side is null) return FlashcardSide.Empty();
-        if (!Enum.TryParse<MediaPosition>(side.Position, true, out var pos))
+        if (!Enum.TryParse<MediaPosition>(side.Position, true, out var pos) || !Enum.IsDefined(pos))
             return new Error("Package.InvalidWorkspace", $"Unsupported media position '{side.Position}'.", ErrorType.Validation);
         if (!IsSafeRelativeAssetPath(side.ImagePath, storageDir))
             return new Error("Package.InvalidWorkspace", $"Unsafe flashcard imagePath '{side.ImagePath}'.", ErrorType.Validation);
@@ -564,9 +672,24 @@ public sealed class MbypkgExporter(
         string? Alt = null,
         string? CalloutTone = null,
         string? CalloutTitle = null,
-        string? RefKey = null);
+        string? RefKey = null,
+        [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? PayloadJson = null);
     private sealed record QuizPackageDto(string Id, string QuizType, List<QuestionPackageDto> Questions, string? Name = null, string? Description = null);
-    private sealed record QuestionPackageDto(string Id, int Index, string QuestionType, string? PromptText, int MaxOptions, bool IsMultiCorrect, List<OptionPackageDto> Options, SidePackageDto? Front, SidePackageDto? Back, Dictionary<string, string>? LayoutOverrides, string? PromptImagePath = null, string? Explanation = null, string? RefKey = null);
+    private sealed record QuestionPackageDto(
+        string Id,
+        int Index,
+        string QuestionType,
+        string? PromptText,
+        int MaxOptions,
+        bool IsMultiCorrect,
+        List<OptionPackageDto> Options,
+        SidePackageDto? Front,
+        SidePackageDto? Back,
+        Dictionary<string, string>? LayoutOverrides,
+        string? PromptImagePath = null,
+        string? Explanation = null,
+        string? RefKey = null,
+        [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? PayloadJson = null);
     private sealed record OptionPackageDto(int Index, string? Text, string? ImagePath, bool IsCorrect);
     private sealed record SidePackageDto(string? Text, string? ImagePath, string Position, bool IsPositionExplicit = false);
 }

@@ -135,6 +135,9 @@ public static class CliResultExtensions
     public static int WriteValidationError(IConsole console, string code, string description, bool json = false, string? path = null, string? hint = null) =>
         Result.Failure(new Error(code, description, ErrorType.Validation, path, hint)).ToExitCode(console, json);
 
+    public static int WriteFailureError(IConsole console, string code, string description, bool json = false, string? path = null, string? hint = null) =>
+        Result.Failure(new Error(code, description, ErrorType.Failure, path, hint)).ToExitCode(console, json);
+
     public static int WriteNotFoundError(IConsole console, string code, string description, bool json = false) =>
         Result.Failure(new Error(code, description, ErrorType.NotFound)).ToExitCode(console, json);
 }

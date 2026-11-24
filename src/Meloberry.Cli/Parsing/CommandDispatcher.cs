@@ -34,71 +34,86 @@ public sealed class CommandDispatcher(
         bool envAgent = string.Equals(Environment.GetEnvironmentVariable("MBY_AGENT"), "1", StringComparison.OrdinalIgnoreCase) ||
                         string.Equals(Environment.GetEnvironmentVariable("MBY_AGENT"), "true", StringComparison.OrdinalIgnoreCase);
 
-        if (!TryParseArgs(args, envAgent, out var verb, out var positional, out var named, out var globals, out var showHelp, out var showVersion, out var parseErr))
-        {
-            return CliResultExtensions.WriteValidationError(console, "Cli.ParseError", parseErr!, globals.Json);
-        }
+        bool jsonMode = envAgent || args.TakeWhile(a => a != "--").Any(a => string.Equals(a, "--json", StringComparison.OrdinalIgnoreCase));
 
-        if (showVersion)
-            return await InvokeCommandAsync(_commands["version"], console, globals, positional, named, cancellationToken);
-
-        if (string.Equals(verb, "help", StringComparison.OrdinalIgnoreCase))
+        try
         {
-            if (positional.Count == 0)
+            if (!TryParseArgs(args, envAgent, out var verb, out var positional, out var named, out var globals, out var showHelp, out var showVersion, out var parseErr))
+            {
+                return CliResultExtensions.WriteValidationError(console, "Cli.ParseError", parseErr!, globals.Json);
+            }
+
+            jsonMode = globals.Json;
+
+            if (showVersion)
+                return await InvokeCommandAsync(_commands["version"], console, globals, positional, named, cancellationToken);
+
+            if (string.Equals(verb, "help", StringComparison.OrdinalIgnoreCase))
+            {
+                if (positional.Count == 0)
+                    return await InvokeCommandAsync(_commands["prime"], console, globals, positional, named, cancellationToken);
+
+                if (!_commands.TryGetValue(positional[0], out var helpTarget))
+                {
+                    return CliResultExtensions.WriteValidationError(
+                        console,
+                        "Cli.UnknownCommand",
+                        $"Unknown command '{positional[0]}'. Run 'mby prime' for supported commands.",
+                        globals.Json);
+                }
+
+                WriteCommandHelp(helpTarget, console, globals.Json);
+                return ExitCodes.Success;
+            }
+
+            if (string.IsNullOrWhiteSpace(verb))
                 return await InvokeCommandAsync(_commands["prime"], console, globals, positional, named, cancellationToken);
 
-            if (!_commands.TryGetValue(positional[0], out var helpTarget))
+            if (!_commands.TryGetValue(verb, out var cliCommand))
             {
+                if (showHelp)
+                    return await InvokeCommandAsync(_commands["prime"], console, globals, positional, named, cancellationToken);
+
                 return CliResultExtensions.WriteValidationError(
                     console,
                     "Cli.UnknownCommand",
-                    $"Unknown command '{positional[0]}'. Run 'mby prime' for supported commands.",
+                    $"Unknown command '{verb}'. Run 'mby prime' for supported commands.",
                     globals.Json);
             }
 
-            WriteCommandHelp(helpTarget, console, globals.Json);
-            return ExitCodes.Success;
-        }
-
-        if (string.IsNullOrWhiteSpace(verb))
-            return await InvokeCommandAsync(_commands["prime"], console, globals, positional, named, cancellationToken);
-
-        if (!_commands.TryGetValue(verb, out var cliCommand))
-        {
             if (showHelp)
-                return await InvokeCommandAsync(_commands["prime"], console, globals, positional, named, cancellationToken);
-
-            return CliResultExtensions.WriteValidationError(
-                console,
-                "Cli.UnknownCommand",
-                $"Unknown command '{verb}'. Run 'mby prime' for supported commands.",
-                globals.Json);
-        }
-
-        if (showHelp)
-        {
-            WriteCommandHelp(cliCommand, console, globals.Json);
-            return ExitCodes.Success;
-        }
-
-        foreach (var (optName, values) in named)
-        {
-            bool isFlag = values.Count == 0;
-            bool supported = isFlag
-                ? cliCommand.Descriptor.AllowedFlagOptions?.Contains(optName) == true
-                : cliCommand.Descriptor.AllowedValueOptions?.Contains(optName) == true;
-
-            if (!supported)
             {
-                return CliResultExtensions.WriteValidationError(
-                    console,
-                    "Cli.UnsupportedOption",
-                    $"Option '--{optName}' is not supported by command '{verb}'.",
-                    globals.Json);
+                WriteCommandHelp(cliCommand, console, globals.Json);
+                return ExitCodes.Success;
             }
-        }
 
-        return await InvokeCommandAsync(cliCommand, console, globals, positional, named, cancellationToken);
+            foreach (var (optName, values) in named)
+            {
+                bool isFlag = values.Count == 0;
+                bool supported = isFlag
+                    ? cliCommand.Descriptor.AllowedFlagOptions?.Contains(optName) == true
+                    : cliCommand.Descriptor.AllowedValueOptions?.Contains(optName) == true;
+
+                if (!supported)
+                {
+                    return CliResultExtensions.WriteValidationError(
+                        console,
+                        "Cli.UnsupportedOption",
+                        $"Option '--{optName}' is not supported by command '{verb}'.",
+                        globals.Json);
+                }
+            }
+
+            return await InvokeCommandAsync(cliCommand, console, globals, positional, named, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return CliResultExtensions.WriteFailureError(console, "Cli.Cancelled", "Operation was cancelled.", jsonMode);
+        }
+        catch (Exception ex)
+        {
+            return CliResultExtensions.WriteFailureError(console, "Cli.UnexpectedError", ex.Message, jsonMode);
+        }
     }
 
     private static void WriteCommandHelp(CliCommand command, IConsole console, bool json)

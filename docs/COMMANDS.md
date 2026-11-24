@@ -6,7 +6,7 @@ All commands are verb-first, stateless, and non-interactive. Pass `-` for any `<
 | :--- | :--- | :--- |
 | `prime` | `mby prime` *(or `mby` / `mby --help` / `mby -h`)* | Print compact AI-agent grammar card |
 | `help` | `mby <cmd> --help` *(or `mby <cmd> -h` / `mby help <cmd>`)* | Print command-specific usage, prerequisites, flags, and examples |
-| `spec` | `mby spec [type...]` | Print schemas with exact limits (`session`, `article`, `quiz`, `text`, `image`, `mcq`, `flashcard`, `layouts`, `callout`, `markdown`, `analyze`, `pkg`, `build`, `batch`, `patch`) |
+| `spec` | `mby spec [type\|@group...]` | Print schemas with exact limits (grouped by `@content` vs. `@other`; see Spec Classification below) |
 | `apply` | `mby apply [addr] <file\|dir\|-> [-o dir] [--build dir] [--verify] [--static-only] [--timeout n] [--export plat[:path]] [--dry-run] [--quiet\|--verbose]` | Create workspace or append components/blocks/questions from JSON, Markdown, or directory |
 | `patch` | `mby patch <addr> [file\|-] [--set k=v] [--move idx:shift\|exchange]` | Surgically update fields or reorder by ID, `#path`, or `#ref` |
 | `get` | `mby get <addr> [--view outline\|full\|ids]` | Inspect entity (`outline` default) |
@@ -15,7 +15,19 @@ All commands are verb-first, stateless, and non-interactive. Pass `-` for any `<
 | `check` | `mby check <addr> [--quiet\|--verbose]` | Run mandatory lint validation |
 | `build` | `mby build <addr\|spec\|dir\|-> [-o dir] [--verify] [--static-only] [--ephemeral] [--timeout n] [--preview] [--no-wait]` | Lint and generate WebApp with optional headless/static runtime verification |
 | `batch` | `mby batch <file\|->` | Execute JSON operations array atomically in one transaction |
-| `pkg` | `mby pkg export <wsId> <desktop\|android> [outPath] [--include-layout]`<br>`mby pkg import <file> [destDir]` | Export `.mbypkg` v1.0 archive (defaults to workspace project root or parent dir) or import (defaults to CWD) |
+| `pkg` | `mby pkg export <wsId> <desktop\|android> [outPath] [--include-layout]`<br>`mby pkg import <file> [destDir]` | Export `.mbypkg` v2.0 archive (defaults to workspace project root or parent dir) or import `v1.0`/`v2.0` (defaults to CWD) |
 | `layout` | `mby layout get [mcq\|flashcard\|article]`<br>`mby layout set <mcq\|flashcard\|article> <prop> <val>`<br>`mby layout edit [target] [--no-wait]` | Query bounds, update global layout profile, or serve GUI layout editor (`article-text`, `image`, `mcq-question`, `mcq-options`, `flashcard`) |
 | `analyze` | `mby analyze <webDir\|report.json> [--headless] [--static-only] [--timeout n] [--all] [--live] [--no-wait]` | Run zero-touch headless/static WebApp verification or analyze captured telemetry reports |
 | `version` | `mby version` *(or `-v` / `--version`)* | Print CLI version and .NET runtime |
+
+## Spec Classification (`mby spec`)
+
+Topics are split into **Session & Quiz Content Specs** (`scope: "content"`) and **Other Specs** (`scope: "other"`). Query individual topics or `@group` selectors *(quote `'@group'` in PowerShell because `@word` is PowerShell's splatting operator)*:
+
+| Tier (`scope`) | Subcategory (`category`) | Group Selector(s) | Implemented Topics (19) |
+| :--- | :--- | :--- | :--- |
+| **Session & Quiz Content Specs** (`content`) | `container` | `@content` / `@containers` | `session`, `article`, `quiz` |
+| | `block` | `@content` / `@blocks` | `text`, `image`, `callout`, `table` |
+| | `question` | `@content` / `@questions` | `mcq`, `flashcard`, `fill-blank`, `assertion-reason`, `spot-error` |
+| **Other Specs** (`other`) | `format` | `@other` / `@formats` | `markdown`, `layouts` |
+| | `workflow` | `@other` / `@workflows` | `patch`, `batch`, `pkg`, `build`, `analyze` |

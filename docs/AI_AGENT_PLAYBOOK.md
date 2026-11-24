@@ -4,9 +4,9 @@ Minimal-token execution rules for driving `mby` deterministically.
 
 ## Conventions
 
-1. **Discover lazily**: Run `mby prime` once or `mby <cmd> --help`. Query `mby spec <type...>` (including `callout`, `markdown`, `analyze`, `pkg`, `build`, `batch`, `patch`) for exact limits and schemas.
+1. **Discover lazily**: Run `mby prime` once or `mby <cmd> --help`. Query `mby spec <topic|@group...>` — `@content` (`@containers`, `@blocks`, `@questions`) for session/quiz schemas or `@other` (`@formats`, `@workflows`) for `markdown`, `layouts`, `patch`, `batch`, `pkg`, `build`, and `analyze` *(quote `'@group'` in PowerShell)*.
 2. **Use `MBY_AGENT=1` or `--json`**: Receive single-line minified JSON (`--quiet` omits large ID arrays).
-3. **Prefer Markdown & Modular Directories**: Author `./articles/*.md` (YAML frontmatter + `![alt](path "caption")` + `:::callout` + GFM tables) + quiz `.json` files instead of escaping long prose inside JSON strings.
+3. **Prefer Markdown & Modular Directories**: Author `./articles/*.md` (YAML frontmatter + `![alt](path "caption")` + `:::callout` + `:::table`) and Markdown quizzes (`kind: quiz` + `:::mcq`, `:::flashcard`, `:::fill-blank`, `:::assertion-reason`, `:::spot-error`) instead of escaping long prose or KaTeX inside JSON strings.
 4. **Address with `#path` or `#ref`**: Component `ref` values auto-slugify cleanly when omitted, or set explicit `"ref": "slug"` (`<=32` chars).
 5. **Close QA in one command**: Run `mby build ./articles/ -o ./dist_web --verify --json` or `mby analyze ./dist_web --headless --json` for zero-touch runtime verification.
 

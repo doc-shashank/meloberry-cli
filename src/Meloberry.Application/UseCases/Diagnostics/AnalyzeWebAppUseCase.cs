@@ -56,7 +56,7 @@ public sealed class AnalyzeWebAppHandler(IAnalysisReportStore reportStore)
         sb.AppendLine($"# Meloberry Aggregate Analysis ({included.Count} of {totalRunsFound} run(s))");
         sb.AppendLine();
         sb.AppendLine($"- **Workspace:** `{included[0].WorkspaceId}`");
-        sb.AppendLine($"- **Average MCQ Accuracy:** {avgAccuracy.ToString("F1", CultureInfo.InvariantCulture)}%");
+        sb.AppendLine($"- **Average Graded Accuracy:** {avgAccuracy.ToString("F1", CultureInfo.InvariantCulture)}%");
         sb.AppendLine($"- **Average Duration:** {avgDurationSec.ToString("F1", CultureInfo.InvariantCulture)}s");
         sb.AppendLine();
 

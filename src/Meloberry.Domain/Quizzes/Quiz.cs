@@ -88,6 +88,12 @@ public sealed class Quiz
         {
             "mcq" => (true, QuestionType.Mcq),
             "flashcard" => (true, QuestionType.Flashcard),
+            "fill-blank" or "fillblank" => (true, QuestionType.FillBlank),
+            "assertion-reason" or "assertionreason" => (true, QuestionType.AssertionReason),
+            "spot-error" or "spoterror" => (true, QuestionType.SpotError),
+            "diff" or "differentiation" => (true, QuestionType.Differentiation),
+            "mechanism" => (true, QuestionType.Mechanism),
+            "relabel" or "relabel-image" or "relabelimage" => (true, QuestionType.RelabelImage),
             _ => (false, default(QuestionType))
         };
         return ok;
@@ -95,18 +101,21 @@ public sealed class Quiz
 
     public Result<Question> AddQuestion(string questionId, QuestionType type, int? targetIndex = null)
     {
-        Question question = type == QuestionType.Mcq
-            ? McqQuestion.CreateNew(questionId, Id, 1)
-            : FlashcardQuestion.CreateNew(questionId, Id, 1);
+        Question question = type switch
+        {
+            QuestionType.Mcq => McqQuestion.CreateNew(questionId, Id, 1),
+            QuestionType.Flashcard => FlashcardQuestion.CreateNew(questionId, Id, 1),
+            _ => PayloadQuestion.Rehydrate(questionId, Id, 1, type, "{}")
+        };
         return InsertQuestion(question, targetIndex);
     }
 
     public Result<Question> InsertQuestion(Question question, int? targetIndex = null)
     {
         if (Type == QuizType.Mcq && question.Type != QuestionType.Mcq)
-            return QuizErrors.QuestionTypeMismatch(Id, "mcq", question.Type.ToString().ToLowerInvariant());
+            return QuizErrors.QuestionTypeMismatch(Id, "mcq", Question.ToWireString(question.Type));
         if (Type == QuizType.Flashcard && question.Type != QuestionType.Flashcard)
-            return QuizErrors.QuestionTypeMismatch(Id, "flashcard", question.Type.ToString().ToLowerInvariant());
+            return QuizErrors.QuestionTypeMismatch(Id, "flashcard", Question.ToWireString(question.Type));
 
         var insertResult = IndexedListReorderer.InsertAt(_questions, question, targetIndex);
         return insertResult.IsSuccess ? question : insertResult.Error!;
@@ -115,9 +124,9 @@ public sealed class Quiz
     public Result ReplaceQuestionAt(string existingQuestionId, Question replacement, int? targetIndex = null)
     {
         if (Type == QuizType.Mcq && replacement.Type != QuestionType.Mcq)
-            return QuizErrors.QuestionTypeMismatch(Id, "mcq", replacement.Type.ToString().ToLowerInvariant());
+            return QuizErrors.QuestionTypeMismatch(Id, "mcq", Question.ToWireString(replacement.Type));
         if (Type == QuizType.Flashcard && replacement.Type != QuestionType.Flashcard)
-            return QuizErrors.QuestionTypeMismatch(Id, "flashcard", replacement.Type.ToString().ToLowerInvariant());
+            return QuizErrors.QuestionTypeMismatch(Id, "flashcard", Question.ToWireString(replacement.Type));
 
         int currentIdx = _questions.FindIndex(q => string.Equals(q.Id, existingQuestionId, StringComparison.Ordinal));
         if (currentIdx < 0) return QuestionErrors.NotFound(existingQuestionId);

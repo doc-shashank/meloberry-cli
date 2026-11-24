@@ -25,7 +25,8 @@ public sealed record JsonQuestionSpec(
     Dictionary<string, string>? LayoutOverrides,
     string? ImagePath = null,
     string? Explanation = null,
-    string? Ref = null);
+    string? Ref = null,
+    string? PayloadJson = null);
 
 public sealed record DeclarativeArticleBlockSpec(
     string Kind,
@@ -35,7 +36,8 @@ public sealed record DeclarativeArticleBlockSpec(
     string? Caption = null,
     string? Alt = null,
     string? Tone = null,
-    string? Title = null);
+    string? Title = null,
+    string? PayloadJson = null);
 
 public sealed record DeclarativeComponentSpec(
     string Kind,

@@ -118,13 +118,13 @@ public sealed class LintAndExportGuardTests : IDisposable
         Assert.Contains("prevCompMenu", html);
         Assert.Contains("prevCompMenuItem", html);
         Assert.Contains("scrollDownBtn", html);
-        Assert.Contains("<meta name=\"generator\" content=\"Meloberry CLI (mby) 1.3.0\"", html);
+        Assert.Contains("<meta name=\"generator\" content=\"Meloberry CLI (mby) 2.0.0\"", html);
         Assert.Contains("id=\"greetingGeneratorFooter\"", html);
 
         var genEl = dataPayload.RootElement.GetProperty("generator");
         Assert.Equal("Meloberry CLI", genEl.GetProperty("toolName").GetString());
         Assert.Equal("mby", genEl.GetProperty("executable").GetString());
-        Assert.Equal("1.3.0", genEl.GetProperty("version").GetString());
+        Assert.Equal("2.0.0", genEl.GetProperty("version").GetString());
 
         Assert.Contains("--option-columns", js);
         Assert.Contains("bindLongPress", js);
@@ -217,16 +217,16 @@ public sealed class LintAndExportGuardTests : IDisposable
         var appMeta = new AssemblyCliToolMetadataProvider(typeof(Meloberry.Application.DependencyInjection).Assembly, "mby").GetMetadata();
         var infraMeta = provider.GetRequiredService<ICliToolMetadataProvider>().GetMetadata();
 
-        Assert.Equal("1.3.0", domainMeta.Version);
-        Assert.Equal("1.3.0", appMeta.Version);
-        Assert.Equal("1.3.0", infraMeta.Version);
+        Assert.Equal("2.0.0", domainMeta.Version);
+        Assert.Equal("2.0.0", appMeta.Version);
+        Assert.Equal("2.0.0", infraMeta.Version);
         Assert.Equal("Meloberry CLI", infraMeta.ProductName);
         Assert.Equal("mby", infraMeta.ExecutableName);
 
         var editorBuilder = provider.GetRequiredService<ILayoutEditorPageBuilder>();
         var html = editorBuilder.BuildHtml("mcq-options", infraMeta);
-        Assert.Contains("<meta name=\"generator\" content=\"Meloberry CLI (mby) 1.3.0\"", html);
-        Assert.Contains("mby v1.3.0", html);
+        Assert.Contains("<meta name=\"generator\" content=\"Meloberry CLI (mby) 2.0.0\"", html);
+        Assert.Contains("mby v2.0.0", html);
         Assert.Contains("Article Text Block", html);
         Assert.Contains("Image Block", html);
         Assert.Contains("MCQ Question", html);

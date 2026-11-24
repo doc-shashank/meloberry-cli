@@ -4,6 +4,7 @@ using Meloberry.Application.UseCases.Diagnostics;
 using Meloberry.Application.UseCases.Packaging;
 using Meloberry.Domain.Common;
 using Meloberry.Domain.Errors;
+using Meloberry.Domain.Payloads;
 using Meloberry.Domain.Quizzes;
 using Meloberry.Domain.Sessions;
 
@@ -719,7 +720,8 @@ public sealed class ApplySpecHandler(
             if (bKind == "text")
             {
                 if (!string.IsNullOrWhiteSpace(b.ImagePath) || !string.IsNullOrWhiteSpace(b.Caption) ||
-                    !string.IsNullOrWhiteSpace(b.Alt) || !string.IsNullOrWhiteSpace(b.Tone) || !string.IsNullOrWhiteSpace(b.Title))
+                    !string.IsNullOrWhiteSpace(b.Alt) || !string.IsNullOrWhiteSpace(b.Tone) ||
+                    !string.IsNullOrWhiteSpace(b.Title) || !string.IsNullOrWhiteSpace(b.PayloadJson))
                 {
                     return new Error("Json.InvalidFieldForType", "Article text block only supports 'kind', 'text', and optional 'ref'.", ErrorType.Validation);
                 }
@@ -730,8 +732,9 @@ public sealed class ApplySpecHandler(
             }
             else if (bKind == "image")
             {
-                if (!string.IsNullOrWhiteSpace(b.Text) || !string.IsNullOrWhiteSpace(b.Tone) || !string.IsNullOrWhiteSpace(b.Title))
-                    return new Error("Json.InvalidFieldForType", "Article image block cannot specify 'text', 'tone', or 'title'.", ErrorType.Validation);
+                if (!string.IsNullOrWhiteSpace(b.Text) || !string.IsNullOrWhiteSpace(b.Tone) ||
+                    !string.IsNullOrWhiteSpace(b.Title) || !string.IsNullOrWhiteSpace(b.PayloadJson))
+                    return new Error("Json.InvalidFieldForType", "Article image block cannot specify 'text', 'tone', 'title', or table payload fields.", ErrorType.Validation);
                 if (string.IsNullOrWhiteSpace(b.ImagePath))
                     return new Error("Json.InvalidSpec", "Article image block requires 'imagePath'.", ErrorType.Validation);
 
@@ -746,8 +749,9 @@ public sealed class ApplySpecHandler(
             }
             else if (bKind == "callout")
             {
-                if (!string.IsNullOrWhiteSpace(b.ImagePath) || !string.IsNullOrWhiteSpace(b.Caption) || !string.IsNullOrWhiteSpace(b.Alt))
-                    return new Error("Json.InvalidFieldForType", "Article callout block cannot specify 'imagePath', 'caption', or 'alt'.", ErrorType.Validation);
+                if (!string.IsNullOrWhiteSpace(b.ImagePath) || !string.IsNullOrWhiteSpace(b.Caption) ||
+                    !string.IsNullOrWhiteSpace(b.Alt) || !string.IsNullOrWhiteSpace(b.PayloadJson))
+                    return new Error("Json.InvalidFieldForType", "Article callout block cannot specify 'imagePath', 'caption', 'alt', or table payload fields.", ErrorType.Validation);
 
                 CalloutTone tone = CalloutTone.Pearl;
                 if (!string.IsNullOrWhiteSpace(b.Tone) && !ArticleBlock.TryParseCalloutTone(b.Tone, out tone))
@@ -757,9 +761,23 @@ public sealed class ApplySpecHandler(
                 if (!res.IsSuccess) return res.Error!;
                 created = res.Value;
             }
+            else if (bKind == "table")
+            {
+                if (!string.IsNullOrWhiteSpace(b.Text) || !string.IsNullOrWhiteSpace(b.ImagePath) ||
+                    !string.IsNullOrWhiteSpace(b.Alt) || !string.IsNullOrWhiteSpace(b.Tone))
+                    return new Error("Json.InvalidFieldForType", "Article table block cannot specify 'text', 'imagePath', 'alt', or 'tone'.", ErrorType.Validation);
+
+                if (!Phase1PayloadCodec.TryDeserialize<TableBlockPayload>(b.PayloadJson, out var tablePayload) || tablePayload is null)
+                    return ArticleErrors.InvalidTablePayload("Table block requires valid 'headers' and 'rows' data.");
+
+                var canonicalJson = Phase1PayloadCodec.Serialize(tablePayload);
+                var res = comp.AddTableBlock(blockId, canonicalJson, tablePayload.Title ?? b.Title);
+                if (!res.IsSuccess) return res.Error!;
+                created = res.Value;
+            }
             else
             {
-                return new Error("Json.InvalidSpec", $"Unsupported article block kind '{b.Kind}'. Use 'text', 'image', or 'callout'.", ErrorType.Validation);
+                return new Error("Json.InvalidSpec", $"Unsupported article block kind '{b.Kind}'. Use 'text', 'image', 'callout', or 'table'.", ErrorType.Validation);
             }
 
             if (!string.IsNullOrWhiteSpace(b.Ref))

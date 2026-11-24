@@ -99,14 +99,14 @@ public sealed class GetCliCommand : CliCommand
         private static void AppendBlock(StringBuilder sb, InspectArticleBlockDto b, string indent)
         {
             var refPart = b.Ref is null ? string.Empty : $" #{b.Ref}";
-            var preview = b.Snippet ?? b.TextContent ?? b.ImagePath ?? string.Empty;
+            var preview = b.Snippet ?? b.TextContent ?? b.ImagePath ?? b.PayloadJson ?? string.Empty;
             sb.AppendLine($"{indent}#{b.Path} {b.Id} [{b.Kind}]{refPart} {preview}".TrimEnd());
         }
 
         private static void AppendQuestion(StringBuilder sb, InspectQuestionDto q, string indent)
         {
             var refPart = q.Ref is null ? string.Empty : $" #{q.Ref}";
-            var preview = q.Snippet ?? q.Text ?? q.Front?.Text ?? string.Empty;
+            var preview = q.Snippet ?? q.Text ?? q.Front?.Text ?? q.PayloadJson ?? string.Empty;
             sb.AppendLine($"{indent}#{q.Path} {q.Id} [{q.Type}]{refPart} {preview}".TrimEnd());
         }
     }

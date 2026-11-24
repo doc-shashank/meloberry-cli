@@ -26,7 +26,7 @@ public sealed record SessionAnalysisReport(
           .AppendLine($"- **Total Duration:** {(TotalDurationMs / 1000.0).ToString("F1", CultureInfo.InvariantCulture)}s\n")
           .AppendLine("## Summary\n")
           .AppendLine($"- **Total Content Slides:** {Summary.TotalSlides}")
-          .AppendLine($"- **MCQs:** {Summary.McqCorrectFinal} / {Summary.McqTotal} correct ({Summary.McqAccuracyPercent.ToString("F1", CultureInfo.InvariantCulture)}% | First-try: {Summary.McqCorrectFirstTry})")
+          .AppendLine($"- **Graded Questions:** {Summary.McqCorrectFinal} / {Summary.McqTotal} correct ({Summary.McqAccuracyPercent.ToString("F1", CultureInfo.InvariantCulture)}% | First-try: {Summary.McqCorrectFirstTry})")
           .AppendLine($"- **Flashcards:** {Summary.FlashcardKnown} known, {Summary.FlashcardNeedsReview} needs review (of {Summary.FlashcardTotal})")
           .AppendLine($"- **Articles Viewed:** {Summary.ArticleSlidesViewed}\n");
 
@@ -46,6 +46,7 @@ public sealed record SessionAnalysisReport(
             var details = s.Kind switch
             {
                 "mcq" => $"Correct: {(s.IsCorrect == true ? "Yes" : "No")}, Checks: {s.CheckAttempts ?? 0}, Selected: [{string.Join(",", s.SelectedOptionIndices ?? [])}]",
+                "fill-blank" or "assertion-reason" or "spot-error" or "diff" or "mechanism" or "relabel" => $"Correct: {(s.IsCorrect == true ? "Yes" : "No")}, Checks: {s.CheckAttempts ?? 0}",
                 "flashcard" => $"Flips: {s.FlipCount ?? 0}, Rating: {s.FlashcardRating ?? "unrated"}",
                 _ => s.VisitedCount > 0 ? "Viewed" : "Skipped"
             };

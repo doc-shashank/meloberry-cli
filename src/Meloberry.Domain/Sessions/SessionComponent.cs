@@ -113,6 +113,15 @@ public sealed class SessionComponent : IIndexedEntity
         return insertResult.IsSuccess ? blockResult.Value : insertResult.Error!;
     }
 
+    public Result<ArticleBlock> AddTableBlock(string artCompId, string payloadJson, string? title = null, int? targetIndex = null)
+    {
+        if (Kind != ComponentKind.Article) return ComponentErrors.WrongKind(Id, "article");
+        var blockResult = ArticleBlock.CreateTable(artCompId, Id, payloadJson, title);
+        if (!blockResult.IsSuccess) return blockResult.Error!;
+        var insertResult = IndexedListReorderer.InsertAt(_articleBlocks, blockResult.Value, targetIndex);
+        return insertResult.IsSuccess ? blockResult.Value : insertResult.Error!;
+    }
+
     public Result ReorderBlock(string artCompId, int targetIndex, ReorderMode mode) =>
         Kind != ComponentKind.Article
             ? ComponentErrors.WrongKind(Id, "article")

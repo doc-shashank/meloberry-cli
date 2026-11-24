@@ -37,11 +37,11 @@ public sealed class SqliteWorkspaceRepository(
                             ownedIds.Add(b.Id);
                             string? toneStr = b.CalloutTone.HasValue ? ArticleBlock.CalloutToneToString(b.CalloutTone.Value) : null;
                             await ExecAsync(conn, tx,
-                                "INSERT INTO ArticleBlocks (Id, ComponentId, SortIndex, BlockKind, TextContent, ImagePath, RefKey, Caption, Alt, CalloutTone, CalloutTitle) VALUES ($id, $cid, $idx, $kind, $txt, $img, $ref, $cap, $alt, $tone, $ctitle);",
+                                "INSERT INTO ArticleBlocks (Id, ComponentId, SortIndex, BlockKind, TextContent, ImagePath, RefKey, Caption, Alt, CalloutTone, CalloutTitle, PayloadJson) VALUES ($id, $cid, $idx, $kind, $txt, $img, $ref, $cap, $alt, $tone, $ctitle, $pj);",
                                 cancellationToken,
                                 ("$id", b.Id), ("$cid", b.ComponentId), ("$idx", b.Index), ("$kind", b.Kind.ToString()),
                                 ("$txt", b.TextContent), ("$img", b.ImagePath), ("$ref", b.RefKey),
-                                ("$cap", b.Caption), ("$alt", b.Alt), ("$tone", toneStr), ("$ctitle", b.CalloutTitle));
+                                ("$cap", b.Caption), ("$alt", b.Alt), ("$tone", toneStr), ("$ctitle", b.CalloutTitle), ("$pj", b.PayloadJson));
                         }
                     }
                     else if (comp.Quiz is not null)
@@ -367,14 +367,14 @@ public sealed class SqliteWorkspaceRepository(
         await ExecAsync(conn, null, """
             CREATE TABLE IF NOT EXISTS WorkspaceMeta (Id TEXT PRIMARY KEY, Kind TEXT NOT NULL, SubType TEXT NOT NULL, ActiveComponentId TEXT NULL, Name TEXT NULL, Description TEXT NULL);
             CREATE TABLE IF NOT EXISTS Components (Id TEXT PRIMARY KEY, SortIndex INTEGER NOT NULL, Kind TEXT NOT NULL, QuizType TEXT NULL, LayoutOverridesJson TEXT NULL, Title TEXT NULL, RefKey TEXT NULL);
-            CREATE TABLE IF NOT EXISTS ArticleBlocks (Id TEXT PRIMARY KEY, ComponentId TEXT NOT NULL, SortIndex INTEGER NOT NULL, BlockKind TEXT NOT NULL, TextContent TEXT NULL, ImagePath TEXT NULL, RefKey TEXT NULL, Caption TEXT NULL, Alt TEXT NULL, CalloutTone TEXT NULL, CalloutTitle TEXT NULL);
-            CREATE TABLE IF NOT EXISTS Questions (Id TEXT PRIMARY KEY, ContainerId TEXT NOT NULL, SortIndex INTEGER NOT NULL, QuestionType TEXT NOT NULL, PromptText TEXT NULL, MaxOptions INTEGER NOT NULL, IsMultiCorrect INTEGER NOT NULL, FrontText TEXT NULL, FrontImagePath TEXT NULL, FrontPosition TEXT NULL, BackText TEXT NULL, BackImagePath TEXT NULL, BackPosition TEXT NULL, LayoutOverridesJson TEXT NULL, PromptImagePath TEXT NULL, Explanation TEXT NULL, RefKey TEXT NULL);
+            CREATE TABLE IF NOT EXISTS ArticleBlocks (Id TEXT PRIMARY KEY, ComponentId TEXT NOT NULL, SortIndex INTEGER NOT NULL, BlockKind TEXT NOT NULL, TextContent TEXT NULL, ImagePath TEXT NULL, RefKey TEXT NULL, Caption TEXT NULL, Alt TEXT NULL, CalloutTone TEXT NULL, CalloutTitle TEXT NULL, PayloadJson TEXT NULL);
+            CREATE TABLE IF NOT EXISTS Questions (Id TEXT PRIMARY KEY, ContainerId TEXT NOT NULL, SortIndex INTEGER NOT NULL, QuestionType TEXT NOT NULL, PromptText TEXT NULL, MaxOptions INTEGER NOT NULL, IsMultiCorrect INTEGER NOT NULL, FrontText TEXT NULL, FrontImagePath TEXT NULL, FrontPosition TEXT NULL, BackText TEXT NULL, BackImagePath TEXT NULL, BackPosition TEXT NULL, LayoutOverridesJson TEXT NULL, PromptImagePath TEXT NULL, Explanation TEXT NULL, RefKey TEXT NULL, PayloadJson TEXT NULL);
             CREATE TABLE IF NOT EXISTS McqOptions (QuestionId TEXT NOT NULL, OptionIndex INTEGER NOT NULL, OptionText TEXT NULL, ImagePath TEXT NULL, IsCorrect INTEGER NOT NULL, PRIMARY KEY (QuestionId, OptionIndex));
             """, ct);
         await EnsureTableColumnsAsync(conn, ct, "WorkspaceMeta", "Name", "Description");
         await EnsureTableColumnsAsync(conn, ct, "Components", "Title", "RefKey");
-        await EnsureTableColumnsAsync(conn, ct, "ArticleBlocks", "RefKey", "Caption", "Alt", "CalloutTone", "CalloutTitle");
-        await EnsureTableColumnsAsync(conn, ct, "Questions", "PromptImagePath", "Explanation", "RefKey");
+        await EnsureTableColumnsAsync(conn, ct, "ArticleBlocks", "RefKey", "Caption", "Alt", "CalloutTone", "CalloutTitle", "PayloadJson");
+        await EnsureTableColumnsAsync(conn, ct, "Questions", "PromptImagePath", "Explanation", "RefKey", "PayloadJson");
     }
 
     private static async Task EnsureTableColumnsAsync(SqliteConnection conn, CancellationToken ct, string tableName, params string[] columns)
@@ -396,15 +396,15 @@ public sealed class SqliteWorkspaceRepository(
         var card = question as FlashcardQuestion;
         await ExecAsync(conn, tx, """
             INSERT INTO Questions (Id, ContainerId, SortIndex, QuestionType, PromptText, MaxOptions, IsMultiCorrect,
-                FrontText, FrontImagePath, FrontPosition, BackText, BackImagePath, BackPosition, LayoutOverridesJson, PromptImagePath, Explanation, RefKey)
-            VALUES ($id, $cid, $idx, $qt, $pt, $mo, $im, $ft, $fi, $fp, $bt, $bi, $bp, $lj, $pimg, $exp, $ref);
+                FrontText, FrontImagePath, FrontPosition, BackText, BackImagePath, BackPosition, LayoutOverridesJson, PromptImagePath, Explanation, RefKey, PayloadJson)
+            VALUES ($id, $cid, $idx, $qt, $pt, $mo, $im, $ft, $fi, $fp, $bt, $bi, $bp, $lj, $pimg, $exp, $ref, $pj);
             """, ct,
             ("$id", question.Id), ("$cid", question.ContainerId), ("$idx", question.Index), ("$qt", question.Type.ToString()),
             ("$pt", mcq?.Text), ("$mo", mcq?.MaxOptions ?? 0), ("$im", mcq?.IsMultiCorrect == true ? 1 : 0),
             ("$ft", card?.Front.Text), ("$fi", card?.Front.ImagePath), ("$fp", card is null ? null : FormatSidePosition(card.Front)),
             ("$bt", card?.Back.Text), ("$bi", card?.Back.ImagePath), ("$bp", card is null ? null : FormatSidePosition(card.Back)),
             ("$lj", JsonSerializer.Serialize(question.LayoutOverrides)),
-            ("$pimg", mcq?.ImagePath), ("$exp", mcq?.Explanation), ("$ref", question.RefKey));
+            ("$pimg", mcq?.ImagePath), ("$exp", mcq?.Explanation), ("$ref", question.RefKey), ("$pj", question.PayloadJson));
 
         if (mcq is not null)
         {
@@ -432,8 +432,8 @@ public sealed class SqliteWorkspaceRepository(
         await conn.OpenAsync(ct);
         await EnsureTableColumnsAsync(conn, ct, "WorkspaceMeta", "Name", "Description");
         await EnsureTableColumnsAsync(conn, ct, "Components", "Title", "RefKey");
-        await EnsureTableColumnsAsync(conn, ct, "ArticleBlocks", "RefKey", "Caption", "Alt", "CalloutTone", "CalloutTitle");
-        await EnsureTableColumnsAsync(conn, ct, "Questions", "PromptImagePath", "Explanation", "RefKey");
+        await EnsureTableColumnsAsync(conn, ct, "ArticleBlocks", "RefKey", "Caption", "Alt", "CalloutTone", "CalloutTitle", "PayloadJson");
+        await EnsureTableColumnsAsync(conn, ct, "Questions", "PromptImagePath", "Explanation", "RefKey", "PayloadJson");
 
         string sessionId; string? activeId, name, desc;
         await using (var metaCmd = conn.CreateCommand())
@@ -483,7 +483,7 @@ public sealed class SqliteWorkspaceRepository(
         await using var conn = OpenWorkspaceConnection(dbPath);
         await conn.OpenAsync(ct);
         await EnsureTableColumnsAsync(conn, ct, "WorkspaceMeta", "Name", "Description");
-        await EnsureTableColumnsAsync(conn, ct, "Questions", "PromptImagePath", "Explanation", "RefKey");
+        await EnsureTableColumnsAsync(conn, ct, "Questions", "PromptImagePath", "Explanation", "RefKey", "PayloadJson");
 
         string quizId; QuizType quizType; string? name, desc;
         await using (var metaCmd = conn.CreateCommand())
@@ -504,7 +504,7 @@ public sealed class SqliteWorkspaceRepository(
     {
         var map = new Dictionary<string, List<ArticleBlock>>(StringComparer.Ordinal);
         await using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT Id, ComponentId, SortIndex, BlockKind, TextContent, ImagePath, RefKey, Caption, Alt, CalloutTone, CalloutTitle FROM ArticleBlocks ORDER BY SortIndex;";
+        cmd.CommandText = "SELECT Id, ComponentId, SortIndex, BlockKind, TextContent, ImagePath, RefKey, Caption, Alt, CalloutTone, CalloutTitle, PayloadJson FROM ArticleBlocks ORDER BY SortIndex;";
         await using var r = await cmd.ExecuteReaderAsync(ct);
         while (await r.ReadAsync(ct))
         {
@@ -524,7 +524,8 @@ public sealed class SqliteWorkspaceRepository(
                 r.IsDBNull(7) ? null : r.GetString(7),
                 r.IsDBNull(8) ? null : r.GetString(8),
                 calloutTone,
-                r.IsDBNull(10) ? null : r.GetString(10));
+                r.IsDBNull(10) ? null : r.GetString(10),
+                r.IsDBNull(11) ? null : r.GetString(11));
             (map.TryGetValue(compId, out var list) ? list : map[compId] = []).Add(block);
         }
         return map;
@@ -548,7 +549,7 @@ public sealed class SqliteWorkspaceRepository(
         var map = new Dictionary<string, List<Question>>(StringComparer.Ordinal);
         await using (var qCmd = conn.CreateCommand())
         {
-            qCmd.CommandText = "SELECT Id, ContainerId, SortIndex, QuestionType, PromptText, MaxOptions, IsMultiCorrect, FrontText, FrontImagePath, FrontPosition, BackText, BackImagePath, BackPosition, LayoutOverridesJson, PromptImagePath, Explanation, RefKey FROM Questions ORDER BY SortIndex;";
+            qCmd.CommandText = "SELECT Id, ContainerId, SortIndex, QuestionType, PromptText, MaxOptions, IsMultiCorrect, FrontText, FrontImagePath, FrontPosition, BackText, BackImagePath, BackPosition, LayoutOverridesJson, PromptImagePath, Explanation, RefKey, PayloadJson FROM Questions ORDER BY SortIndex;";
             await using var r = await qCmd.ExecuteReaderAsync(ct);
             while (await r.ReadAsync(ct))
             {
@@ -556,27 +557,34 @@ public sealed class SqliteWorkspaceRepository(
                 var qType = Enum.TryParse<QuestionType>(r.GetString(3), true, out var qt) ? qt : QuestionType.Mcq;
                 var ov = DeserializeOverrides(r.IsDBNull(13) ? null : r.GetString(13));
                 var refKey = r.IsDBNull(16) ? null : r.GetString(16);
-                Question q;
-                if (qType == QuestionType.Mcq)
+                var payloadJson = r.IsDBNull(17) ? null : r.GetString(17);
+                Question q = qType switch
                 {
-                    q = McqQuestion.Rehydrate(qid, cid, idx, r.IsDBNull(4) ? string.Empty : r.GetString(4),
+                    QuestionType.Mcq => McqQuestion.Rehydrate(qid, cid, idx, r.IsDBNull(4) ? string.Empty : r.GetString(4),
                         r.GetInt32(5), r.GetInt32(6) == 1, optionsByQ.TryGetValue(qid, out var list) ? list : [], ov,
                         r.IsDBNull(14) ? null : r.GetString(14),
                         r.IsDBNull(15) ? null : r.GetString(15),
-                        refKey);
-                }
-                else
-                {
-                    var (fp, fExp) = ParseSidePosition(r.IsDBNull(9) ? null : r.GetString(9));
-                    var (bp, bExp) = ParseSidePosition(r.IsDBNull(12) ? null : r.GetString(12));
-                    q = FlashcardQuestion.Rehydrate(qid, cid, idx,
-                        FlashcardSide.Rehydrate(r.IsDBNull(7) ? null : r.GetString(7), r.IsDBNull(8) ? null : r.GetString(8), fp, fExp),
-                        FlashcardSide.Rehydrate(r.IsDBNull(10) ? null : r.GetString(10), r.IsDBNull(11) ? null : r.GetString(11), bp, bExp), ov, refKey);
-                }
+                        refKey),
+                    QuestionType.Flashcard => RehydrateFlashcardRow(qid, cid, idx, r, ov, refKey),
+                    QuestionType.FillBlank or QuestionType.AssertionReason or QuestionType.SpotError or QuestionType.Differentiation or QuestionType.Mechanism or QuestionType.RelabelImage =>
+                        PayloadQuestion.Rehydrate(qid, cid, idx, qType, payloadJson ?? "{}", ov, refKey),
+                    _ => throw new InvalidOperationException($"Unsupported persisted question type '{qType}' (payload present: {payloadJson is not null}).")
+                };
                 (map.TryGetValue(cid, out var qList) ? qList : map[cid] = []).Add(q);
             }
         }
         return map;
+    }
+
+    private static FlashcardQuestion RehydrateFlashcardRow(
+        string qid, string cid, int idx, SqliteDataReader r, Dictionary<string, string>? ov, string? refKey)
+    {
+        var (fp, fExp) = ParseSidePosition(r.IsDBNull(9) ? null : r.GetString(9));
+        var (bp, bExp) = ParseSidePosition(r.IsDBNull(12) ? null : r.GetString(12));
+        return FlashcardQuestion.Rehydrate(qid, cid, idx,
+            FlashcardSide.Rehydrate(r.IsDBNull(7) ? null : r.GetString(7), r.IsDBNull(8) ? null : r.GetString(8), fp, fExp),
+            FlashcardSide.Rehydrate(r.IsDBNull(10) ? null : r.GetString(10), r.IsDBNull(11) ? null : r.GetString(11), bp, bExp),
+            ov, refKey);
     }
 
     private static Dictionary<string, string>? DeserializeOverrides(string? json)

@@ -3,6 +3,9 @@ using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using Meloberry.Application.Abstractions;
 using Meloberry.Domain.Common;
+using Meloberry.Domain.Payloads;
+using Meloberry.Domain.Questions;
+using Meloberry.Domain.Quizzes;
 
 namespace Meloberry.Infrastructure.Services;
 
@@ -21,7 +24,12 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
         "kind", "name", "description", "title", "quizType", "components", "blocks", "questions",
         "layoutOverrides", "order", "ref", "text", "imagePath", "caption", "alt", "tone",
         "type", "explanation", "maxOptions", "isMultiCorrect", "options", "index", "isCorrect",
-        "front", "back", "position", "textPosition"
+        "front", "back", "position", "textPosition",
+        "stickyFirstCol", "hideableCols", "headers", "alignments", "rows", "footnote",
+        "fuzzy", "caseSensitive", "assertion", "reason", "answer", "scheme",
+        "requireFix", "allowNoError", "noError",
+        "mode", "bank", "steps", "stepId", "orderGroup", "isDistractor",
+        "prompt", "style", "masks", "masksPath", "include", "boxes", "label", "aliases", "rect", "x", "y", "w", "h", "distractors"
     ];
 
     [GeneratedRegex(@"property\s+'(?<prop>[^']+)'", RegexOptions.IgnoreCase)]
@@ -82,6 +90,11 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
             var raw = await File.ReadAllTextAsync(sessionMdPath, ct);
             var parsed = MarkdownSpecParser.ParseDocument(raw, sessionMdPath, isSessionManifest: true);
             if (!parsed.IsSuccess) return parsed.Error!;
+            if (!string.IsNullOrWhiteSpace(parsed.Value.Kind) &&
+                !string.Equals(parsed.Value.Kind.Trim(), "session", StringComparison.OrdinalIgnoreCase))
+                return new Error("Markdown.InvalidFrontmatter", $"Directory '_session.md' must omit 'kind' or set 'kind' to 'session', found '{parsed.Value.Kind}'.", ErrorType.Validation);
+            if (!string.IsNullOrWhiteSpace(parsed.Value.QuizType))
+                return new Error("Json.InvalidFieldForType", "Top-level 'quizType' is not valid on '_session.md' session manifests.", ErrorType.Validation);
             if (parsed.Value.LayoutOverrides is { Count: > 0 })
                 return new Error("Json.InvalidFieldForType", "Top-level 'layoutOverrides' belong on components or individual questions, not '_session.md' session manifests.", ErrorType.Validation);
             if (!string.IsNullOrWhiteSpace(parsed.Value.Ref))
@@ -95,6 +108,11 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
             var raw = await File.ReadAllTextAsync(sessionJsonPath, ct);
             var parsed = ParseSpec(raw, sessionJsonPath);
             if (!parsed.IsSuccess) return parsed.Error!;
+            if (!string.IsNullOrWhiteSpace(parsed.Value.Kind) &&
+                !string.Equals(parsed.Value.Kind.Trim(), "session", StringComparison.OrdinalIgnoreCase))
+                return new Error("Json.InvalidSpec", $"Directory 'session.json' must omit 'kind' or set 'kind' to 'session', found '{parsed.Value.Kind}'.", ErrorType.Validation);
+            if (parsed.Value.Blocks is { Count: > 0 } || parsed.Value.Questions is { Count: > 0 })
+                return new Error("Json.InvalidFieldForType", "Directory 'session.json' cannot specify root 'blocks' or 'questions'.", ErrorType.Validation);
             if (parsed.Value.LayoutOverrides is { Count: > 0 })
                 return new Error("Json.InvalidFieldForType", "Top-level 'layoutOverrides' belong on components or individual questions, not 'session.json' session roots.", ErrorType.Validation);
             if (!string.IsNullOrWhiteSpace(parsed.Value.Ref))
@@ -111,6 +129,9 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
                 var name = Path.GetFileName(f);
                 if (name.StartsWith('_')) return false;
                 if (string.Equals(name, "session.json", StringComparison.OrdinalIgnoreCase))
+                    return false;
+                if (name.EndsWith(".masks.json", StringComparison.OrdinalIgnoreCase) ||
+                    name.EndsWith(".meta.json", StringComparison.OrdinalIgnoreCase))
                     return false;
                 return IsMarkdownFile(f) || string.Equals(Path.GetExtension(f), ".json", StringComparison.OrdinalIgnoreCase);
             })
@@ -158,11 +179,15 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
             var spec = jsonRes.Value;
             if (spec.Components is { Count: > 0 })
             {
+                if (spec.Blocks is { Count: > 0 } || spec.Questions is { Count: > 0 })
+                    return new Error("Json.InvalidFieldForType", $"Component JSON '{Path.GetFileName(file)}' cannot mix 'components[]' with root 'blocks' or 'questions'.", ErrorType.Validation);
                 foreach (var c in spec.Components)
                     components.Add(c with { SourceDirectory = fullDir });
             }
             else if (spec.Blocks is { Count: > 0 } || string.Equals(spec.Kind, "article", StringComparison.OrdinalIgnoreCase))
             {
+                if (spec.Questions is { Count: > 0 })
+                    return new Error("Json.InvalidFieldForType", $"Article JSON '{Path.GetFileName(file)}' cannot specify quiz 'questions[]'.", ErrorType.Validation);
                 components.Add(new DeclarativeComponentSpec(
                     "article",
                     spec.Title ?? spec.Name ?? MarkdownSpecParser.HumanizeFileStem(file),
@@ -175,6 +200,8 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
             }
             else if (spec.Questions is { Count: > 0 } || spec.Kind?.ToLowerInvariant() is "quiz" or "mcq" or "flashcard" or "mixed")
             {
+                if (spec.Blocks is { Count: > 0 })
+                    return new Error("Json.InvalidFieldForType", $"Quiz JSON '{Path.GetFileName(file)}' cannot specify article 'blocks[]'.", ErrorType.Validation);
                 var qType = !string.IsNullOrWhiteSpace(spec.QuizType)
                     ? spec.QuizType
                     : (spec.Kind?.Equals("quiz", StringComparison.OrdinalIgnoreCase) == false ? spec.Kind : "mixed");
@@ -390,6 +417,52 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
             var b = rawBlocks[i];
             if (b is null || string.IsNullOrWhiteSpace(b.Kind))
                 return new Error("Json.InvalidSpec", $"Article block at index {i} must be a non-null object with a 'kind' field.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
+
+            bool hasTableFields = b.StickyFirstCol.HasValue || b.HideableCols is not null || b.Headers is not null ||
+                                  b.Alignments is not null || b.Rows is not null || b.Footnote is not null;
+
+            if (string.Equals(b.Kind.Trim(), "table", StringComparison.OrdinalIgnoreCase))
+            {
+                if (b.Headers is not null && b.Headers.Any(h => h is null))
+                    return new Error("Json.InvalidSpec", $"Table block at '{pathPrefix}[{i}]' contains a null entry in 'headers'.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].headers");
+                if (b.Alignments is not null && b.Alignments.Any(a => a is null))
+                    return new Error("Json.InvalidSpec", $"Table block at '{pathPrefix}[{i}]' contains a null entry in 'alignments'.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].alignments");
+                if (b.Rows is not null)
+                {
+                    for (int rIdx = 0; rIdx < b.Rows.Count; rIdx++)
+                    {
+                        var row = b.Rows[rIdx];
+                        if (row is null || row.Any(c => c is null))
+                            return new Error("Json.InvalidSpec", $"Table block at '{pathPrefix}[{i}]' contains a null row or cell in 'rows[{rIdx}]'.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].rows[{rIdx}]");
+                    }
+                }
+
+                var headers = (IReadOnlyList<string>)(b.Headers?.Select(h => h!).ToList() ?? []);
+                var alignments = b.Alignments is { Count: > 0 }
+                    ? (IReadOnlyList<string>)b.Alignments.Select(a => string.IsNullOrWhiteSpace(a) ? "left" : a!.Trim().ToLowerInvariant()).ToList()
+                    : Enumerable.Repeat("left", headers.Count).ToList();
+                var rows = (IReadOnlyList<IReadOnlyList<string>>)(b.Rows?.Select(r => (IReadOnlyList<string>)r!.Select(c => c!).ToList()).ToList() ?? []);
+                var hideable = (IReadOnlyList<int>)(b.HideableCols ?? []);
+
+                var payload = new TableBlockPayload(
+                    string.IsNullOrWhiteSpace(b.Title) ? null : b.Title.Trim(),
+                    string.IsNullOrWhiteSpace(b.Caption) ? null : b.Caption.Trim(),
+                    b.StickyFirstCol ?? false,
+                    hideable,
+                    headers,
+                    alignments,
+                    rows,
+                    string.IsNullOrWhiteSpace(b.Footnote) ? null : b.Footnote.Trim());
+
+                list.Add(new DeclarativeArticleBlockSpec(
+                    b.Kind, b.Text, b.ImagePath, b.Ref, b.Caption, b.Alt, b.Tone, b.Title,
+                    PayloadJson: Phase1PayloadCodec.Serialize(payload)));
+                continue;
+            }
+
+            if (hasTableFields)
+                return new Error("Json.InvalidFieldForType", $"Article block kind '{b.Kind}' cannot specify table fields ('headers', 'rows', 'alignments', 'stickyFirstCol', 'hideableCols', 'footnote').", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
+
             list.Add(new DeclarativeArticleBlockSpec(b.Kind, b.Text, b.ImagePath, b.Ref, b.Caption, b.Alt, b.Tone, b.Title));
         }
         return Result<IReadOnlyList<DeclarativeArticleBlockSpec>?>.Success(list);
@@ -413,6 +486,179 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
 
             static JsonFlashcardSideSpec? MapSide(ApplySideDto? s) =>
                 s is null ? null : new JsonFlashcardSideSpec(s.Text, s.ImagePath, s.Position ?? s.TextPosition);
+
+            bool hasMcqOnly = q.MaxOptions.HasValue || q.IsMultiCorrect || options.Count > 0;
+            bool hasImagePath = !string.IsNullOrWhiteSpace(q.ImagePath);
+            bool hasFlashcardOnly = q.Front is not null || q.Back is not null;
+            bool hasRecallFlags = q.Fuzzy.HasValue || q.CaseSensitive.HasValue;
+            bool hasArOnly = q.Assertion is not null || q.Reason is not null || q.Answer is not null || q.Scheme is not null;
+            bool hasSpotOnly = q.RequireFix.HasValue || q.NoError.HasValue;
+            bool hasTableShape = q.Headers is not null || q.Alignments is not null || q.Rows is not null;
+            bool hasMode = q.Mode is not null;
+            bool hasDiffOnly = q.Bank.HasValue || hasTableShape;
+            bool hasMechOnly = q.Steps is not null;
+            bool hasRelabelOnly = q.Prompt is not null || q.Style is not null || q.Masks is not null || q.MasksPath is not null ||
+                                  q.Include is not null || q.Boxes is not null || q.Distractors is not null;
+
+            if (Quiz.TryParseQuestionType(q.Type, out var qType) &&
+                qType is QuestionType.FillBlank or QuestionType.AssertionReason or QuestionType.SpotError or QuestionType.Differentiation or QuestionType.Mechanism or QuestionType.RelabelImage)
+            {
+                string payloadJson;
+                if (qType == QuestionType.FillBlank)
+                {
+                    if (hasMcqOnly || hasImagePath || hasFlashcardOnly || hasArOnly || hasSpotOnly || q.AllowNoError.HasValue || hasMode || hasDiffOnly || hasMechOnly || hasRelabelOnly || q.Title is not null)
+                        return new Error("Json.InvalidFieldForType", "Fill-in-the-blank question specifies fields belonging to another question type.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
+                    var template = q.Text ?? string.Empty;
+                    var slotsRes = Phase1PayloadRules.ParseFillBlankTemplate(template);
+                    var payload = new FillBlankPayload(template, slotsRes.IsSuccess ? slotsRes.Value : [], q.Fuzzy ?? true, q.CaseSensitive ?? false, string.IsNullOrWhiteSpace(q.Explanation) ? null : q.Explanation.Trim());
+                    payloadJson = Phase1PayloadCodec.Serialize(payload);
+                }
+                else if (qType == QuestionType.AssertionReason)
+                {
+                    if (hasMcqOnly || hasImagePath || hasFlashcardOnly || hasRecallFlags || hasSpotOnly || q.AllowNoError.HasValue || hasMode || hasDiffOnly || hasMechOnly || hasRelabelOnly || q.Title is not null || !string.IsNullOrWhiteSpace(q.Text))
+                        return new Error("Json.InvalidFieldForType", "Assertion-Reason question cannot specify 'text' or fields belonging to another question type.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
+                    var ans = Phase1PayloadRules.NormalizeAssertionReasonAnswer(q.Answer);
+                    var sch = Phase1PayloadRules.ResolveAssertionReasonScheme(q.Scheme, ans);
+                    var payload = new AssertionReasonPayload(q.Assertion?.Trim() ?? string.Empty, q.Reason?.Trim() ?? string.Empty, ans, sch, string.IsNullOrWhiteSpace(q.Explanation) ? null : q.Explanation.Trim());
+                    payloadJson = Phase1PayloadCodec.Serialize(payload);
+                }
+                else if (qType == QuestionType.SpotError)
+                {
+                    if (hasMcqOnly || hasImagePath || hasFlashcardOnly || hasRecallFlags || hasArOnly || hasMode || hasDiffOnly || hasMechOnly || hasRelabelOnly || q.Title is not null)
+                        return new Error("Json.InvalidFieldForType", "Spot-the-error question specifies fields belonging to another question type.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
+                    var template = q.Text ?? string.Empty;
+                    var segsRes = Phase1PayloadRules.ParseSpotErrorTemplate(template);
+                    bool noError = q.NoError ?? false;
+                    bool allowNoError = q.AllowNoError ?? noError;
+                    var payload = new SpotErrorPayload(template, segsRes.IsSuccess ? segsRes.Value : [], q.RequireFix ?? false, allowNoError, noError, string.IsNullOrWhiteSpace(q.Explanation) ? null : q.Explanation.Trim());
+                    payloadJson = Phase1PayloadCodec.Serialize(payload);
+                }
+                else if (qType == QuestionType.Differentiation)
+                {
+                    if (hasMcqOnly || hasImagePath || hasFlashcardOnly || hasArOnly || hasSpotOnly || hasMechOnly || hasRelabelOnly || !string.IsNullOrWhiteSpace(q.Text))
+                        return new Error("Json.InvalidFieldForType", "Differentiation question cannot specify 'text' or fields belonging to another question type.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
+                    if (q.Headers is not null && q.Headers.Any(h => h is null))
+                        return new Error("Json.InvalidSpec", $"Differentiation question at '{pathPrefix}[{i}]' contains a null entry in 'headers'.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].headers");
+                    if (q.Alignments is not null && q.Alignments.Any(a => a is null))
+                        return new Error("Json.InvalidSpec", $"Differentiation question at '{pathPrefix}[{i}]' contains a null entry in 'alignments'.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].alignments");
+                    if (q.Rows is not null)
+                    {
+                        for (int rIdx = 0; rIdx < q.Rows.Count; rIdx++)
+                        {
+                            if (q.Rows[rIdx] is null || q.Rows[rIdx]!.Any(c => c is null))
+                                return new Error("Json.InvalidSpec", $"Differentiation question at '{pathPrefix}[{i}]' contains a null row or cell in 'rows[{rIdx}]'.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].rows[{rIdx}]");
+                        }
+                    }
+
+                    var mode = Phase2PayloadRules.NormalizeDiffMode(q.Mode);
+                    var headers = (IReadOnlyList<string>)(q.Headers?.Select(h => h!).ToList() ?? []);
+                    var alignments = q.Alignments is { Count: > 0 }
+                        ? (IReadOnlyList<string>)q.Alignments.Select(a => string.IsNullOrWhiteSpace(a) ? "left" : a!.Trim().ToLowerInvariant()).ToList()
+                        : Enumerable.Repeat("left", headers.Count).ToList();
+                    var rows = (IReadOnlyList<IReadOnlyList<string>>)(q.Rows?.Select(r => (IReadOnlyList<string>)r!.Select(c => c!).ToList()).ToList() ?? []);
+                    var specialRes = Phase2PayloadRules.ParseDifferentiationTable(mode, headers, rows);
+                    var payload = new DifferentiationPayload(
+                        mode,
+                        string.IsNullOrWhiteSpace(q.Title) ? null : q.Title.Trim(),
+                        q.Bank ?? false,
+                        q.Fuzzy ?? true,
+                        q.CaseSensitive ?? false,
+                        q.AllowNoError ?? false,
+                        headers,
+                        alignments,
+                        rows,
+                        specialRes.IsSuccess ? specialRes.Value : [],
+                        string.IsNullOrWhiteSpace(q.Explanation) ? null : q.Explanation.Trim());
+                    payloadJson = Phase1PayloadCodec.Serialize(payload);
+                }
+                else if (qType == QuestionType.Mechanism)
+                {
+                    if (hasMcqOnly || hasImagePath || hasFlashcardOnly || hasRecallFlags || hasArOnly || hasSpotOnly || q.AllowNoError.HasValue || hasMode || hasDiffOnly || hasRelabelOnly || !string.IsNullOrWhiteSpace(q.Text))
+                        return new Error("Json.InvalidFieldForType", "Mechanism question cannot specify 'text' or fields belonging to another question type.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
+                    if (q.Steps is not null && q.Steps.Any(s => s is null))
+                        return new Error("Json.InvalidSpec", $"Mechanism question at '{pathPrefix}[{i}]' contains a null entry in 'steps'.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].steps");
+
+                    var steps = (q.Steps ?? [])
+                        .Select((s, sIdx) => new MechanismStep(
+                            s!.StepId > 0 ? s.StepId : sIdx + 1,
+                            s.IsDistractor ? 0 : s.OrderGroup,
+                            s.Text?.Trim() ?? string.Empty,
+                            s.IsDistractor))
+                        .ToList();
+                    var payload = new MechanismPayload(
+                        string.IsNullOrWhiteSpace(q.Title) ? null : q.Title.Trim(),
+                        steps,
+                        string.IsNullOrWhiteSpace(q.Explanation) ? null : q.Explanation.Trim());
+                    payloadJson = Phase1PayloadCodec.Serialize(payload);
+                }
+                else
+                {
+                    if (hasMcqOnly || hasFlashcardOnly || hasArOnly || hasSpotOnly || q.AllowNoError.HasValue || hasDiffOnly || hasMechOnly || q.Title is not null || !string.IsNullOrWhiteSpace(q.Text))
+                        return new Error("Json.InvalidFieldForType", "Relabel question cannot specify 'text' or fields belonging to another question type.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
+                    if (!string.IsNullOrWhiteSpace(q.Masks) && !string.IsNullOrWhiteSpace(q.MasksPath))
+                        return new Error("Json.InvalidQuestion", "Relabel question cannot specify both 'masks' and 'masksPath'.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
+                    var masksPath = !string.IsNullOrWhiteSpace(q.MasksPath) ? q.MasksPath.Trim() : (string.IsNullOrWhiteSpace(q.Masks) ? null : q.Masks.Trim());
+                    if (masksPath is not null && q.Boxes is { Count: > 0 })
+                        return new Error("Json.InvalidQuestion", "Relabel question cannot specify both 'masks'/'masksPath' sidecar and inline 'boxes'.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
+                    if (q.Include is not null && q.Include.Any(x => x is null))
+                        return new Error("Json.InvalidSpec", $"Relabel question at '{pathPrefix}[{i}]' contains a null entry in 'include'.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].include");
+                    if (q.Distractors is not null && q.Distractors.Any(x => x is null))
+                        return new Error("Json.InvalidSpec", $"Relabel question at '{pathPrefix}[{i}]' contains a null entry in 'distractors'.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].distractors");
+
+                    var boxes = new List<RelabelBox>();
+                    if (q.Boxes is not null)
+                    {
+                        for (int bIdx = 0; bIdx < q.Boxes.Count; bIdx++)
+                        {
+                            var b = q.Boxes[bIdx];
+                            if (b is null)
+                                return new Error("Json.InvalidSpec", $"Relabel question at '{pathPrefix}[{i}]' contains a null entry in 'boxes'.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].boxes[{bIdx}]");
+                            if (b.Aliases is not null && b.Aliases.Any(a => a is null))
+                                return new Error("Json.InvalidSpec", $"Relabel box at '{pathPrefix}[{i}].boxes[{bIdx}]' contains a null alias.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].boxes[{bIdx}].aliases");
+
+                            double bx, by, bw, bh;
+                            if (b.Rect is not null)
+                            {
+                                if (b.Rect.Count != 4)
+                                    return new Error("Json.InvalidQuestion", $"Relabel box at '{pathPrefix}[{i}].boxes[{bIdx}]' 'rect' must contain exactly 4 numbers [x, y, w, h].", ErrorType.Validation, Path: $"{pathPrefix}[{i}].boxes[{bIdx}].rect");
+                                bx = b.Rect[0]; by = b.Rect[1]; bw = b.Rect[2]; bh = b.Rect[3];
+                            }
+                            else if (b.X.HasValue && b.Y.HasValue && b.W.HasValue && b.H.HasValue)
+                            {
+                                bx = b.X.Value; by = b.Y.Value; bw = b.W.Value; bh = b.H.Value;
+                            }
+                            else
+                            {
+                                return new Error("Json.InvalidQuestion", $"Relabel box at '{pathPrefix}[{i}].boxes[{bIdx}]' must specify 'rect: [x,y,w,h]' or numeric 'x', 'y', 'w', 'h'.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].boxes[{bIdx}]");
+                            }
+
+                            var aliases = (b.Aliases ?? []).Where(a => !string.IsNullOrWhiteSpace(a)).Select(a => a!.Trim()).ToList();
+                            boxes.Add(new RelabelBox(bIdx + 1, b.Label?.Trim() ?? string.Empty, aliases, bx, by, bw, bh));
+                        }
+                    }
+
+                    var payload = new RelabelImagePayload(
+                        q.ImagePath?.Trim() ?? string.Empty,
+                        string.IsNullOrWhiteSpace(q.Prompt) ? null : q.Prompt.Trim(),
+                        string.IsNullOrWhiteSpace(q.Mode) ? "bank" : Phase2PayloadRules.NormalizeRelabelMode(q.Mode),
+                        string.IsNullOrWhiteSpace(q.Style) ? "solid" : Phase2PayloadRules.NormalizeRelabelStyle(q.Style),
+                        boxes,
+                        (q.Distractors ?? []).Where(d => !string.IsNullOrWhiteSpace(d)).Select(d => d!.Trim()).ToList(),
+                        q.Fuzzy ?? true,
+                        q.CaseSensitive ?? false,
+                        string.IsNullOrWhiteSpace(q.Explanation) ? null : q.Explanation.Trim(),
+                        SourceMasksPath: masksPath,
+                        IncludeLabels: q.Include?.Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x!.Trim()).ToList());
+                    payloadJson = Phase1PayloadCodec.Serialize(payload);
+                }
+
+                var outerImagePath = qType == QuestionType.RelabelImage ? null : q.ImagePath;
+                list.Add(new JsonQuestionSpec(q.Type, null, q.MaxOptions, q.IsMultiCorrect, options, MapSide(q.Front), MapSide(q.Back), q.LayoutOverrides, outerImagePath, q.Explanation, q.Ref, payloadJson));
+                continue;
+            }
+
+            if (hasRecallFlags || hasArOnly || hasSpotOnly || q.AllowNoError.HasValue || hasMode || hasDiffOnly || hasMechOnly || hasRelabelOnly || q.Title is not null)
+                return new Error("Json.InvalidFieldForType", $"Question type '{q.Type}' cannot specify specialized payload fields.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
 
             list.Add(new JsonQuestionSpec(q.Type, q.Text, q.MaxOptions, q.IsMultiCorrect, options, MapSide(q.Front), MapSide(q.Back), q.LayoutOverrides, q.ImagePath, q.Explanation, q.Ref));
         }
@@ -455,6 +701,12 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
         public string? Alt { get; set; }
         public string? Tone { get; set; }
         public string? Title { get; set; }
+        public bool? StickyFirstCol { get; set; }
+        public List<int>? HideableCols { get; set; }
+        public List<string?>? Headers { get; set; }
+        public List<string?>? Alignments { get; set; }
+        public List<List<string?>?>? Rows { get; set; }
+        public string? Footnote { get; set; }
     }
 
     private sealed class ApplyQuestionDto
@@ -470,6 +722,29 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
         public ApplySideDto? Front { get; set; }
         public ApplySideDto? Back { get; set; }
         public Dictionary<string, string>? LayoutOverrides { get; set; }
+        public bool? Fuzzy { get; set; }
+        public bool? CaseSensitive { get; set; }
+        public string? Assertion { get; set; }
+        public string? Reason { get; set; }
+        public string? Answer { get; set; }
+        public string? Scheme { get; set; }
+        public bool? RequireFix { get; set; }
+        public bool? AllowNoError { get; set; }
+        public bool? NoError { get; set; }
+        public string? Mode { get; set; }
+        public bool? Bank { get; set; }
+        public string? Title { get; set; }
+        public List<string?>? Headers { get; set; }
+        public List<string?>? Alignments { get; set; }
+        public List<List<string?>?>? Rows { get; set; }
+        public List<ApplyMechanismStepDto?>? Steps { get; set; }
+        public string? Prompt { get; set; }
+        public string? Style { get; set; }
+        public string? Masks { get; set; }
+        public string? MasksPath { get; set; }
+        public List<string?>? Include { get; set; }
+        public List<ApplyRelabelBoxDto?>? Boxes { get; set; }
+        public List<string?>? Distractors { get; set; }
     }
 
     private sealed class ApplyOptionDto
@@ -486,5 +761,24 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
         public string? ImagePath { get; set; }
         public string? Position { get; set; }
         public string? TextPosition { get; set; }
+    }
+
+    private sealed class ApplyMechanismStepDto
+    {
+        public int StepId { get; set; }
+        public int OrderGroup { get; set; }
+        public string? Text { get; set; }
+        public bool IsDistractor { get; set; }
+    }
+
+    private sealed class ApplyRelabelBoxDto
+    {
+        public string? Label { get; set; }
+        public List<string?>? Aliases { get; set; }
+        public List<double>? Rect { get; set; }
+        public double? X { get; set; }
+        public double? Y { get; set; }
+        public double? W { get; set; }
+        public double? H { get; set; }
     }
 }
