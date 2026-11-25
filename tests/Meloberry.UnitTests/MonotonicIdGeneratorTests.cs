@@ -1,3 +1,4 @@
+using Meloberry.Infrastructure;
 using Meloberry.Infrastructure.Services;
 using Xunit;
 
@@ -33,5 +34,38 @@ public sealed class MonotonicIdGeneratorTests
         }
 
         Assert.Equal(1000, ids.Count);
+    }
+
+    [Fact]
+    public async Task ConcurrentMultiInstanceGeneration_WithSharedAppDataLease_ProducesZeroCollisions()
+    {
+        var appDataDir = Path.Combine(Path.GetTempPath(), $"mby_lease_test_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(appDataDir);
+        try
+        {
+            var opts = new MeloberryStorageOptions { AppDataDirectory = appDataDir };
+            var generators = Enumerable.Range(0, 4)
+                .Select(_ => new MonotonicTimestampIdGenerator(opts))
+                .ToArray();
+
+            var tasks = generators.Select(gen => Task.Run(() =>
+            {
+                var local = new List<string>(150);
+                for (int i = 0; i < 150; i++)
+                    local.Add(gen.NewQuestionId());
+                return local;
+            })).ToArray();
+
+            var results = await Task.WhenAll(tasks);
+            var allIds = results.SelectMany(x => x).ToList();
+            Assert.Equal(600, allIds.Count);
+            Assert.Equal(600, allIds.Distinct(StringComparer.Ordinal).Count());
+            Assert.True(File.Exists(Path.Combine(appDataDir, ".mby_id_clock")));
+        }
+        finally
+        {
+            if (Directory.Exists(appDataDir))
+                Directory.Delete(appDataDir, recursive: true);
+        }
     }
 }

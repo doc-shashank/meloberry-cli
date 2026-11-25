@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using Meloberry.Application.Abstractions;
 using Meloberry.Application.UseCases.Common;
 using Meloberry.Application.UseCases.Diagnostics;
@@ -49,7 +50,9 @@ public sealed record ApplySpecResponse(
     ApplyLintSummary? Lint = null,
     string? WebOutputPath = null,
     string? PackagePath = null,
-    WebAppVerificationReport? Verify = null);
+    WebAppVerificationReport? Verify = null,
+    [property: JsonIgnore] StudySession? InMemorySession = null,
+    [property: JsonIgnore] Quiz? InMemoryQuiz = null);
 
 public sealed class ApplySpecHandler(
     IIdGenerator idGenerator,
@@ -97,6 +100,8 @@ public sealed class ApplySpecHandler(
         var addedComponents = new List<SessionComponent>();
         var addedBlocks = new List<string>();
         var addedQuestions = new List<string>();
+        bool deferLintToBuildOrExport = !command.DryRun &&
+            (!string.IsNullOrWhiteSpace(command.BuildOutDir) || !string.IsNullOrWhiteSpace(command.ExportSpec));
 
         string? ephemeralRoot = command.Ephemeral && !command.DryRun
             ? Path.Combine(Path.GetTempPath(), $"mby_ephemeral_{Guid.NewGuid():N}")
@@ -106,7 +111,7 @@ public sealed class ApplySpecHandler(
         Result<ApplySpecResponse> applyRes;
         if (string.IsNullOrWhiteSpace(command.TargetAddress))
         {
-            applyRes = await CreateNewWorkspaceAsync(spec, effectiveWorkingDir, command.DryRun, command.Quiet, command.Verbose, jsonDir, cwd, addedComponents, addedBlocks, addedQuestions, cancellationToken);
+            applyRes = await CreateNewWorkspaceAsync(spec, effectiveWorkingDir, command.DryRun, deferLintToBuildOrExport, command.Quiet, command.Verbose, jsonDir, cwd, addedComponents, addedBlocks, addedQuestions, cancellationToken);
         }
         else
         {
@@ -116,9 +121,9 @@ public sealed class ApplySpecHandler(
 
             applyRes = target.EntityKind switch
             {
-                "session" => await AppendToSessionAsync(target.Session!, target.StorageDirectory, spec, command.DryRun, command.Quiet, command.Verbose, jsonDir, cwd, addedComponents, addedBlocks, addedQuestions, cancellationToken),
+                "session" => await AppendToSessionAsync(target.Session!, target.StorageDirectory, spec, command.DryRun, deferLintToBuildOrExport, command.Quiet, command.Verbose, jsonDir, cwd, addedComponents, addedBlocks, addedQuestions, cancellationToken),
                 "component" => await AppendToComponentAsync(target.Session!, target.Component!, target.StorageDirectory, spec, command.DryRun, command.Quiet, command.Verbose, jsonDir, cwd, addedBlocks, addedQuestions, cancellationToken),
-                "quiz" => await AppendToQuizAsync(target.Quiz!, target.StorageDirectory, spec, command.DryRun, command.Quiet, command.Verbose, jsonDir, cwd, addedQuestions, cancellationToken),
+                "quiz" => await AppendToQuizAsync(target.Quiz!, target.StorageDirectory, spec, command.DryRun, deferLintToBuildOrExport, command.Quiet, command.Verbose, jsonDir, cwd, addedQuestions, cancellationToken),
                 _ => new Error("Apply.UnsupportedTarget", $"Target '{command.TargetAddress}' ({target.EntityKind}) cannot be used with apply. Target a session, component, quiz, or omit target.", ErrorType.Validation)
             };
         }
@@ -135,16 +140,25 @@ public sealed class ApplySpecHandler(
             string? webOut = null;
             string? pkgOut = null;
             ApplyLintSummary? lintSummary = res.Lint;
+            LintReportResponse? cachedLintReport = null;
             WebAppVerificationReport? verifyReport = null;
 
             if (!string.IsNullOrWhiteSpace(command.BuildOutDir))
             {
-                var buildRes = await buildWebHandler.HandleAsync(
-                    new BuildWebAppCommand(res.TargetId, command.BuildOutDir, command.VerifyWeb, command.Verbose, command.Quiet, command.StaticVerifyOnly, command.VerifyTimeoutSeconds),
-                    cancellationToken);
+                var buildCmd = new BuildWebAppCommand(res.TargetId, command.BuildOutDir, command.VerifyWeb, command.Verbose, command.Quiet, command.StaticVerifyOnly, command.VerifyTimeoutSeconds);
+                var buildRes = (res.InMemorySession is not null || res.InMemoryQuiz is not null)
+                    ? await buildWebHandler.BuildResolvedWorkspaceAsync(
+                        res.InMemorySession,
+                        res.InMemoryQuiz,
+                        res.StorageDirectory,
+                        buildCmd,
+                        includeLintReport: !string.IsNullOrWhiteSpace(command.ExportSpec),
+                        cancellationToken)
+                    : await buildWebHandler.HandleAsync(buildCmd, cancellationToken);
                 if (!buildRes.IsSuccess) return buildRes.Error!;
                 webOut = buildRes.Value.IndexHtmlPath;
                 lintSummary = buildRes.Value.Lint;
+                cachedLintReport = buildRes.Value.LintReport;
                 verifyReport = buildRes.Value.Verify;
             }
 
@@ -153,7 +167,16 @@ public sealed class ApplySpecHandler(
                 var colonIdx = command.ExportSpec.IndexOf(':');
                 var platform = colonIdx >= 0 ? command.ExportSpec[..colonIdx] : command.ExportSpec;
                 var outPath = colonIdx >= 0 && colonIdx + 1 < command.ExportSpec.Length ? command.ExportSpec[(colonIdx + 1)..] : null;
-                var expRes = await exportHandler.HandleAsync(new ExportPackageCommand(res.TargetId, outPath, platform), cancellationToken);
+                var expCmd = new ExportPackageCommand(res.TargetId, outPath, platform);
+                var expRes = (res.InMemorySession is not null || res.InMemoryQuiz is not null)
+                    ? await exportHandler.ExportResolvedWorkspaceAsync(
+                        res.InMemorySession,
+                        res.InMemoryQuiz,
+                        res.StorageDirectory,
+                        expCmd,
+                        cachedLintReport,
+                        cancellationToken)
+                    : await exportHandler.HandleAsync(expCmd, cancellationToken);
                 if (!expRes.IsSuccess) return expRes.Error!;
                 pkgOut = expRes.Value.PackagePath;
                 lintSummary = new ApplyLintSummary(expRes.Value.LintReport.IsClean, expRes.Value.LintReport.ErrorCount, expRes.Value.LintReport.WarningCount);
@@ -165,7 +188,9 @@ public sealed class ApplySpecHandler(
                 Lint = lintSummary,
                 WebOutputPath = webOut,
                 PackagePath = pkgOut,
-                Verify = verifyReport
+                Verify = verifyReport,
+                InMemorySession = null,
+                InMemoryQuiz = null
             };
         }
         finally
@@ -189,6 +214,7 @@ public sealed class ApplySpecHandler(
         DeclarativeApplySpec spec,
         string? workingDirectory,
         bool dryRun,
+        bool skipPostPersistLint,
         bool quiet,
         bool verbose,
         string jsonDir,
@@ -296,13 +322,19 @@ public sealed class ApplySpecHandler(
                 }
 
                 await repository.CreateSessionAsync(session, ct);
-                var createdReport = await lintHandler.LintSessionInMemoryAsync(session, storageDir, ct);
+                ApplyLintSummary? lintSummary = null;
+                if (!skipPostPersistLint)
+                {
+                    var createdReport = await lintHandler.LintSessionInMemoryAsync(session, storageDir, ct);
+                    lintSummary = new ApplyLintSummary(createdReport.IsClean, createdReport.ErrorCount, createdReport.WarningCount);
+                }
                 return new ApplySpecResponse(
                     session.Id, "session", storageDir, CreatedWorkspace: true, DryRun: false,
                     Components: MapComponentSummaries(addedComponents),
                     AddedBlockIds: CompactIds(addedBlocks, quiet, verbose),
                     AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose),
-                    Lint: new ApplyLintSummary(createdReport.IsClean, createdReport.ErrorCount, createdReport.WarningCount));
+                    Lint: lintSummary,
+                    InMemorySession: session);
             }
             catch
             {
@@ -366,11 +398,17 @@ public sealed class ApplySpecHandler(
                 }
 
                 await repository.CreateQuizAsync(quiz, ct);
-                var createdReport = await lintHandler.LintQuizInMemoryAsync(quiz, storageDir, ct);
+                ApplyLintSummary? lintSummary = null;
+                if (!skipPostPersistLint)
+                {
+                    var createdReport = await lintHandler.LintQuizInMemoryAsync(quiz, storageDir, ct);
+                    lintSummary = new ApplyLintSummary(createdReport.IsClean, createdReport.ErrorCount, createdReport.WarningCount);
+                }
                 return new ApplySpecResponse(
                     quiz.Id, "quiz", storageDir, CreatedWorkspace: true, DryRun: false,
                     AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose),
-                    Lint: new ApplyLintSummary(createdReport.IsClean, createdReport.ErrorCount, createdReport.WarningCount));
+                    Lint: lintSummary,
+                    InMemoryQuiz: quiz);
             }
             catch
             {
@@ -391,6 +429,7 @@ public sealed class ApplySpecHandler(
         string realStorageDir,
         DeclarativeApplySpec spec,
         bool dryRun,
+        bool skipPostPersistLint,
         bool quiet,
         bool verbose,
         string jsonDir,
@@ -445,6 +484,7 @@ public sealed class ApplySpecHandler(
         return await ExecuteAppendWithRollbackAsync(
             realStorageDir,
             dryRun,
+            skipPostPersistLint,
             async workingAssetRoot =>
             {
                 var usedRefs = CollectSessionRefs(session);
@@ -463,7 +503,8 @@ public sealed class ApplySpecHandler(
                 Components: MapComponentSummaries(addedComponents),
                 AddedBlockIds: CompactIds(addedBlocks, quiet, verbose),
                 AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose),
-                Lint: new ApplyLintSummary(report.IsClean, report.ErrorCount, report.WarningCount)));
+                Lint: report is null ? null : new ApplyLintSummary(report.IsClean, report.ErrorCount, report.WarningCount),
+                InMemorySession: dryRun ? null : session));
     }
 
     private async Task<Result<ApplySpecResponse>> AppendToComponentAsync(
@@ -514,6 +555,7 @@ public sealed class ApplySpecHandler(
         return await ExecuteAppendWithRollbackAsync(
             realStorageDir,
             dryRun,
+            skipPostPersistLint: false,
             async workingAssetRoot =>
             {
                 var usedRefs = CollectSessionRefs(session);
@@ -543,7 +585,7 @@ public sealed class ApplySpecHandler(
                 comp.Id, "component", realStorageDir, CreatedWorkspace: false, DryRun: dryRun,
                 AddedBlockIds: CompactIds(addedBlocks, quiet, verbose),
                 AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose),
-                Lint: new ApplyLintSummary(report.IsClean, report.ErrorCount, report.WarningCount)));
+                Lint: report is null ? null : new ApplyLintSummary(report.IsClean, report.ErrorCount, report.WarningCount)));
     }
 
     private async Task<Result<ApplySpecResponse>> AppendToQuizAsync(
@@ -551,6 +593,7 @@ public sealed class ApplySpecHandler(
         string realStorageDir,
         DeclarativeApplySpec spec,
         bool dryRun,
+        bool skipPostPersistLint,
         bool quiet,
         bool verbose,
         string jsonDir,
@@ -578,6 +621,7 @@ public sealed class ApplySpecHandler(
         return await ExecuteAppendWithRollbackAsync(
             realStorageDir,
             dryRun,
+            skipPostPersistLint,
             workingAssetRoot =>
             {
                 var usedRefs = quiz.Questions.Where(q => q.RefKey is not null).Select(q => q.RefKey!).ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -588,16 +632,18 @@ public sealed class ApplySpecHandler(
             report => new ApplySpecResponse(
                 quiz.Id, "quiz", realStorageDir, CreatedWorkspace: false, DryRun: dryRun,
                 AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose),
-                Lint: new ApplyLintSummary(report.IsClean, report.ErrorCount, report.WarningCount)));
+                Lint: report is null ? null : new ApplyLintSummary(report.IsClean, report.ErrorCount, report.WarningCount),
+                InMemoryQuiz: dryRun ? null : quiz));
     }
 
-    private async Task<Result<ApplySpecResponse>> ExecuteAppendWithRollbackAsync<TLintReport>(
+    private static async Task<Result<ApplySpecResponse>> ExecuteAppendWithRollbackAsync<TLintReport>(
         string realStorageDir,
         bool dryRun,
+        bool skipPostPersistLint,
         Func<string, Task<Result>> applyMutationsAsync,
         Func<Task> persistAsync,
         Func<string, Task<TLintReport>> lintAsync,
-        Func<TLintReport, ApplySpecResponse> buildResponse)
+        Func<TLintReport?, ApplySpecResponse> buildResponse) where TLintReport : class
     {
         var workingAssetRoot = dryRun ? CreateDryRunStagingCopy(realStorageDir) : realStorageDir;
         var existingAssets = dryRun ? null : CaptureExistingAssets(realStorageDir);
@@ -612,7 +658,7 @@ public sealed class ApplySpecHandler(
 
             await persistAsync();
             persisted = true;
-            return buildResponse(await lintAsync(realStorageDir));
+            return buildResponse(skipPostPersistLint ? null : await lintAsync(realStorageDir));
         }
         finally
         {

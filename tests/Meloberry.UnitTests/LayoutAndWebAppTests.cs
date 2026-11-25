@@ -70,19 +70,19 @@ public sealed class LayoutAndWebAppTests : IDisposable
         var domainMeta = new AssemblyCliToolMetadataProvider(typeof(Meloberry.Domain.Common.Result).Assembly, "mby").GetMetadata();
         var appMeta = new AssemblyCliToolMetadataProvider(typeof(Meloberry.Application.DependencyInjection).Assembly, "mby").GetMetadata();
         var infraMeta = sp.GetRequiredService<ICliToolMetadataProvider>().GetMetadata();
-        Assert.Equal("2.1.0", domainMeta.Version);
-        Assert.Equal("2.1.0", appMeta.Version);
-        Assert.Equal("2.1.0", infraMeta.Version);
+        Assert.Equal("2.1.1", domainMeta.Version);
+        Assert.Equal("2.1.1", appMeta.Version);
+        Assert.Equal("2.1.1", infraMeta.Version);
         Assert.Equal("Meloberry", infraMeta.AppName);
         Assert.Equal("Meloberry CLI", infraMeta.ProductName);
         Assert.Equal("mby", infraMeta.ExecutableName);
         Assert.Equal("https://github.com/doc-shashank/meloberry-cli/", infraMeta.RepositoryUrl);
 
         var editorHtml = sp.GetRequiredService<ILayoutEditorPageBuilder>().BuildHtml("relabel", infraMeta, "csrf-sample-123");
-        Assert.Contains("<meta name=\"generator\" content=\"Meloberry CLI (mby) 2.1.0\"", editorHtml);
+        Assert.Contains("<meta name=\"generator\" content=\"Meloberry CLI (mby) 2.1.1\"", editorHtml);
         Assert.Contains("EDITOR_CSRF_TOKEN = \"csrf-sample-123\"", editorHtml);
         Assert.Contains("X-Mby-Editor-Token", editorHtml);
-        Assert.Contains("mby v2.1.0", editorHtml);
+        Assert.Contains("mby v2.1.1", editorHtml);
         Assert.Contains("data-theme=\"paper\"", editorHtml);
         foreach (var targetId in new[] { "article-text", "callout", "table", "image", "mcq-question", "mcq-options", "fill-blank", "assertion-reason", "spot-error", "diff", "mechanism", "relabel", "flashcard" })
             Assert.Contains($"id: '{targetId}'", editorHtml);
@@ -137,7 +137,7 @@ public sealed class LayoutAndWebAppTests : IDisposable
 
         var html = await File.ReadAllTextAsync(built.Value.IndexHtmlPath);
         var js = await File.ReadAllTextAsync(Path.Combine(webOut, "app.js"));
-        Assert.Contains("<meta name=\"generator\" content=\"Meloberry CLI (mby) 2.1.0\"", html);
+        Assert.Contains("<meta name=\"generator\" content=\"Meloberry CLI (mby) 2.1.1\"", html);
         Assert.DoesNotContain("<script>alert(1)</script>", js);
         Assert.DoesNotContain("javascript:alert(2)", js);
         Assert.Contains("aboveImage", js);
@@ -402,5 +402,244 @@ public sealed class LayoutAndWebAppTests : IDisposable
         Assert.True(overflowRes.IsSuccess, overflowRes.Error?.Description);
         Assert.False(overflowRes.Value.Passed);
         Assert.Contains(overflowRes.Value.OverflowIssues, msg => msg.Contains("Q2", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task WebAppGenerator_TreeShakesComponentsThemesNullsAndStaleFiles()
+    {
+        using var sp = _fx.CreateProvider("appdata_treeshake");
+        using var scope = sp.CreateScope();
+        var apply = scope.ServiceProvider.GetRequiredService<ApplySpecHandler>();
+        var build = scope.ServiceProvider.GetRequiredService<BuildWebAppHandler>();
+        var setLayout = scope.ServiceProvider.GetRequiredService<SetLayoutPropertyHandler>();
+
+        // 1. Text-only article session (berry theme)
+        Assert.True((await setLayout.HandleAsync(new SetLayoutPropertyCommand("article", "themeMode", "berry"))).IsSuccess);
+        var textApplied = (await apply.HandleAsync(new ApplySpecCommand(null, null,
+            "---\ntitle: Plain Notes\n---\n\nJust plain prose without math, images, or links.\n", _fx.WorkDir))).Value;
+        var textWeb = Path.Combine(_fx.TempRoot, "web_text_only");
+        var textBuilt = await build.HandleAsync(new BuildWebAppCommand(textApplied.TargetId, textWeb, StaticVerifyOnly: true));
+        Assert.True(textBuilt.IsSuccess && textBuilt.Value.Verify?.Passed == true);
+
+        Assert.True(File.Exists(Path.Combine(textWeb, "components", "blocks", "article.css")));
+        Assert.False(Directory.Exists(Path.Combine(textWeb, "components", "questions")));
+        Assert.False(Directory.Exists(Path.Combine(textWeb, "components", "aux")));
+        Assert.False(Directory.Exists(Path.Combine(textWeb, "katex")));
+        Assert.True(File.Exists(Path.Combine(textWeb, "preview-index.json")));
+        Assert.True(File.Exists(Path.Combine(textWeb, "preview-index.js")));
+
+        var textCss = await File.ReadAllTextAsync(Path.Combine(textWeb, "styles.css"));
+        Assert.DoesNotContain("data-theme=\"dark\"", textCss);
+        Assert.DoesNotContain("data-theme=\"light\"", textCss);
+        Assert.DoesNotContain("data-theme=\"paper\"", textCss);
+
+        var textHtml = await File.ReadAllTextAsync(textBuilt.Value.IndexHtmlPath);
+        Assert.DoesNotContain("imageZoomModal", textHtml);
+        Assert.DoesNotContain("linkPreviewPopover", textHtml);
+        Assert.Contains("id=\"mby-ico-save\"", textHtml);
+
+        var textJs = await File.ReadAllTextAsync(Path.Combine(textWeb, "app.js"));
+        Assert.DoesNotContain("\"relabel\":null", textJs);
+        Assert.DoesNotContain("\"flashcard\":null", textJs);
+        Assert.DoesNotContain("\"layout\":", textJs);
+        Assert.DoesNotContain("\"layoutOverrides\":", textJs);
+        Assert.Contains("\"profiles\":", textJs);
+        Assert.Contains("getSearchIndex", textJs);
+        Assert.Contains("ensureSlideRendered", textJs);
+
+        // 1b. Root DATA.profiles deduplicates global profile overrides, static spec fields, & CaseGroup target inheritance
+        Assert.True((await setLayout.HandleAsync(new SetLayoutPropertyCommand("mcq", "optionColumns", "2"))).IsSuccess);
+        var dedupRes = await apply.HandleAsync(new ApplySpecCommand(null, null, """
+            {
+              "kind": "quiz",
+              "quizType": "mixed",
+              "name": "Dedup Check",
+              "questions": [
+                {
+                  "type": "mcq",
+                  "text": "Q1?",
+                  "options": [
+                    { "text": "A", "isCorrect": true },
+                    { "text": "B", "isCorrect": false }
+                  ]
+                },
+                {
+                  "type": "mcq",
+                  "text": "Q2?",
+                  "layoutOverrides": { "cardMaxWidthPx": "720" },
+                  "options": [
+                    { "text": "C", "isCorrect": true },
+                    { "text": "D", "isCorrect": false }
+                  ]
+                },
+                {
+                  "type": "assertion-reason",
+                  "assertion": "Statement one.",
+                  "reason": "Statement two.",
+                  "answer": "both-explain"
+                },
+                {
+                  "type": "diff",
+                  "mode": "spot-wrong",
+                  "title": "Plain Title",
+                  "headers": ["Col A", "Col B"],
+                  "rows": [["Same", "~~Bad~~ -> Good"]]
+                },
+                {
+                  "type": "case",
+                  "title": "Case Inheritance",
+                  "stem": "Clinical scenario.",
+                  "layoutOverrides": { "cardMaxWidthPx": "760" },
+                  "questions": [
+                    {
+                      "type": "flashcard",
+                      "front": { "text": "Sub front" },
+                      "back": { "text": "Sub back" }
+                    },
+                    {
+                      "type": "mcq",
+                      "text": "Sub MCQ?",
+                      "options": [
+                        { "text": "Yes", "isCorrect": true },
+                        { "text": "No", "isCorrect": false }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+            """, _fx.WorkDir));
+        Assert.True(dedupRes.IsSuccess, dedupRes.Error?.Description);
+        var dedupApplied = dedupRes.Value;
+        var dedupWeb = Path.Combine(_fx.TempRoot, "web_dedup");
+        var dedupBuilt = await build.HandleAsync(new BuildWebAppCommand(dedupApplied.TargetId, dedupWeb, StaticVerifyOnly: true));
+        Assert.True(dedupBuilt.IsSuccess && dedupBuilt.Value.Verify?.Passed == true);
+        var dedupJs = await File.ReadAllTextAsync(Path.Combine(dedupWeb, "app.js"));
+        Assert.Contains("\"optionColumns\":\"2\"", dedupJs);
+        Assert.Single(System.Text.RegularExpressions.Regex.Matches(dedupJs, "\"optionColumns\":\"2\""));
+        Assert.Contains("\"layoutOverrides\":{\"cardMaxWidthPx\":\"720\"}", dedupJs);
+        Assert.DoesNotContain("\"options\":[{\"code\":", dedupJs);
+        Assert.DoesNotContain("\"rowsRaw\":", dedupJs);
+        Assert.DoesNotContain("\"alignments\":", dedupJs);
+        Assert.DoesNotContain("\"titleHtml\":", dedupJs);
+        Assert.True((await setLayout.HandleAsync(new SetLayoutPropertyCommand("mcq", "optionColumns", "1"))).IsSuccess);
+
+        // 2. Standalone imageless MCQ quiz
+        var mcqApplied = (await apply.HandleAsync(new ApplySpecCommand(null, null,
+            "---\nkind: quiz\nquizType: mcq\nname: Solo MCQ\n---\n\n:::mcq\n2 + 2 = ?\n- [x] 4\n- [ ] 5\n:::\n", _fx.WorkDir))).Value;
+        var mcqWeb = Path.Combine(_fx.TempRoot, "web_solo_mcq");
+        var mcqBuilt = await build.HandleAsync(new BuildWebAppCommand(mcqApplied.TargetId, mcqWeb, StaticVerifyOnly: true));
+        Assert.True(mcqBuilt.IsSuccess && mcqBuilt.Value.Verify?.Passed == true);
+
+        Assert.True(File.Exists(Path.Combine(mcqWeb, "components", "aux", "graded-core.css")));
+        Assert.True(File.Exists(Path.Combine(mcqWeb, "components", "aux", "graded-core.js")));
+        Assert.True(File.Exists(Path.Combine(mcqWeb, "components", "questions", "choice-grid.css")));
+        Assert.True(File.Exists(Path.Combine(mcqWeb, "components", "questions", "mcq.js")));
+        Assert.False(Directory.Exists(Path.Combine(mcqWeb, "components", "blocks")));
+        Assert.False(File.Exists(Path.Combine(mcqWeb, "components", "aux", "media-zoom.js")));
+        Assert.False(File.Exists(Path.Combine(mcqWeb, "components", "aux", "quiz-bundle.js")));
+        Assert.False(File.Exists(Path.Combine(mcqWeb, "components", "questions", "flashcard.js")));
+        Assert.False(File.Exists(Path.Combine(mcqWeb, "preview-index.json")));
+        Assert.False(File.Exists(Path.Combine(mcqWeb, "preview-index.js")));
+
+        // 3. Transitive case dependencies (Set3 case hosting Set1 mcq + Set2 fill-blank)
+        var caseApplied = (await apply.HandleAsync(new ApplySpecCommand(null, null, """
+            ---
+            kind: quiz
+            quizType: mixed
+            name: Case Transitive Check
+            ---
+
+            :::case{title="Clinical Vignette"}
+            A patient presents with acute dyspnea.
+
+            ::::mcq
+            First-line bedside imaging?
+            - [x] Chest radiograph
+            - [ ] MRI brain
+            ::::
+
+            ::::fill-blank
+            Normal arterial pH is approximately {{7.40}}.
+            ::::
+            :::
+            """, _fx.WorkDir))).Value;
+        var caseWeb = Path.Combine(_fx.TempRoot, "web_case_transitive");
+        var caseBuilt = await build.HandleAsync(new BuildWebAppCommand(caseApplied.TargetId, caseWeb, StaticVerifyOnly: true));
+        Assert.True(caseBuilt.IsSuccess && caseBuilt.Value.Verify?.Passed == true);
+
+        Assert.True(File.Exists(Path.Combine(caseWeb, "components", "questions", "case.css")));
+        Assert.True(File.Exists(Path.Combine(caseWeb, "components", "questions", "case.js")));
+        Assert.True(File.Exists(Path.Combine(caseWeb, "components", "questions", "mcq.js")));
+        Assert.True(File.Exists(Path.Combine(caseWeb, "components", "questions", "choice-grid.css")));
+        Assert.True(File.Exists(Path.Combine(caseWeb, "components", "questions", "fill-blank.css")));
+        Assert.True(File.Exists(Path.Combine(caseWeb, "components", "questions", "fill-blank.js")));
+        Assert.True(File.Exists(Path.Combine(caseWeb, "components", "questions", "recall-utils.js")));
+        Assert.True(File.Exists(Path.Combine(caseWeb, "components", "questions", "blank-input.css")));
+        Assert.True(File.Exists(Path.Combine(caseWeb, "components", "aux", "graded-core.css")));
+        Assert.True(File.Exists(Path.Combine(caseWeb, "components", "aux", "graded-core.js")));
+
+        Assert.False(File.Exists(Path.Combine(caseWeb, "components", "questions", "relabel.js")));
+        Assert.False(File.Exists(Path.Combine(caseWeb, "components", "questions", "diff.js")));
+        Assert.False(File.Exists(Path.Combine(caseWeb, "components", "questions", "mechanism.js")));
+        Assert.False(File.Exists(Path.Combine(caseWeb, "components", "questions", "flashcard.js")));
+        Assert.False(File.Exists(Path.Combine(caseWeb, "components", "aux", "media-zoom.js")));
+
+        // 4. Stale file cleanup on rebuild into the same output directory
+        var heavyDir = _fx.SubDir("heavy_src");
+        await TestAssets.WritePngAsync(Path.Combine(heavyDir, "organ.png"));
+        var heavyMdPath = Path.Combine(heavyDir, "heavy.md");
+        await File.WriteAllTextAsync(heavyMdPath, """
+            ---
+            kind: quiz
+            quizType: mixed
+            name: Heavy Math + Relabel
+            ---
+
+            :::relabel{image="organ.png"}
+            prompt: Identify $\alpha$ structure:
+            boxes:
+              - label: "Cortex"
+                rect: [0.1, 0.1, 0.3, 0.3]
+            :::
+            """);
+        var heavyApplied = (await apply.HandleAsync(new ApplySpecCommand(null, heavyMdPath, WorkingDirectory: _fx.WorkDir))).Value;
+        var reuseWeb = Path.Combine(_fx.TempRoot, "web_reuse");
+
+        var firstBuild = await build.HandleAsync(new BuildWebAppCommand(heavyApplied.TargetId, reuseWeb, StaticVerifyOnly: true));
+        Assert.True(firstBuild.IsSuccess && firstBuild.Value.Verify?.Passed == true);
+        Assert.True(File.Exists(Path.Combine(reuseWeb, "katex", "katex.min.js")));
+        Assert.True(File.Exists(Path.Combine(reuseWeb, "katex", "fonts", "KaTeX_Main-Regular.woff2")));
+        Assert.False(File.Exists(Path.Combine(reuseWeb, "katex", "fonts", "KaTeX_Fraktur-Regular.woff2")));
+        Assert.False(File.Exists(Path.Combine(reuseWeb, "katex", "fonts", "KaTeX_AMS-Regular.woff2")));
+        Assert.True(File.Exists(Path.Combine(reuseWeb, "components", "questions", "relabel.js")));
+
+        // Drop a stale file into reuseWeb/assets and reports/verify.latest.json, then rebuild with text-only session
+        await TestAssets.WritePngAsync(Path.Combine(reuseWeb, "assets", "stale_orphan.png"));
+        Directory.CreateDirectory(Path.Combine(reuseWeb, "reports"));
+        var sentinelReport = Path.Combine(reuseWeb, "reports", "keep_me.json");
+        await File.WriteAllTextAsync(sentinelReport, "{}");
+
+        var secondBuild = await build.HandleAsync(new BuildWebAppCommand(textApplied.TargetId, reuseWeb, StaticVerifyOnly: true));
+        Assert.True(secondBuild.IsSuccess && secondBuild.Value.Verify?.Passed == true);
+        Assert.False(Directory.Exists(Path.Combine(reuseWeb, "katex")));
+        Assert.False(Directory.Exists(Path.Combine(reuseWeb, "components", "questions")));
+        Assert.False(File.Exists(Path.Combine(reuseWeb, "assets", "stale_orphan.png")));
+        Assert.True(File.Exists(sentinelReport));
+
+        // 5. Selective KaTeX font families (\mathfrak + \mathbb) copied only when used, and pruned when removed
+        var fancyMathApplied = (await apply.HandleAsync(new ApplySpecCommand(null, null,
+            "---\ntitle: Fancy Math\n---\n\nLie algebra $\\mathfrak{g} \\subset \\mathbb{R}^n$.\n", _fx.WorkDir))).Value;
+        var fancyWeb = Path.Combine(_fx.TempRoot, "web_fancy_math");
+        Assert.True((await build.HandleAsync(new BuildWebAppCommand(fancyMathApplied.TargetId, fancyWeb, StaticVerifyOnly: true))).IsSuccess);
+        Assert.True(File.Exists(Path.Combine(fancyWeb, "katex", "fonts", "KaTeX_Fraktur-Regular.woff2")));
+        Assert.True(File.Exists(Path.Combine(fancyWeb, "katex", "fonts", "KaTeX_AMS-Regular.woff2")));
+        Assert.False(File.Exists(Path.Combine(fancyWeb, "katex", "fonts", "KaTeX_Script-Regular.woff2")));
+
+        // Rebuild plain math into fancyWeb -> Fraktur & AMS fonts pruned
+        Assert.True((await build.HandleAsync(new BuildWebAppCommand(heavyApplied.TargetId, fancyWeb, StaticVerifyOnly: true))).IsSuccess);
+        Assert.True(File.Exists(Path.Combine(fancyWeb, "katex", "fonts", "KaTeX_Main-Regular.woff2")));
+        Assert.False(File.Exists(Path.Combine(fancyWeb, "katex", "fonts", "KaTeX_Fraktur-Regular.woff2")));
+        Assert.False(File.Exists(Path.Combine(fancyWeb, "katex", "fonts", "KaTeX_AMS-Regular.woff2")));
     }
 }

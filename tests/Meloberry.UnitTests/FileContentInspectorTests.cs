@@ -73,4 +73,25 @@ public sealed class FileContentInspectorTests : IDisposable
         Assert.Equal(ErrorType.Validation, res.Error!.Type);
         Assert.Equal("File.UnsupportedFormat", res.Error.Code);
     }
+
+    [Fact]
+    public async Task StreamingCopyAndHeaderOnlyVerify_HandleLargeRasterAssets()
+    {
+        var largePng = Path.Combine(_tempDir, "large_diagram.png");
+        var payload = new byte[256 * 1024];
+        byte[] pngSig = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        pngSig.CopyTo(payload, 0);
+        for (int i = 8; i < payload.Length; i++)
+            payload[i] = (byte)(i & 0xFF);
+        await File.WriteAllBytesAsync(largePng, payload);
+
+        var ws = Path.Combine(_tempDir, "ws_large");
+        var resolved = await _inspector.ResolveInputAsync(ContentInputMethod.Path, largePng, ws, requireImageOnly: true);
+        Assert.True(resolved.IsSuccess);
+        Assert.Equal(ResolvedContentKind.Image, resolved.Value.Kind);
+        Assert.EndsWith(".png", resolved.Value.RelativeAssetPath);
+
+        var verify = await _inspector.VerifyStoredAssetAsync(ws, resolved.Value.RelativeAssetPath!);
+        Assert.True(verify.IsSuccess);
+    }
 }

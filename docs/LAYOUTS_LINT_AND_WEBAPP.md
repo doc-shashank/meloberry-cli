@@ -87,7 +87,7 @@ Three global profiles (`article`, `mcq`, `flashcard`) persist in `<app-data>/app
 
 ## Generated WebApp, Search & Headless Verification
 
-`build` emits `index.html`, `styles.css`, `app.js`, `assets/`, and offline `katex/` assets whenever math is detected (including captions, callouts, table titles/headers/cells/footnotes, blank answers, and spot-error corrections).
+`build` emits `index.html`, `styles.css` (active theme only), `app.js`, tree-shaken `components/{aux,blocks,questions}/` modules for only the block/question specs used by the workspace, `assets/`, `preview-index.{json,js}` (for sessions), and offline `katex/` assets whenever math is detected (including captions, callouts, table titles/headers/cells/footnotes, blank answers, and spot-error corrections).
 - **Articles:** Render semantic `<figure>/<figcaption>` pairs, `pearl`/`clinical`/`warning` callout cards, interactive study tables (`stickyFirstCol`, `hideableCols` blur/peek recall toggles), and native `mby://` link cards / cross-article navigation.
 - **Interactive Recall & Quizzes:** Supports MCQ, 3D flashcards, `fill-blank` (custom `placeholder`, case/whitespace/Greek normalization, Levenshtein fuzzy tolerance, and `"Override: Mark Correct"`), `assertion-reason`, `spot-error` (optional prompt `image`, tappable chips, optional `requireFix` input with `Enter` submit, and `"No error"` toggle), `diff` (`fill` with optional word bank, `spot-wrong`, `rearrange`), `mechanism` (parallel `orderGroup` sequencing + decoys), and `relabel` (`reveal`, `bank`, `recall` occlusion over an unmasked diagram).
 - **Search & Telemetry:** Client-side `Ctrl+K` / `/` full-text search indexes all article blocks, tables, and quiz questions.

@@ -186,6 +186,29 @@ public sealed class AddressPatchAndLintTests : IDisposable
             """;
         Assert.True((await batch.HandleAsync(new BatchOperationsCommand(InlineJson: rmPrevBatch))).IsSuccess);
 
+        // Batch rollback restores pre-existing assets, deletes newly added assets, and undoes full workspace rm
+        var preExistingAssets = Directory.GetFiles(Path.Combine(applied.StorageDirectory, "assets"))
+            .Select(Path.GetFileName)
+            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var rollbackAppendSpec = await WriteTempJsonAsync(srcDir, "rollback_append.json", """{"blocks":[{"kind":"image","imagePath":"orphan.png"}]}""");
+        var rollbackAssetsAndRmBatch = $$"""
+            [
+              { "op": "patch", "addr": "{{wsId}}#b-one", "set": ["text=Mutated inside failing batch"] },
+              { "op": "apply", "addr": "{{wsId}}#c1", "file": "{{rollbackAppendSpec.Replace("\\", "\\\\")}}" },
+              { "op": "rm", "addr": "{{wsId}}" },
+              { "op": "patch", "addr": "{{wsId}}", "set": [123] }
+            ]
+            """;
+        Assert.Equal("Batch.InvalidOp", (await batch.HandleAsync(new BatchOperationsCommand(InlineJson: rollbackAssetsAndRmBatch))).Error!.Code);
+        Assert.True(Directory.Exists(applied.StorageDirectory));
+        Assert.Equal("First block", (await resolver.ResolveAsync($"{wsId}#b-one")).Value.ArticleBlock!.TextContent);
+        var postRollbackAssets = Directory.GetFiles(Path.Combine(applied.StorageDirectory, "assets"))
+            .Select(Path.GetFileName)
+            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        Assert.Equal(preExistingAssets, postRollbackAssets);
+
         // Domain UpdateImage / SetSideImage blank-path validation
         var imgBlock = ArticleBlock.CreateImage("ArtComp_1", "Component_1", "assets/fig1.png");
         Assert.Equal("ArticleBlock.EmptyImagePath", imgBlock.UpdateImage("  ").Error!.Code);

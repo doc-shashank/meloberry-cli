@@ -1,6 +1,7 @@
 using Meloberry.Application;
 using Meloberry.Application.Abstractions;
 using Meloberry.Cli.Abstractions;
+using Meloberry.Cli.Commands;
 using Meloberry.Cli.GuiEditor;
 using Meloberry.Cli.Parsing;
 using Meloberry.Infrastructure;
@@ -17,10 +18,26 @@ public static class CliServiceRegistration
         services.AddSingleton<ILocalPreviewHost, LocalPreviewHost>();
         services.AddSingleton<CommandDispatcher>();
 
-        foreach (var cmdType in typeof(CliServiceRegistration).Assembly.GetTypes()
-            .Where(t => !t.IsAbstract && typeof(CliCommand).IsAssignableFrom(t)))
+        CliCommand[] commands =
+        [
+            new ApplyCliCommand(),
+            new PatchCliCommand(),
+            new BatchCliCommand(),
+            new RmCliCommand(),
+            new BuildCliCommand(),
+            new PkgCliCommand(),
+            new LayoutCliCommand(),
+            new AnalyzeCliCommand(),
+            new PrimeCliCommand(),
+            new SpecCliCommand(),
+            new GetCliCommand(),
+            new LsCliCommand(),
+            new CheckCliCommand(),
+            new VersionCliCommand()
+        ];
+
+        foreach (var cmd in commands)
         {
-            var cmd = (CliCommand)Activator.CreateInstance(cmdType)!;
             services.AddSingleton(cmd);
             services.AddScoped(cmd.Descriptor.HandlerType);
         }

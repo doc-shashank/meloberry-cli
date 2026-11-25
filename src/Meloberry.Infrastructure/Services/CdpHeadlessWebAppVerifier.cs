@@ -5,14 +5,17 @@ using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Meloberry.Application.Abstractions;
 using Meloberry.Domain.Common;
 using Meloberry.Infrastructure.Web;
 
 namespace Meloberry.Infrastructure.Services;
 
-public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
+public sealed partial class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
 {
+    [GeneratedRegex(@"(?:<link\b[^>]*\bhref|<script\b[^>]*\bsrc)\s*=\s*[""'](?<path>[^""']+)[""']", RegexOptions.IgnoreCase | RegexOptions.Compiled)]
+    private static partial Regex HtmlLocalAssetRegex();
     private static readonly JsonSerializerOptions ReportJsonOptions = new()
     {
         WriteIndented = true,
@@ -202,12 +205,22 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
             return (0, 0);
         }
 
-        if (html.Contains("katex/katex.min.css", StringComparison.OrdinalIgnoreCase))
+        foreach (Match m in HtmlLocalAssetRegex().Matches(html))
         {
-            if (!File.Exists(Path.Combine(fullDir, "katex", "katex.min.css")))
-                brokenAssets.Add("Missing katex/katex.min.css referenced by index.html");
-            if (!File.Exists(Path.Combine(fullDir, "katex", "katex.min.js")))
-                brokenAssets.Add("Missing katex/katex.min.js referenced by index.html");
+            var refPath = m.Groups["path"].Value.Trim();
+            if (string.IsNullOrWhiteSpace(refPath) ||
+                refPath.StartsWith("data:", StringComparison.OrdinalIgnoreCase) ||
+                refPath.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+                refPath.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var cleanPath = refPath.Split('?', '#')[0];
+            if (!PathConfinement.TryResolveInside(fullDir, cleanPath, out var localFile) ||
+                !File.Exists(localFile) ||
+                new FileInfo(localFile).Length == 0)
+            {
+                brokenAssets.Add($"Missing or empty asset referenced in index.html: '{refPath}'");
+            }
         }
 
         var appJs = await File.ReadAllTextAsync(appJsPath, ct);
@@ -220,15 +233,14 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
         }
 
         start += marker.Length;
-        int endLine = appJs.IndexOf(";\n", start, StringComparison.Ordinal);
-        if (endLine < 0) endLine = appJs.IndexOf(";\r\n", start, StringComparison.Ordinal);
-        if (endLine < 0)
+        int endObj = FindJsonObjectEnd(appJs, start);
+        if (endObj < 0)
         {
             consoleErrors.Add("Unable to locate end of DATA JSON payload in app.js");
             return (0, 0);
         }
 
-        var jsonSlice = appJs[start..endLine];
+        var jsonSlice = appJs[start..(endObj + 1)];
         int slideCount = 0;
         int imgCount = 0;
         try
@@ -256,6 +268,36 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
         }
 
         return (slideCount, imgCount);
+    }
+
+    private static int FindJsonObjectEnd(string text, int startIdx)
+    {
+        int i = startIdx;
+        while (i < text.Length && char.IsWhiteSpace(text[i])) i++;
+        if (i >= text.Length || text[i] != '{') return -1;
+
+        int depth = 0;
+        bool inString = false;
+        bool escaped = false;
+        for (; i < text.Length; i++)
+        {
+            char c = text[i];
+            if (inString)
+            {
+                if (escaped) { escaped = false; continue; }
+                if (c == '\\') { escaped = true; continue; }
+                if (c == '"') inString = false;
+                continue;
+            }
+            if (c == '"') { inString = true; continue; }
+            if (c == '{') depth++;
+            else if (c == '}')
+            {
+                depth--;
+                if (depth == 0) return i;
+            }
+        }
+        return -1;
     }
 
     private static void CollectImagePathsRecursive(JsonElement element, Action<string> onImagePath)
@@ -326,7 +368,7 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
 
                     try
                     {
-                        var msgJson = Encoding.UTF8.GetString(ms.ToArray());
+                        var msgJson = Encoding.UTF8.GetString(ms.GetBuffer().AsSpan(0, (int)ms.Length));
                         using var doc = JsonDocument.Parse(msgJson);
                         var root = doc.RootElement.Clone();
 
@@ -497,6 +539,7 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
         const string verifyScript = """
             (async () => {
               const sleep = ms => new Promise(r => setTimeout(r, ms));
+              const settle = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
               const out = { slidesChecked: 0, imagesChecked: 0, brokenAssets: [], overflowIssues: [], katexErrors: [], consoleErrors: [] };
               if (typeof DATA !== 'object' || !Array.isArray(DATA.slides)) {
                 out.consoleErrors.push('DATA.slides not found on page.');
@@ -511,7 +554,7 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
               document.head.appendChild(verifyStyle);
 
               startBtn.click();
-              await sleep(100);
+              await settle();
 
               const imgsSeen = new Set();
               const isHorizontallyScrollable = el => {
@@ -611,7 +654,7 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
                 const diagSpots = card?.querySelectorAll('.mby-diagram-hotspot') || [];
                 if (diagSpots.length > 0) {
                   diagSpots[0].click();
-                  await sleep(25);
+                  await settle();
                   checkCardOverflow(card, sIdx, `${qLabel} (Diagram Card)`);
                   const diagKErrs = scopeEl.querySelectorAll('.katex-error');
                   if (diagKErrs.length > 0)
@@ -622,7 +665,7 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
                 const revBtns = card?.querySelectorAll('.mby-reveal-unlock-btn') || [];
                 if (revBtns.length > 0) {
                   revBtns[0].click();
-                  await sleep(25);
+                  await settle();
                   checkCardOverflow(card, sIdx, `${qLabel} (Reveal)`);
                 }
 
@@ -630,24 +673,24 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
                 const mechChips = card?.querySelectorAll('.mby-mech-chip, .mby-classify-chip, .mby-match-chip') || [];
                 if (mechChips.length > 0) {
                   mechChips[0].click();
-                  await sleep(20);
+                  await settle();
                 }
                 const clsBucket = card?.querySelector('.mby-classify-bucket');
-                if (clsBucket) { clsBucket.click(); await sleep(15); }
+                if (clsBucket) { clsBucket.click(); await settle(); }
                 const matchSlot = card?.querySelector('.mby-match-slot');
-                if (matchSlot) { matchSlot.click(); await sleep(15); }
+                if (matchSlot) { matchSlot.click(); await settle(); }
                 const numIn = card?.querySelector('.mby-numeric-input');
                 if (numIn) {
                   numIn.value = '10';
                   numIn.dispatchEvent(new Event('input', { bubbles: true }));
-                  await sleep(15);
+                  await settle();
                 }
 
                 // Exercise interactive relabel mask overlay clicks to verify zero runtime console errors
                 const maskBoxes = card?.querySelectorAll('.mby-mask-box') || [];
                 if (maskBoxes.length > 0) {
                   maskBoxes[0].click();
-                  await sleep(20);
+                  await settle();
                 }
 
                 // Exercise Case-Group sub-question tabs if present
@@ -655,12 +698,12 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
                 if (caseTabs.length > 0) {
                   for (let ctIdx = 0; ctIdx < caseTabs.length; ctIdx++) {
                     caseTabs[ctIdx].click();
-                    await sleep(25);
+                    await settle();
                     checkCardOverflow(card, sIdx, `${qLabel} (Case Part ${ctIdx + 1})`);
                     const subCheck = card?.querySelector('.mby-case-subhost .mby-check-btn');
                     if (subCheck) {
                       subCheck.click();
-                      await sleep(25);
+                      await settle();
                       checkCardOverflow(card, sIdx, `${qLabel} (Case Part ${ctIdx + 1} Checked)`);
                     }
                     const subKErrs = scopeEl.querySelectorAll('.katex-error');
@@ -672,7 +715,7 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
                   const checkBtn = card?.querySelector('.mby-check-btn');
                   if (checkBtn) {
                     checkBtn.click();
-                    await sleep(30);
+                    await settle();
                     checkCardOverflow(card, sIdx, `${qLabel} (Checked)`);
                     const postKErrors = scopeEl.querySelectorAll('.katex-error');
                     if (postKErrors.length > 0)
@@ -684,9 +727,9 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
                 const tblBtns = card?.querySelectorAll('.mby-th-hideable, .mby-table-toggle-btn') || [];
                 for (const tb of tblBtns) {
                   tb.click();
-                  await sleep(15);
+                  await settle();
                   tb.click();
-                  await sleep(15);
+                  await settle();
                 }
 
                 // Flip flashcards to verify back-face layout as well
@@ -696,9 +739,9 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
                     card.click();
                     const deadline = Date.now() + 1200;
                     while (Date.now() < deadline && (card.classList.contains('is-flipping') || !backFace.classList.contains('is-active'))) {
-                      await sleep(30);
+                      await sleep(20);
                     }
-                    await sleep(20);
+                    await settle();
                     checkCardOverflow(card, sIdx, `${qLabel} (Back)`);
                   }
                 }
@@ -706,14 +749,14 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
 
               for (let i = 0; i < DATA.slides.length; i++) {
                 if (typeof goToSlide === 'function') goToSlide(i);
-                await sleep(60);
+                await settle();
                 out.slidesChecked += 1;
                 const slide = DATA.slides[i];
                 if (slide?.kind === 'quiz' && Array.isArray(slide.questions) && slide.questions.length > 0) {
                   const pills = document.getElementById('slidesTrack')?.children?.[i]?.querySelectorAll('.mby-q-pill') || [];
                   for (let q = 0; q < pills.length; q++) {
                     pills[q].click();
-                    await sleep(45);
+                    await settle();
                     await checkSlide(i, q, ` Q${q + 1}`);
                   }
                 } else {
@@ -727,12 +770,12 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
               const searchInput = document.getElementById('searchInput');
               if (searchBtn && searchModal && searchInput) {
                 searchBtn.click();
-                await sleep(40);
+                await settle();
                 if (searchModal.classList.contains('hidden'))
                   out.consoleErrors.push('Search modal failed to open on button click.');
                 searchInput.value = 'a';
                 searchInput.dispatchEvent(new Event('input', { bubbles: true }));
-                await sleep(40);
+                await settle();
                 document.getElementById('searchCloseBtn')?.click();
               } else {
                 out.consoleErrors.push('Search UI elements missing.');
@@ -949,9 +992,17 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
 
                 var ext = Path.GetExtension(filePath);
                 ctx.Response.ContentType = WebHostUtilities.GetMimeType(ext);
-                var bytes = await File.ReadAllBytesAsync(filePath, ct);
-                ctx.Response.ContentLength64 = bytes.Length;
-                await ctx.Response.OutputStream.WriteAsync(bytes, ct);
+                if (relPath.StartsWith("assets/", StringComparison.OrdinalIgnoreCase) ||
+                    relPath.StartsWith("katex/fonts/", StringComparison.OrdinalIgnoreCase))
+                {
+                    ctx.Response.AddHeader("Cache-Control", "public, max-age=31536000, immutable");
+                }
+                await using var fs = new FileStream(
+                    filePath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                    bufferSize: 81920, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                ctx.Response.ContentLength64 = fs.Length;
+                if (fs.Length > 0)
+                    await fs.CopyToAsync(ctx.Response.OutputStream, 81920, ct);
                 ctx.Response.Close();
             }
             catch

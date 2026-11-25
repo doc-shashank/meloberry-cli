@@ -32,7 +32,15 @@ public sealed class ChainTransactionManager(MeloberryStorageOptions options) : I
         if (string.IsNullOrWhiteSpace(storageDirectory))
             return;
 
-        _current.Value?.TrackDirectory(storageDirectory);
+        _current.Value?.TrackWorkspaceMutation(storageDirectory);
+    }
+
+    internal void NotifyWorkspaceDeleting(string storageDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(storageDirectory))
+            return;
+
+        _current.Value?.TrackWorkspaceDeletion(storageDirectory);
     }
 
     internal void NotifyOutputDirectoryMutating(string outputDirectory)
@@ -88,7 +96,34 @@ public sealed class ChainTransactionManager(MeloberryStorageOptions options) : I
             }
         }
 
-        foreach (var ws in active.GetTrackedDirectoriesSnapshot())
+        foreach (var dir in active.GetTrackedDirectoriesSnapshot())
+        {
+            if (!dir.Existed)
+            {
+                TryDeleteDirectory(dir.FullDirectory);
+                continue;
+            }
+
+            Directory.CreateDirectory(dir.FullDirectory);
+            ClearDirectoryContents(dir.FullDirectory);
+            if (!string.IsNullOrWhiteSpace(dir.BackupDirectory) && Directory.Exists(dir.BackupDirectory))
+                CopyDirectoryContents(dir.BackupDirectory, dir.FullDirectory);
+        }
+
+        foreach (var delWs in active.GetDeletedWorkspacesSnapshot())
+        {
+            if (!string.IsNullOrWhiteSpace(delWs.MovedBackupDirectory) && Directory.Exists(delWs.MovedBackupDirectory))
+            {
+                if (Directory.Exists(delWs.FullDirectory))
+                    TryDeleteDirectory(delWs.FullDirectory);
+                var parentDir = Path.GetDirectoryName(delWs.FullDirectory);
+                if (!string.IsNullOrWhiteSpace(parentDir))
+                    Directory.CreateDirectory(parentDir);
+                MoveDirectoryAcrossVolumesSafe(delWs.MovedBackupDirectory, delWs.FullDirectory);
+            }
+        }
+
+        foreach (var ws in active.GetMutatedWorkspacesSnapshot())
         {
             if (!ws.Existed)
             {
@@ -97,9 +132,27 @@ public sealed class ChainTransactionManager(MeloberryStorageOptions options) : I
             }
 
             Directory.CreateDirectory(ws.FullDirectory);
-            ClearDirectoryContents(ws.FullDirectory);
-            if (!string.IsNullOrWhiteSpace(ws.BackupDirectory) && Directory.Exists(ws.BackupDirectory))
-                CopyDirectoryContents(ws.BackupDirectory, ws.FullDirectory);
+            if (!string.IsNullOrWhiteSpace(ws.DbPath))
+            {
+                DeleteSqliteSidecars(ws.DbPath);
+                if (ws.DbExisted && !string.IsNullOrWhiteSpace(ws.DbBackupPath) && File.Exists(ws.DbBackupPath))
+                    File.Copy(ws.DbBackupPath, ws.DbPath, overwrite: true);
+                else if (!ws.DbExisted)
+                    TryDeleteFile(ws.DbPath);
+            }
+
+            var assetsDir = Path.Combine(ws.FullDirectory, "assets");
+            if (Directory.Exists(assetsDir))
+            {
+                foreach (var assetFile in Directory.EnumerateFiles(assetsDir))
+                {
+                    var fileName = Path.GetFileName(assetFile);
+                    if (ws.ExistingAssetNames is null || !ws.ExistingAssetNames.Contains(fileName))
+                        TryDeleteFile(assetFile);
+                }
+                if (!ws.AssetsDirExisted && Directory.GetFileSystemEntries(assetsDir).Length == 0)
+                    TryDeleteDirectory(assetsDir);
+            }
         }
 
         DeleteSqliteSidecars(options.AppSettingsDbPath);
@@ -116,6 +169,19 @@ public sealed class ChainTransactionManager(MeloberryStorageOptions options) : I
         }
 
         TryDeleteDirectory(active.TxRoot);
+    }
+
+    private static void MoveDirectoryAcrossVolumesSafe(string sourceDir, string destinationDir)
+    {
+        try
+        {
+            Directory.Move(sourceDir, destinationDir);
+        }
+        catch (IOException)
+        {
+            CopyDirectoryContents(sourceDir, destinationDir);
+            TryDeleteDirectory(sourceDir);
+        }
     }
 
     private static void DeleteSqliteSidecars(string dbPath)
@@ -168,18 +234,96 @@ public sealed class ChainTransactionManager(MeloberryStorageOptions options) : I
 
     private sealed record TrackedDirectory(string FullDirectory, bool Existed, string? BackupDirectory);
     private sealed record TrackedFile(string FullPath, bool Existed, string? BackupPath);
+    private sealed record TrackedWorkspaceMutation(
+        string FullDirectory,
+        bool Existed,
+        string? DbPath,
+        bool DbExisted,
+        string? DbBackupPath,
+        bool AssetsDirExisted,
+        HashSet<string>? ExistingAssetNames);
+    private sealed record TrackedWorkspaceDeletion(string FullDirectory, string? MovedBackupDirectory);
 
     private sealed class ActiveChainTransaction(string txRoot, bool appSettingsExisted, string? appSettingsBackupPath)
     {
         private readonly object _gate = new();
         private readonly Dictionary<string, TrackedDirectory> _trackedDirs = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, TrackedFile> _trackedFiles = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, TrackedWorkspaceMutation> _mutatedWorkspaces = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, TrackedWorkspaceDeletion> _deletedWorkspaces = new(StringComparer.OrdinalIgnoreCase);
 
         public string TxRoot { get; } = txRoot;
         public bool AppSettingsExisted { get; } = appSettingsExisted;
         public string? AppSettingsBackupPath { get; } = appSettingsBackupPath;
         public bool Committed { get; set; }
         public bool RolledBack { get; set; }
+
+        public void TrackWorkspaceMutation(string directory)
+        {
+            var fullDir = Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            lock (_gate)
+            {
+                if (_mutatedWorkspaces.ContainsKey(fullDir))
+                    return;
+
+                if (!Directory.Exists(fullDir))
+                {
+                    _mutatedWorkspaces[fullDir] = new TrackedWorkspaceMutation(
+                        fullDir, Existed: false, DbPath: null, DbExisted: false, DbBackupPath: null, AssetsDirExisted: false, ExistingAssetNames: null);
+                    return;
+                }
+
+                SqliteConnection.ClearAllPools();
+                var wsId = Path.GetFileName(fullDir);
+                var dbPath = Path.Combine(fullDir, $"{wsId}.db");
+                bool dbExisted = File.Exists(dbPath);
+                string? dbBackupPath = null;
+                if (dbExisted)
+                {
+                    var dbBackupRoot = Path.Combine(TxRoot, "ws_db");
+                    Directory.CreateDirectory(dbBackupRoot);
+                    dbBackupPath = Path.Combine(dbBackupRoot, $"{_mutatedWorkspaces.Count}_{wsId}.db.bak");
+                    File.Copy(dbPath, dbBackupPath, overwrite: true);
+                }
+
+                var assetsDir = Path.Combine(fullDir, "assets");
+                bool assetsDirExisted = Directory.Exists(assetsDir);
+                HashSet<string>? existingAssets = null;
+                if (assetsDirExisted)
+                {
+                    existingAssets = Directory.EnumerateFiles(assetsDir)
+                        .Select(Path.GetFileName)
+                        .Where(n => !string.IsNullOrWhiteSpace(n))
+                        .ToHashSet(StringComparer.OrdinalIgnoreCase)!;
+                }
+
+                _mutatedWorkspaces[fullDir] = new TrackedWorkspaceMutation(
+                    fullDir, Existed: true, dbPath, dbExisted, dbBackupPath, assetsDirExisted, existingAssets);
+            }
+        }
+
+        public void TrackWorkspaceDeletion(string directory)
+        {
+            var fullDir = Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            lock (_gate)
+            {
+                if (_deletedWorkspaces.ContainsKey(fullDir))
+                    return;
+
+                if (!Directory.Exists(fullDir))
+                {
+                    _deletedWorkspaces[fullDir] = new TrackedWorkspaceDeletion(fullDir, MovedBackupDirectory: null);
+                    return;
+                }
+
+                SqliteConnection.ClearAllPools();
+                var delRoot = Path.Combine(TxRoot, "ws_del");
+                Directory.CreateDirectory(delRoot);
+                var backupDir = Path.Combine(delRoot, _deletedWorkspaces.Count.ToString());
+                MoveDirectoryAcrossVolumesSafe(fullDir, backupDir);
+                _deletedWorkspaces[fullDir] = new TrackedWorkspaceDeletion(fullDir, backupDir);
+            }
+        }
 
         public void TrackDirectory(string directory)
         {
@@ -239,6 +383,22 @@ public sealed class ChainTransactionManager(MeloberryStorageOptions options) : I
             lock (_gate)
             {
                 return [.. _trackedFiles.Values];
+            }
+        }
+
+        public List<TrackedWorkspaceMutation> GetMutatedWorkspacesSnapshot()
+        {
+            lock (_gate)
+            {
+                return [.. _mutatedWorkspaces.Values];
+            }
+        }
+
+        public List<TrackedWorkspaceDeletion> GetDeletedWorkspacesSnapshot()
+        {
+            lock (_gate)
+            {
+                return [.. _deletedWorkspaces.Values];
             }
         }
     }

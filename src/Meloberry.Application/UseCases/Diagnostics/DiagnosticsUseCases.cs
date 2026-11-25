@@ -29,27 +29,28 @@ public sealed class LintHandler(
 
         var entity = resolved.Value;
         var issues = new List<LintIssue>();
+        var verifiedAssets = new Dictionary<string, Result>(StringComparer.OrdinalIgnoreCase);
 
         switch (entity.EntityKind)
         {
             case "session":
-                await LintSessionAsync(entity.Session!, entity.StorageDirectory, issues, cancellationToken);
+                await LintSessionAsync(entity.Session!, entity.StorageDirectory, issues, verifiedAssets, cancellationToken);
                 break;
             case "component":
                 CheckAssetDirectory(entity.StorageDirectory, entity.Component!.Id, issues);
-                await LintComponentAsync(entity.Component!, entity.StorageDirectory, issues, cancellationToken);
+                await LintComponentAsync(entity.Component!, entity.StorageDirectory, issues, verifiedAssets, cancellationToken);
                 break;
             case "articleBlock":
                 CheckAssetDirectory(entity.StorageDirectory, entity.ArticleBlock!.Id, issues);
-                await LintArticleBlockAsync(entity.ArticleBlock!, entity.StorageDirectory, issues, cancellationToken);
+                await LintArticleBlockAsync(entity.ArticleBlock!, entity.StorageDirectory, issues, verifiedAssets, cancellationToken);
                 break;
             case "quiz":
                 CheckAssetDirectory(entity.StorageDirectory, entity.Quiz!.Id, issues);
-                await LintQuizAsync(entity.Quiz!, entity.StorageDirectory, issues, cancellationToken);
+                await LintQuizAsync(entity.Quiz!, entity.StorageDirectory, issues, verifiedAssets, cancellationToken);
                 break;
             case "question":
                 CheckAssetDirectory(entity.StorageDirectory, entity.Question!.Id, issues);
-                await LintQuestionAsync(entity.Question!, entity.StorageDirectory, issues, cancellationToken);
+                await LintQuestionAsync(entity.Question!, entity.StorageDirectory, issues, verifiedAssets, cancellationToken);
                 break;
         }
 
@@ -68,10 +69,11 @@ public sealed class LintHandler(
 
         var entity = resolved.Value;
         var issues = new List<LintIssue>();
+        var verifiedAssets = new Dictionary<string, Result>(StringComparer.OrdinalIgnoreCase);
 
         if (entity.EntityKind == "session" && entity.Session is not null)
         {
-            await LintSessionAsync(entity.Session, entity.StorageDirectory, issues, cancellationToken);
+            await LintSessionAsync(entity.Session, entity.StorageDirectory, issues, verifiedAssets, cancellationToken);
             var report = BuildReport(entity.Session.Id, issues);
             return report.ErrorCount > 0
                 ? FailLint(entity.Session.Id, report)
@@ -81,7 +83,7 @@ public sealed class LintHandler(
         if (entity.EntityKind == "quiz" && entity.Quiz is not null)
         {
             CheckAssetDirectory(entity.StorageDirectory, entity.Quiz.Id, issues);
-            await LintQuizAsync(entity.Quiz, entity.StorageDirectory, issues, cancellationToken);
+            await LintQuizAsync(entity.Quiz, entity.StorageDirectory, issues, verifiedAssets, cancellationToken);
             var report = BuildReport(entity.Quiz.Id, issues);
             return report.ErrorCount > 0
                 ? FailLint(entity.Quiz.Id, report)
@@ -94,19 +96,21 @@ public sealed class LintHandler(
     internal async Task<LintReportResponse> LintSessionInMemoryAsync(StudySession session, string storageDirectory, CancellationToken ct)
     {
         var issues = new List<LintIssue>();
-        await LintSessionAsync(session, storageDirectory, issues, ct);
+        var verifiedAssets = new Dictionary<string, Result>(StringComparer.OrdinalIgnoreCase);
+        await LintSessionAsync(session, storageDirectory, issues, verifiedAssets, ct);
         return BuildReport(session.Id, issues);
     }
 
     internal async Task<LintReportResponse> LintQuizInMemoryAsync(Quiz quiz, string storageDirectory, CancellationToken ct)
     {
         var issues = new List<LintIssue>();
+        var verifiedAssets = new Dictionary<string, Result>(StringComparer.OrdinalIgnoreCase);
         CheckAssetDirectory(storageDirectory, quiz.Id, issues);
-        await LintQuizAsync(quiz, storageDirectory, issues, ct);
+        await LintQuizAsync(quiz, storageDirectory, issues, verifiedAssets, ct);
         return BuildReport(quiz.Id, issues);
     }
 
-    private static Error FailLint(string targetId, LintReportResponse report)
+    internal static Error FailLint(string targetId, LintReportResponse report)
     {
         var summary = string.Join("; ", report.Issues.Where(i => i.Severity == "Error").Select(i => $"[{i.Code}] {i.Message}"));
         return LintErrors.FailedLintCheck(targetId, report.ErrorCount, summary, report);
@@ -125,7 +129,8 @@ public sealed class LintHandler(
             issues.Add(new LintIssue("Error", "Lint.BrokenAssetDirectory", targetId, $"Workspace or assets directory is missing: '{assetsDir}'."));
     }
 
-    private async Task LintSessionAsync(StudySession session, string storageDirectory, List<LintIssue> issues, CancellationToken ct)
+    private async Task LintSessionAsync(
+        StudySession session, string storageDirectory, List<LintIssue> issues, Dictionary<string, Result> verifiedAssets, CancellationToken ct)
     {
         CheckAssetDirectory(storageDirectory, session.Id, issues);
         if (session.Components.Count == 0)
@@ -134,7 +139,7 @@ public sealed class LintHandler(
             return;
         }
         foreach (var component in session.Components)
-            await LintComponentAsync(component, storageDirectory, issues, ct);
+            await LintComponentAsync(component, storageDirectory, issues, verifiedAssets, ct);
 
         await LintSessionNativeLinksAsync(session, issues, ct);
     }
@@ -227,7 +232,8 @@ public sealed class LintHandler(
             (!string.IsNullOrWhiteSpace(a.RefKey) && string.Equals(a.RefKey, target, StringComparison.OrdinalIgnoreCase)) ||
             string.Equals($"c{a.Index}", target, StringComparison.OrdinalIgnoreCase));
 
-    private async Task LintComponentAsync(SessionComponent component, string storageDirectory, List<LintIssue> issues, CancellationToken ct)
+    private async Task LintComponentAsync(
+        SessionComponent component, string storageDirectory, List<LintIssue> issues, Dictionary<string, Result> verifiedAssets, CancellationToken ct)
     {
         if (component.Kind == ComponentKind.Article)
         {
@@ -237,16 +243,16 @@ public sealed class LintHandler(
                 return;
             }
             foreach (var block in component.ArticleBlocks)
-                await LintArticleBlockAsync(block, storageDirectory, issues, ct);
+                await LintArticleBlockAsync(block, storageDirectory, issues, verifiedAssets, ct);
             foreach (var lc in component.LinkCards)
             {
                 if (!string.IsNullOrWhiteSpace(lc.ImagePath))
-                    await CheckImageAssetAsync(storageDirectory, lc.ImagePath, $"{component.Id}:link:{lc.Id}", issues, ct);
+                    await CheckImageAssetAsync(storageDirectory, lc.ImagePath, $"{component.Id}:link:{lc.Id}", issues, verifiedAssets, ct);
             }
         }
         else if (component.Quiz is not null)
         {
-            await LintQuizAsync(component.Quiz, storageDirectory, issues, ct);
+            await LintQuizAsync(component.Quiz, storageDirectory, issues, verifiedAssets, ct);
         }
         else if (component.Kind == ComponentKind.Quiz)
         {
@@ -254,7 +260,8 @@ public sealed class LintHandler(
         }
     }
 
-    private Task LintArticleBlockAsync(ArticleBlock block, string storageDirectory, List<LintIssue> issues, CancellationToken ct)
+    private Task LintArticleBlockAsync(
+        ArticleBlock block, string storageDirectory, List<LintIssue> issues, Dictionary<string, Result> verifiedAssets, CancellationToken ct)
     {
         if (block.Kind == ArticleBlockKind.Text)
         {
@@ -275,17 +282,18 @@ public sealed class LintHandler(
         }
         if (block.Kind == ArticleBlockKind.DiagramExplore)
         {
-            return LintDiagramExploreBlockAsync(block, storageDirectory, issues, ct);
+            return LintDiagramExploreBlockAsync(block, storageDirectory, issues, verifiedAssets, ct);
         }
         if (block.Kind == ArticleBlockKind.Reveal)
         {
             LintRevealBlock(block, issues);
             return Task.CompletedTask;
         }
-        return CheckImageAssetAsync(storageDirectory, block.ImagePath, block.Id, issues, ct);
+        return CheckImageAssetAsync(storageDirectory, block.ImagePath, block.Id, issues, verifiedAssets, ct);
     }
 
-    private async Task LintDiagramExploreBlockAsync(ArticleBlock block, string storageDirectory, List<LintIssue> issues, CancellationToken ct)
+    private async Task LintDiagramExploreBlockAsync(
+        ArticleBlock block, string storageDirectory, List<LintIssue> issues, Dictionary<string, Result> verifiedAssets, CancellationToken ct)
     {
         if (!Phase1PayloadCodec.TryDeserialize<DiagramExplorePayload>(block.PayloadJson, out var p) || p is null)
         {
@@ -293,7 +301,7 @@ public sealed class LintHandler(
             return;
         }
         var imgPath = !string.IsNullOrWhiteSpace(p.ImagePath) ? p.ImagePath : block.ImagePath;
-        await CheckImageAssetAsync(storageDirectory, imgPath, $"{block.Id}:image", issues, ct);
+        await CheckImageAssetAsync(storageDirectory, imgPath, $"{block.Id}:image", issues, verifiedAssets, ct);
         if (p.Hotspots is null || p.Hotspots.Count == 0)
         {
             issues.Add(new LintIssue("Error", "Lint.EmptyDiagramHotspots", block.Id, "Diagram Explorer block must define at least 1 annotated hotspot."));
@@ -386,7 +394,8 @@ public sealed class LintHandler(
         }
     }
 
-    private async Task LintQuizAsync(Quiz quiz, string storageDirectory, List<LintIssue> issues, CancellationToken ct)
+    private async Task LintQuizAsync(
+        Quiz quiz, string storageDirectory, List<LintIssue> issues, Dictionary<string, Result> verifiedAssets, CancellationToken ct)
     {
         if (quiz.Questions.Count == 0)
         {
@@ -404,18 +413,19 @@ public sealed class LintHandler(
                     question.Id,
                     $"Quiz '{quiz.Id}' has type '{quiz.Type.ToString().ToLowerInvariant()}' and cannot contain '{Question.ToWireString(question.Type)}' question."));
             }
-            await LintQuestionAsync(question, storageDirectory, issues, ct);
+            await LintQuestionAsync(question, storageDirectory, issues, verifiedAssets, ct);
         }
     }
 
-    private async Task LintQuestionAsync(Question question, string storageDirectory, List<LintIssue> issues, CancellationToken ct)
+    private async Task LintQuestionAsync(
+        Question question, string storageDirectory, List<LintIssue> issues, Dictionary<string, Result> verifiedAssets, CancellationToken ct)
     {
         if (question is McqQuestion mcq)
         {
             if (string.IsNullOrWhiteSpace(mcq.Text))
                 issues.Add(new LintIssue("Error", "Lint.EmptyQuestionPrompt", mcq.Id, "MCQ prompt text is missing."));
             if (!string.IsNullOrWhiteSpace(mcq.ImagePath))
-                await CheckImageAssetAsync(storageDirectory, mcq.ImagePath, $"{mcq.Id}:prompt", issues, ct);
+                await CheckImageAssetAsync(storageDirectory, mcq.ImagePath, $"{mcq.Id}:prompt", issues, verifiedAssets, ct);
             if (mcq.Options.Count < 2)
                 issues.Add(new LintIssue("Error", "Lint.InsufficientOptions", mcq.Id, $"MCQ has {mcq.Options.Count} populated option(s); at least 2 are required."));
             if (mcq.Options.Count < mcq.MaxOptions)
@@ -432,7 +442,7 @@ public sealed class LintHandler(
                 if (string.IsNullOrWhiteSpace(opt.Text) && string.IsNullOrWhiteSpace(opt.ImagePath))
                     issues.Add(new LintIssue("Error", "Lint.EmptyOption", mcq.Id, $"Option {opt.Index} has neither text nor image."));
                 if (!string.IsNullOrWhiteSpace(opt.ImagePath))
-                    await CheckImageAssetAsync(storageDirectory, opt.ImagePath, $"{mcq.Id}:option-{opt.Index}", issues, ct);
+                    await CheckImageAssetAsync(storageDirectory, opt.ImagePath, $"{mcq.Id}:option-{opt.Index}", issues, verifiedAssets, ct);
             }
         }
         else if (question is FlashcardQuestion card)
@@ -442,13 +452,13 @@ public sealed class LintHandler(
             if (string.IsNullOrWhiteSpace(card.Back.Text) && string.IsNullOrWhiteSpace(card.Back.ImagePath))
                 issues.Add(new LintIssue("Error", "Lint.EmptyFlashcardSide", card.Id, "Flashcard Back has neither text nor image."));
             if (!string.IsNullOrWhiteSpace(card.Front.ImagePath))
-                await CheckImageAssetAsync(storageDirectory, card.Front.ImagePath, $"{card.Id}:front", issues, ct);
+                await CheckImageAssetAsync(storageDirectory, card.Front.ImagePath, $"{card.Id}:front", issues, verifiedAssets, ct);
             if (!string.IsNullOrWhiteSpace(card.Back.ImagePath))
-                await CheckImageAssetAsync(storageDirectory, card.Back.ImagePath, $"{card.Id}:back", issues, ct);
+                await CheckImageAssetAsync(storageDirectory, card.Back.ImagePath, $"{card.Id}:back", issues, verifiedAssets, ct);
         }
         else if (question is PayloadQuestion pq)
         {
-            await LintPayloadQuestionAsync(pq, storageDirectory, issues, ct);
+            await LintPayloadQuestionAsync(pq, storageDirectory, issues, verifiedAssets, ct);
         }
     }
 
@@ -464,7 +474,8 @@ public sealed class LintHandler(
         return false;
     }
 
-    private async Task LintPayloadQuestionAsync(PayloadQuestion pq, string storageDirectory, List<LintIssue> issues, CancellationToken ct)
+    private async Task LintPayloadQuestionAsync(
+        PayloadQuestion pq, string storageDirectory, List<LintIssue> issues, Dictionary<string, Result> verifiedAssets, CancellationToken ct)
     {
         switch (pq.Type)
         {
@@ -548,7 +559,7 @@ public sealed class LintHandler(
                 if (!p.NoError && errorCount == 0)
                     issues.Add(new LintIssue("Error", "Lint.SpotErrorMissingFault", pq.Id, "Spot-the-error question has no error span marked with '[~~wrong~~ -> right]' and 'noError' is false."));
                 if (!string.IsNullOrWhiteSpace(p.ImagePath))
-                    await CheckImageAssetAsync(storageDirectory, p.ImagePath, $"{pq.Id}:image", issues, ct);
+                    await CheckImageAssetAsync(storageDirectory, p.ImagePath, $"{pq.Id}:image", issues, verifiedAssets, ct);
                 break;
             }
             case QuestionType.Differentiation:
@@ -654,7 +665,7 @@ public sealed class LintHandler(
             case QuestionType.RelabelImage:
             {
                 if (!TryDeserializePayload<RelabelImagePayload>(pq, "Relabel", issues, out var p)) return;
-                await CheckImageAssetAsync(storageDirectory, p.ImagePath, $"{pq.Id}:image", issues, ct);
+                await CheckImageAssetAsync(storageDirectory, p.ImagePath, $"{pq.Id}:image", issues, verifiedAssets, ct);
                 if (!Phase2PayloadRules.IsValidRelabelMode(p.Mode))
                     issues.Add(new LintIssue("Error", "Lint.InvalidRelabelMode", pq.Id, $"Invalid relabel mode '{p.Mode}'. Supported modes: 'reveal', 'bank', 'recall'."));
                 if (!Phase2PayloadRules.IsValidRelabelStyle(p.Style))
@@ -776,7 +787,7 @@ public sealed class LintHandler(
                 if (!Phase3PayloadRules.IsValidToleranceMode(p.ToleranceMode))
                     issues.Add(new LintIssue("Error", "Lint.InvalidQuestionPayload", pq.Id, $"Invalid toleranceMode '{p.ToleranceMode}'. Use 'absolute' or 'percent'."));
                 if (!string.IsNullOrWhiteSpace(p.ImagePath))
-                    await CheckImageAssetAsync(storageDirectory, p.ImagePath, $"{pq.Id}:image", issues, ct);
+                    await CheckImageAssetAsync(storageDirectory, p.ImagePath, $"{pq.Id}:image", issues, verifiedAssets, ct);
                 break;
             }
             case QuestionType.CaseGroup:
@@ -785,7 +796,7 @@ public sealed class LintHandler(
                 if (string.IsNullOrWhiteSpace(p.Stem))
                     issues.Add(new LintIssue("Error", "Lint.EmptyCaseStem", pq.Id, "Case question vignette stem cannot be empty."));
                 if (!string.IsNullOrWhiteSpace(p.ImagePath))
-                    await CheckImageAssetAsync(storageDirectory, p.ImagePath, $"{pq.Id}:image", issues, ct);
+                    await CheckImageAssetAsync(storageDirectory, p.ImagePath, $"{pq.Id}:image", issues, verifiedAssets, ct);
                 if (p.Questions is null || p.Questions.Count < 2)
                     issues.Add(new LintIssue("Error", "Lint.InsufficientCaseQuestions", pq.Id, $"Case question has {p.Questions?.Count ?? 0} sub-question(s); at least 2 are required."));
                 if (p.Questions is not null)
@@ -810,7 +821,7 @@ public sealed class LintHandler(
 
                         var subId = $"{pq.Id}:sub-{sub.Index}";
                         var rehydrated = sub.RehydrateToDomainQuestion(subType, subId, pq.ContainerId);
-                        await LintQuestionAsync(rehydrated, storageDirectory, issues, ct);
+                        await LintQuestionAsync(rehydrated, storageDirectory, issues, verifiedAssets, ct);
                     }
                 }
                 break;
@@ -821,14 +832,20 @@ public sealed class LintHandler(
         }
     }
 
-    private async Task CheckImageAssetAsync(string storageDirectory, string? relativeAssetPath, string targetId, List<LintIssue> issues, CancellationToken ct)
+    private async Task CheckImageAssetAsync(
+        string storageDirectory, string? relativeAssetPath, string targetId, List<LintIssue> issues, Dictionary<string, Result> verifiedAssets, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(relativeAssetPath))
         {
             issues.Add(new LintIssue("Error", "Lint.BrokenImageFile", targetId, "Image path is empty."));
             return;
         }
-        var verifyRes = await contentInspector.VerifyStoredAssetAsync(storageDirectory, relativeAssetPath, ct);
+        var cacheKey = $"{storageDirectory}\0{relativeAssetPath.Trim()}";
+        if (!verifiedAssets.TryGetValue(cacheKey, out var verifyRes))
+        {
+            verifyRes = await contentInspector.VerifyStoredAssetAsync(storageDirectory, relativeAssetPath, ct);
+            verifiedAssets[cacheKey] = verifyRes;
+        }
         if (!verifyRes.IsSuccess)
             issues.Add(new LintIssue("Error", "Lint.BrokenImageFile", targetId, verifyRes.Error!.Description));
     }

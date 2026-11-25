@@ -275,4 +275,40 @@ public sealed class LayoutEditorHostAndCliTests : IDisposable
             Assert.Equal(ExitCodes.Success, await serverTask);
         }
     }
+
+    [Fact]
+    public async Task LocalPreviewHost_WebAppServer_StreamsImmutableAssetsAndRejectsOversizedAnalysisPost()
+    {
+        var webDir = Path.Combine(_tempDir, "preview_web");
+        Directory.CreateDirectory(Path.Combine(webDir, "assets"));
+        await File.WriteAllTextAsync(Path.Combine(webDir, "index.html"), "<!doctype html><html><body>ok</body></html>");
+        await File.WriteAllBytesAsync(Path.Combine(webDir, "assets", "diag_12345678.png"), [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+
+        using var provider = CliApplicationRunner.BuildServiceProvider(_appDataDir);
+        var host = provider.GetRequiredService<ILocalPreviewHost>();
+        var console = new ObservableConsole();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+
+        var serverTask = host.ServeDirectoryAsync(webDir, console, noWait: false, json: false, silent: false, cts.Token);
+        try
+        {
+            var firstLine = await console.WaitForFirstLineAsync(TimeSpan.FromSeconds(5));
+            var urlMatch = Regex.Match(firstLine, @"http://[^\s]+/");
+            Assert.True(urlMatch.Success, $"Could not parse preview URL from: {firstLine}");
+
+            using var http = new HttpClient { BaseAddress = new Uri(urlMatch.Value) };
+            var assetResp = await http.GetAsync("/assets/diag_12345678.png");
+            Assert.Equal(HttpStatusCode.OK, assetResp.StatusCode);
+            Assert.Contains("immutable", assetResp.Headers.CacheControl?.ToString() ?? string.Empty);
+
+            var oversized = "{\"report\":\"" + new string('x', 5 * 1024 * 1024 + 1024) + "\"}";
+            var postResp = await http.PostAsync("/api/analysis", new StringContent(oversized, Encoding.UTF8, "application/json"));
+            Assert.Equal(HttpStatusCode.RequestEntityTooLarge, postResp.StatusCode);
+        }
+        finally
+        {
+            cts.Cancel();
+            Assert.Equal(ExitCodes.Success, await serverTask);
+        }
+    }
 }

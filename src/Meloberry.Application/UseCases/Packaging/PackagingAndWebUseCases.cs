@@ -3,6 +3,8 @@ using Meloberry.Application.UseCases.Diagnostics;
 using Meloberry.Application.UseCases.Json;
 using Meloberry.Domain.Common;
 using Meloberry.Domain.Layouts;
+using Meloberry.Domain.Quizzes;
+using Meloberry.Domain.Sessions;
 
 namespace Meloberry.Application.UseCases.Packaging;
 
@@ -28,8 +30,41 @@ public sealed class ExportPackageHandler(
             command.Address, "Export.TargetNotFound", $"Export target '{command.Address}' must be a valid Session or Quiz ID.", cancellationToken);
         if (!resolved.IsSuccess) return resolved.Error!;
 
+        return await ExportResolvedCoreAsync(resolved.Value, command, platform, cancellationToken);
+    }
+
+    internal async Task<Result<ExportPackageResponse>> ExportResolvedWorkspaceAsync(
+        StudySession? session,
+        Quiz? quiz,
+        string storageDirectory,
+        ExportPackageCommand command,
+        LintReportResponse? precomputedLintReport = null,
+        CancellationToken cancellationToken = default)
+    {
+        var platform = command.TargetPlatform.Trim().ToLowerInvariant();
+        if (platform is not ("desktop" or "android"))
+            return new Error("Export.InvalidPlatform", $"Invalid export target platform '{command.TargetPlatform}'. Use 'desktop' or 'android'.", ErrorType.Validation);
+
+        if (session is null && quiz is null)
+            return new Error("Export.TargetNotFound", $"Export target '{command.Address}' must be a valid Session or Quiz ID.", ErrorType.NotFound);
+
+        var report = precomputedLintReport ?? (session is not null
+            ? await lintHandler.LintSessionInMemoryAsync(session, storageDirectory, cancellationToken)
+            : await lintHandler.LintQuizInMemoryAsync(quiz!, storageDirectory, cancellationToken));
+        var wsId = session?.Id ?? quiz!.Id;
+        if (report.ErrorCount > 0)
+            return LintHandler.FailLint(wsId, report);
+
+        return await ExportResolvedCoreAsync(new ResolvedWorkspaceLint(session, quiz, storageDirectory, report), command, platform, cancellationToken);
+    }
+
+    private async Task<Result<ExportPackageResponse>> ExportResolvedCoreAsync(
+        ResolvedWorkspaceLint ws,
+        ExportPackageCommand command,
+        string platform,
+        CancellationToken cancellationToken)
+    {
         var layouts = await layoutRepository.GetAllProfilesAsync(cancellationToken);
-        var ws = resolved.Value;
         var wsId = ws.Session?.Id ?? ws.Quiz!.Id;
 
         List<string>? warnings = null;
@@ -95,8 +130,37 @@ public sealed class BuildWebAppHandler(
             command.Address, "BuildWeb.TargetNotFound", $"Target '{command.Address}' must be a valid Session or Quiz ID.", cancellationToken);
         if (!resolved.IsSuccess) return resolved.Error!;
 
+        return await BuildResolvedCoreAsync(resolved.Value, command, forceIncludeLintReport: false, cancellationToken);
+    }
+
+    internal async Task<Result<BuildWebAppResponse>> BuildResolvedWorkspaceAsync(
+        StudySession? session,
+        Quiz? quiz,
+        string storageDirectory,
+        BuildWebAppCommand command,
+        bool includeLintReport = false,
+        CancellationToken cancellationToken = default)
+    {
+        if (session is null && quiz is null)
+            return new Error("BuildWeb.TargetNotFound", $"Target '{command.Address}' must be a valid Session or Quiz ID.", ErrorType.NotFound);
+
+        var report = session is not null
+            ? await lintHandler.LintSessionInMemoryAsync(session, storageDirectory, cancellationToken)
+            : await lintHandler.LintQuizInMemoryAsync(quiz!, storageDirectory, cancellationToken);
+        var wsId = session?.Id ?? quiz!.Id;
+        if (report.ErrorCount > 0)
+            return LintHandler.FailLint(wsId, report);
+
+        return await BuildResolvedCoreAsync(new ResolvedWorkspaceLint(session, quiz, storageDirectory, report), command, includeLintReport, cancellationToken);
+    }
+
+    private async Task<Result<BuildWebAppResponse>> BuildResolvedCoreAsync(
+        ResolvedWorkspaceLint ws,
+        BuildWebAppCommand command,
+        bool forceIncludeLintReport,
+        CancellationToken cancellationToken)
+    {
         var layouts = await layoutRepository.GetAllProfilesAsync(cancellationToken);
-        var ws = resolved.Value;
         var wsId = ws.Session?.Id ?? ws.Quiz!.Id;
         var webRes = ws.Session is not null
             ? await webAppGenerator.GenerateForSessionAsync(ws.Session, ws.StorageDirectory, layouts, command.OutputDirectory, cancellationToken)
@@ -105,7 +169,7 @@ public sealed class BuildWebAppHandler(
         if (!webRes.IsSuccess) return webRes.Error!;
         var webDir = Path.GetDirectoryName(webRes.Value) ?? webRes.Value;
         var lintSummary = new ApplyLintSummary(ws.Report.IsClean, ws.Report.ErrorCount, ws.Report.WarningCount);
-        LintReportResponse? detailedLint = command.Verbose ? ws.Report : null;
+        LintReportResponse? detailedLint = (command.Verbose || forceIncludeLintReport) ? ws.Report : null;
 
         WebAppVerificationReport? verifyReport = null;
         if (command.Verify || command.StaticVerifyOnly)

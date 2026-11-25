@@ -75,6 +75,30 @@ public sealed class PersistenceAndPackagingTests : IDisposable
         Assert.Equal(samplePayload, reloaded!.Session.Components[0].ArticleBlocks[0].PayloadJson);
         var inspected = await inspect.HandleAsync(new InspectEntityQuery($"{sessionId}#legacy-blk", InspectViewMode.Full));
         Assert.Equal(samplePayload, inspected.Value.ArticleBlock?.PayloadJson);
+
+        // Verify PRAGMA user_version was upgraded to 2 and ls refreshes when external .db mtime changes
+        await using (var verConn = new SqliteConnection($"Data Source={dbPath};Pooling=False"))
+        {
+            await verConn.OpenAsync();
+            await using var verCmd = verConn.CreateCommand();
+            verCmd.CommandText = "PRAGMA user_version;";
+            Assert.Equal(2, Convert.ToInt32(await verCmd.ExecuteScalarAsync()));
+        }
+
+        var listedBefore = await repo.ListWorkspacesAsync(wsRoot);
+        Assert.Equal(1, Assert.Single(listedBefore, w => w.Id == sessionId).ItemCount);
+
+        await using (var mutConn = new SqliteConnection($"Data Source={dbPath};Pooling=False"))
+        {
+            await mutConn.OpenAsync();
+            await using var insCmd = mutConn.CreateCommand();
+            insCmd.CommandText = "INSERT INTO Components VALUES ('Component_20261120_100000_009', 2, 'Article', NULL, '{}', 'Second', 'second-notes', NULL);";
+            await insCmd.ExecuteNonQueryAsync();
+        }
+        File.SetLastWriteTimeUtc(dbPath, DateTime.UtcNow.AddMinutes(2));
+
+        var listedAfter = await repo.ListWorkspacesAsync(wsRoot);
+        Assert.Equal(2, Assert.Single(listedAfter, w => w.Id == sessionId).ItemCount);
     }
 
     [Fact]

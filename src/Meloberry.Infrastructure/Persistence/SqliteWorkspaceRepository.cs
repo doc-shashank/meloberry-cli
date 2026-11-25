@@ -13,7 +13,16 @@ public sealed class SqliteWorkspaceRepository(
     IWorkingDirectoryProvider workingDirectoryProvider,
     ChainTransactionManager? transactionManager = null) : IWorkspaceRepository
 {
-    private sealed record RegistryEntry(string WorkspaceId, string Kind, string SubType, string DbPath, string StorageDirectory);
+    private const int CurrentWorkspaceSchemaVersion = 2;
+
+    private sealed record RegistryEntry(
+        string WorkspaceId,
+        string Kind,
+        string SubType,
+        string DbPath,
+        string StorageDirectory,
+        int? ItemCount = null,
+        string? DbLastWriteUtc = null);
 
     public async Task CreateSessionAsync(StudySession session, CancellationToken cancellationToken = default) =>
         await SaveSessionAsync(session, cancellationToken);
@@ -21,29 +30,26 @@ public sealed class SqliteWorkspaceRepository(
     public async Task SaveSessionAsync(StudySession session, CancellationToken cancellationToken = default)
     {
         var ownedIds = new List<string> { session.Id };
-        await SaveWorkspaceCoreAsync(session.WorkingDirectory, session.Id, "session", "session", session.ActiveComponentId, session.Name, session.Description, ownedIds,
+        await SaveWorkspaceCoreAsync(session.WorkingDirectory, session.Id, "session", "session", session.ActiveComponentId, session.Name, session.Description,
+            session.Components.Count, ownedIds,
             async (conn, tx) =>
             {
+                await using var compCmd = PrepareInsertComponentCommand(conn, tx);
+                await using var blockCmd = PrepareInsertArticleBlockCommand(conn, tx);
+                await using var qCmd = PrepareInsertQuestionCommand(conn, tx);
+                await using var optCmd = PrepareInsertMcqOptionCommand(conn, tx);
+
                 foreach (var comp in session.Components)
                 {
                     ownedIds.Add(comp.Id);
-                    var linksJson = comp.LinkCards.Count > 0 ? Phase1PayloadCodec.Serialize(comp.LinkCards) : null;
-                    await ExecAsync(conn, tx, "INSERT INTO Components (Id, SortIndex, Kind, QuizType, LayoutOverridesJson, Title, RefKey, LinksJson) VALUES ($id, $idx, $kind, $qt, $lj, $title, $ref, $links);",
-                        cancellationToken, ("$id", comp.Id), ("$idx", comp.Index), ("$kind", comp.Kind.ToString()),
-                        ("$qt", comp.Quiz?.Type.ToString()), ("$lj", JsonSerializer.Serialize(comp.LayoutOverrides)), ("$title", comp.Title), ("$ref", comp.RefKey), ("$links", linksJson));
+                    await ExecuteInsertComponentAsync(compCmd, comp, cancellationToken);
 
                     if (comp.Kind == ComponentKind.Article)
                     {
                         foreach (var b in comp.ArticleBlocks)
                         {
                             ownedIds.Add(b.Id);
-                            string? toneStr = b.CalloutTone.HasValue ? ArticleBlock.CalloutToneToString(b.CalloutTone.Value) : null;
-                            await ExecAsync(conn, tx,
-                                "INSERT INTO ArticleBlocks (Id, ComponentId, SortIndex, BlockKind, TextContent, ImagePath, RefKey, Caption, Alt, CalloutTone, CalloutTitle, PayloadJson) VALUES ($id, $cid, $idx, $kind, $txt, $img, $ref, $cap, $alt, $tone, $ctitle, $pj);",
-                                cancellationToken,
-                                ("$id", b.Id), ("$cid", b.ComponentId), ("$idx", b.Index), ("$kind", b.Kind.ToString()),
-                                ("$txt", b.TextContent), ("$img", b.ImagePath), ("$ref", b.RefKey),
-                                ("$cap", b.Caption), ("$alt", b.Alt), ("$tone", toneStr), ("$ctitle", b.CalloutTitle), ("$pj", b.PayloadJson));
+                            await ExecuteInsertArticleBlockAsync(blockCmd, b, cancellationToken);
                         }
                     }
                     else if (comp.Quiz is not null)
@@ -51,7 +57,7 @@ public sealed class SqliteWorkspaceRepository(
                         foreach (var q in comp.Quiz.Questions)
                         {
                             ownedIds.Add(q.Id);
-                            await InsertQuestionAsync(conn, tx, q, cancellationToken);
+                            await ExecuteInsertQuestionAsync(qCmd, optCmd, q, cancellationToken);
                         }
                     }
                 }
@@ -73,13 +79,17 @@ public sealed class SqliteWorkspaceRepository(
         await SaveWorkspaceCoreAsync(quiz.WorkingDirectory, quiz.Id, "quiz", quiz.Type.ToString().ToLowerInvariant(), null,
             string.IsNullOrWhiteSpace(quiz.Name) ? null : quiz.Name,
             string.IsNullOrWhiteSpace(quiz.Description) ? null : quiz.Description,
+            quiz.Questions.Count,
             ownedIds,
             async (conn, tx) =>
             {
+                await using var qCmd = PrepareInsertQuestionCommand(conn, tx);
+                await using var optCmd = PrepareInsertMcqOptionCommand(conn, tx);
+
                 foreach (var q in quiz.Questions)
                 {
                     ownedIds.Add(q.Id);
-                    await InsertQuestionAsync(conn, tx, q, cancellationToken);
+                    await ExecuteInsertQuestionAsync(qCmd, optCmd, q, cancellationToken);
                 }
             }, cancellationToken);
     }
@@ -93,6 +103,187 @@ public sealed class SqliteWorkspaceRepository(
 
     public Task SaveOwnerAsync(QuizOwnerContext owner, CancellationToken cancellationToken = default) =>
         owner.Session is not null ? SaveSessionAsync(owner.Session, cancellationToken) : SaveQuizAsync(owner.Quiz, cancellationToken);
+
+    public async Task UpdateSessionMetadataAsync(StudySession session, CancellationToken cancellationToken = default)
+    {
+        var dbPath = Path.Combine(session.WorkingDirectory, $"{session.Id}.db");
+        if (!File.Exists(dbPath))
+        {
+            await SaveSessionAsync(session, cancellationToken);
+            return;
+        }
+
+        transactionManager?.NotifyWorkspaceMutating(session.WorkingDirectory);
+        await using (var conn = OpenWorkspaceConnection(dbPath))
+        {
+            await conn.OpenAsync(cancellationToken);
+            await ExecAsync(conn, null, "PRAGMA synchronous = NORMAL;", cancellationToken);
+            await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(cancellationToken);
+            await ExecAsync(conn, tx,
+                "UPDATE WorkspaceMeta SET ActiveComponentId = $act, Name = $n, Description = $d WHERE Id = $id;",
+                cancellationToken,
+                ("$id", session.Id), ("$act", session.ActiveComponentId), ("$n", session.Name), ("$d", session.Description));
+            await tx.CommitAsync(cancellationToken);
+        }
+        await RefreshRegistryTimestampAsync(session.Id, dbPath, cancellationToken);
+    }
+
+    public async Task UpdateQuizMetadataAsync(Quiz quiz, CancellationToken cancellationToken = default)
+    {
+        var dbPath = Path.Combine(quiz.WorkingDirectory, $"{quiz.Id}.db");
+        if (!File.Exists(dbPath))
+        {
+            await SaveQuizAsync(quiz, cancellationToken);
+            return;
+        }
+
+        transactionManager?.NotifyWorkspaceMutating(quiz.WorkingDirectory);
+        var name = string.IsNullOrWhiteSpace(quiz.Name) ? null : quiz.Name;
+        var desc = string.IsNullOrWhiteSpace(quiz.Description) ? null : quiz.Description;
+        await using (var conn = OpenWorkspaceConnection(dbPath))
+        {
+            await conn.OpenAsync(cancellationToken);
+            await ExecAsync(conn, null, "PRAGMA synchronous = NORMAL;", cancellationToken);
+            await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(cancellationToken);
+            await ExecAsync(conn, tx,
+                "UPDATE WorkspaceMeta SET Name = $n, Description = $d WHERE Id = $id;",
+                cancellationToken,
+                ("$id", quiz.Id), ("$n", name), ("$d", desc));
+            await tx.CommitAsync(cancellationToken);
+        }
+        await RefreshRegistryTimestampAsync(quiz.Id, dbPath, cancellationToken);
+    }
+
+    public async Task UpdateComponentAsync(StudySession session, SessionComponent component, CancellationToken cancellationToken = default)
+    {
+        var dbPath = Path.Combine(session.WorkingDirectory, $"{session.Id}.db");
+        if (!File.Exists(dbPath))
+        {
+            await SaveSessionAsync(session, cancellationToken);
+            return;
+        }
+
+        transactionManager?.NotifyWorkspaceMutating(session.WorkingDirectory);
+        var linksJson = component.LinkCards.Count > 0 ? Phase1PayloadCodec.Serialize(component.LinkCards) : null;
+        await using (var conn = OpenWorkspaceConnection(dbPath))
+        {
+            await conn.OpenAsync(cancellationToken);
+            await ExecAsync(conn, null, "PRAGMA synchronous = NORMAL;", cancellationToken);
+            await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(cancellationToken);
+            await ExecAsync(conn, tx,
+                "UPDATE Components SET SortIndex = $idx, LayoutOverridesJson = $lj, Title = $title, RefKey = $ref, LinksJson = $links WHERE Id = $id;",
+                cancellationToken,
+                ("$id", component.Id),
+                ("$idx", component.Index),
+                ("$lj", JsonSerializer.Serialize(component.LayoutOverrides)),
+                ("$title", component.Title),
+                ("$ref", component.RefKey),
+                ("$links", linksJson));
+            await tx.CommitAsync(cancellationToken);
+        }
+        await RefreshRegistryTimestampAsync(session.Id, dbPath, cancellationToken);
+    }
+
+    public async Task UpdateArticleBlockAsync(StudySession session, ArticleBlock block, CancellationToken cancellationToken = default)
+    {
+        var dbPath = Path.Combine(session.WorkingDirectory, $"{session.Id}.db");
+        if (!File.Exists(dbPath))
+        {
+            await SaveSessionAsync(session, cancellationToken);
+            return;
+        }
+
+        transactionManager?.NotifyWorkspaceMutating(session.WorkingDirectory);
+        string? toneStr = block.CalloutTone.HasValue ? ArticleBlock.CalloutToneToString(block.CalloutTone.Value) : null;
+        await using (var conn = OpenWorkspaceConnection(dbPath))
+        {
+            await conn.OpenAsync(cancellationToken);
+            await ExecAsync(conn, null, "PRAGMA synchronous = NORMAL;", cancellationToken);
+            await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(cancellationToken);
+            await ExecAsync(conn, tx,
+                "UPDATE ArticleBlocks SET SortIndex = $idx, TextContent = $txt, ImagePath = $img, RefKey = $ref, Caption = $cap, Alt = $alt, CalloutTone = $tone, CalloutTitle = $ctitle, PayloadJson = $pj WHERE Id = $id;",
+                cancellationToken,
+                ("$id", block.Id),
+                ("$idx", block.Index),
+                ("$txt", block.TextContent),
+                ("$img", block.ImagePath),
+                ("$ref", block.RefKey),
+                ("$cap", block.Caption),
+                ("$alt", block.Alt),
+                ("$tone", toneStr),
+                ("$ctitle", block.CalloutTitle),
+                ("$pj", block.PayloadJson));
+            await tx.CommitAsync(cancellationToken);
+        }
+        await RefreshRegistryTimestampAsync(session.Id, dbPath, cancellationToken);
+    }
+
+    public async Task UpdateQuestionAsync(QuizOwnerContext owner, Question question, CancellationToken cancellationToken = default)
+    {
+        var wsId = owner.Session?.Id ?? owner.Quiz.Id;
+        var dbPath = Path.Combine(owner.StorageDirectory, $"{wsId}.db");
+        if (!File.Exists(dbPath))
+        {
+            await SaveOwnerAsync(owner, cancellationToken);
+            return;
+        }
+
+        transactionManager?.NotifyWorkspaceMutating(owner.StorageDirectory);
+        var mcq = question as McqQuestion;
+        var card = question as FlashcardQuestion;
+        await using (var conn = OpenWorkspaceConnection(dbPath))
+        {
+            await conn.OpenAsync(cancellationToken);
+            await ExecAsync(conn, null, "PRAGMA synchronous = NORMAL;", cancellationToken);
+            await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(cancellationToken);
+            await ExecAsync(conn, tx, """
+                UPDATE Questions SET
+                    SortIndex = $idx,
+                    PromptText = $pt,
+                    MaxOptions = $mo,
+                    IsMultiCorrect = $im,
+                    FrontText = $ft,
+                    FrontImagePath = $fi,
+                    FrontPosition = $fp,
+                    BackText = $bt,
+                    BackImagePath = $bi,
+                    BackPosition = $bp,
+                    LayoutOverridesJson = $lj,
+                    PromptImagePath = $pimg,
+                    Explanation = $exp,
+                    RefKey = $ref,
+                    PayloadJson = $pj
+                WHERE Id = $id;
+                """, cancellationToken,
+                ("$id", question.Id),
+                ("$idx", question.Index),
+                ("$pt", mcq?.Text),
+                ("$mo", mcq?.MaxOptions ?? 0),
+                ("$im", mcq?.IsMultiCorrect == true ? 1 : 0),
+                ("$ft", card?.Front.Text),
+                ("$fi", card?.Front.ImagePath),
+                ("$fp", card is null ? null : FormatSidePosition(card.Front)),
+                ("$bt", card?.Back.Text),
+                ("$bi", card?.Back.ImagePath),
+                ("$bp", card is null ? null : FormatSidePosition(card.Back)),
+                ("$lj", JsonSerializer.Serialize(question.LayoutOverrides)),
+                ("$pimg", mcq?.ImagePath),
+                ("$exp", mcq?.Explanation),
+                ("$ref", question.RefKey),
+                ("$pj", question.PayloadJson));
+
+            if (mcq is not null)
+            {
+                await ExecAsync(conn, tx, "DELETE FROM McqOptions WHERE QuestionId = $qid;", cancellationToken, ("$qid", mcq.Id));
+                await using var optCmd = PrepareInsertMcqOptionCommand(conn, tx);
+                foreach (var opt in mcq.Options)
+                    await ExecuteInsertMcqOptionAsync(optCmd, mcq.Id, opt, cancellationToken);
+            }
+
+            await tx.CommitAsync(cancellationToken);
+        }
+        await RefreshRegistryTimestampAsync(wsId, dbPath, cancellationToken);
+    }
 
     public async Task<SessionLookupContext?> FindSessionAsync(string sessionId, CancellationToken cancellationToken = default)
     {
@@ -185,11 +376,18 @@ public sealed class SqliteWorkspaceRepository(
         {
             await regConn.OpenAsync(cancellationToken);
             await using var cmd = regConn.CreateCommand();
-            cmd.CommandText = "SELECT WorkspaceId, Kind, SubType, DbPath, StorageDirectory FROM WorkspaceRegistry ORDER BY WorkspaceId DESC;";
+            cmd.CommandText = "SELECT WorkspaceId, Kind, SubType, DbPath, StorageDirectory, ItemCount, DbLastWriteUtc FROM WorkspaceRegistry ORDER BY WorkspaceId DESC;";
             await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
             while (await reader.ReadAsync(cancellationToken))
             {
-                var e = new RegistryEntry(reader.GetString(0), reader.GetString(1), reader.GetString(2), reader.GetString(3), reader.GetString(4));
+                var e = new RegistryEntry(
+                    reader.GetString(0),
+                    reader.GetString(1),
+                    reader.GetString(2),
+                    reader.GetString(3),
+                    reader.GetString(4),
+                    reader.IsDBNull(5) ? null : reader.GetInt32(5),
+                    reader.IsDBNull(6) ? null : reader.GetString(6));
                 if (!File.Exists(e.DbPath)) staleIds.Add(e.WorkspaceId);
                 else rows.Add(e);
             }
@@ -210,7 +408,17 @@ public sealed class SqliteWorkspaceRepository(
                     !normStorage.StartsWith(normScan + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
                     continue;
             }
-            try { items.Add(new WorkspaceListItem(e.WorkspaceId, e.Kind, e.SubType, e.StorageDirectory, await CountWorkspaceItemsAsync(e.DbPath, e.Kind, cancellationToken))); }
+            try
+            {
+                int itemCount;
+                var currentMtime = File.GetLastWriteTimeUtc(e.DbPath).ToString("O");
+                if (e.ItemCount.HasValue && string.Equals(e.DbLastWriteUtc, currentMtime, StringComparison.Ordinal))
+                    itemCount = e.ItemCount.Value;
+                else
+                    itemCount = await CountWorkspaceItemsAsync(e.DbPath, e.Kind, cancellationToken);
+
+                items.Add(new WorkspaceListItem(e.WorkspaceId, e.Kind, e.SubType, e.StorageDirectory, itemCount));
+            }
             catch { }
         }
         return items;
@@ -220,6 +428,7 @@ public sealed class SqliteWorkspaceRepository(
     {
         await using var conn = appRegistry.OpenAppConnection();
         await conn.OpenAsync(ct);
+        await ExecAsync(conn, null, "PRAGMA synchronous = NORMAL;", ct);
         await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(ct);
         foreach (var id in staleIds)
         {
@@ -231,25 +440,28 @@ public sealed class SqliteWorkspaceRepository(
 
     private async Task SaveWorkspaceCoreAsync(
         string storageDir, string id, string kind, string subType, string? activeCompId, string? name, string? desc,
-        List<string> ownedIds, Func<SqliteConnection, SqliteTransaction, Task> writeChildren, CancellationToken ct)
+        int itemCount, List<string> ownedIds, Func<SqliteConnection, SqliteTransaction, Task> writeChildren, CancellationToken ct)
     {
         transactionManager?.NotifyWorkspaceMutating(storageDir);
         Directory.CreateDirectory(storageDir);
         Directory.CreateDirectory(Path.Combine(storageDir, "assets"));
         var dbPath = Path.Combine(storageDir, $"{id}.db");
 
-        await using var conn = OpenWorkspaceConnection(dbPath);
-        await conn.OpenAsync(ct);
-        await EnsureWorkspaceSchemaAsync(conn, ct);
+        await using (var conn = OpenWorkspaceConnection(dbPath))
+        {
+            await conn.OpenAsync(ct);
+            await ExecAsync(conn, null, "PRAGMA synchronous = NORMAL;", ct);
+            await EnsureWorkspaceSchemaAsync(conn, ct);
 
-        await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(ct);
-        await ExecAsync(conn, tx, "DELETE FROM McqOptions; DELETE FROM Questions; DELETE FROM ArticleBlocks; DELETE FROM Components; DELETE FROM WorkspaceMeta;", ct);
-        await ExecAsync(conn, tx, "INSERT INTO WorkspaceMeta (Id, Kind, SubType, ActiveComponentId, Name, Description) VALUES ($id, $k, $st, $act, $n, $d);",
-            ct, ("$id", id), ("$k", kind), ("$st", subType), ("$act", activeCompId), ("$n", name), ("$d", desc));
+            await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(ct);
+            await ExecAsync(conn, tx, "DELETE FROM McqOptions; DELETE FROM Questions; DELETE FROM ArticleBlocks; DELETE FROM Components; DELETE FROM WorkspaceMeta;", ct);
+            await ExecAsync(conn, tx, "INSERT INTO WorkspaceMeta (Id, Kind, SubType, ActiveComponentId, Name, Description) VALUES ($id, $k, $st, $act, $n, $d);",
+                ct, ("$id", id), ("$k", kind), ("$st", subType), ("$act", activeCompId), ("$n", name), ("$d", desc));
 
-        await writeChildren(conn, tx);
-        await tx.CommitAsync(ct);
-        await RegisterWorkspaceAsync(id, kind, subType, dbPath, storageDir, ownedIds, ct);
+            await writeChildren(conn, tx);
+            await tx.CommitAsync(ct);
+        }
+        await RegisterWorkspaceAsync(id, kind, subType, dbPath, storageDir, itemCount, ownedIds, ct);
     }
 
     private async Task<RegistryEntry?> ResolveEntryAsync(string id, bool byEntity, CancellationToken ct)
@@ -269,16 +481,42 @@ public sealed class SqliteWorkspaceRepository(
         await conn.OpenAsync(ct);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = byEntity
-            ? "SELECT w.WorkspaceId, w.Kind, w.SubType, w.DbPath, w.StorageDirectory FROM EntityIndex e INNER JOIN WorkspaceRegistry w ON w.WorkspaceId = e.WorkspaceId WHERE e.EntityId = $id;"
-            : "SELECT WorkspaceId, Kind, SubType, DbPath, StorageDirectory FROM WorkspaceRegistry WHERE WorkspaceId = $id;";
+            ? "SELECT w.WorkspaceId, w.Kind, w.SubType, w.DbPath, w.StorageDirectory, w.ItemCount, w.DbLastWriteUtc FROM EntityIndex e INNER JOIN WorkspaceRegistry w ON w.WorkspaceId = e.WorkspaceId WHERE e.EntityId = $id;"
+            : "SELECT WorkspaceId, Kind, SubType, DbPath, StorageDirectory, ItemCount, DbLastWriteUtc FROM WorkspaceRegistry WHERE WorkspaceId = $id;";
         cmd.Parameters.AddWithValue("$id", id);
 
         await using var r = await cmd.ExecuteReaderAsync(ct);
-        return await r.ReadAsync(ct) ? new RegistryEntry(r.GetString(0), r.GetString(1), r.GetString(2), r.GetString(3), r.GetString(4)) : null;
+        return await r.ReadAsync(ct)
+            ? new RegistryEntry(
+                r.GetString(0),
+                r.GetString(1),
+                r.GetString(2),
+                r.GetString(3),
+                r.GetString(4),
+                r.IsDBNull(5) ? null : r.GetInt32(5),
+                r.IsDBNull(6) ? null : r.GetString(6))
+            : null;
     }
 
     private async Task ScanDirectoryForWorkspacesAsync(string rootDir, CancellationToken ct)
     {
+        await appRegistry.EnsureInitializedAsync(ct);
+        var cachedByDbPath = new Dictionary<string, (string? DbLastWriteUtc, int? ItemCount)>(StringComparer.OrdinalIgnoreCase);
+        await using (var regConn = appRegistry.OpenAppConnection())
+        {
+            await regConn.OpenAsync(ct);
+            await using var cmd = regConn.CreateCommand();
+            cmd.CommandText = "SELECT DbPath, DbLastWriteUtc, ItemCount FROM WorkspaceRegistry;";
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct))
+            {
+                var rawPath = r.GetString(0);
+                var mtime = r.IsDBNull(1) ? null : r.GetString(1);
+                int? cnt = r.IsDBNull(2) ? null : r.GetInt32(2);
+                cachedByDbPath[Path.GetFullPath(rawPath)] = (mtime, cnt);
+            }
+        }
+
         var dirsToScan = new List<string> { rootDir };
         var meloberryWorkspaces = Path.Combine(rootDir, ".meloberry", "workspaces");
         if (Directory.Exists(meloberryWorkspaces))
@@ -294,6 +532,16 @@ public sealed class SqliteWorkspaceRepository(
                     continue;
                 var candidateDb = Path.Combine(subDir, $"{dirName}.db");
                 if (!File.Exists(candidateDb)) continue;
+
+                var fullCandidateDb = Path.GetFullPath(candidateDb);
+                var currentMtime = File.GetLastWriteTimeUtc(fullCandidateDb).ToString("O");
+                if (cachedByDbPath.TryGetValue(fullCandidateDb, out var cached) &&
+                    cached.ItemCount.HasValue &&
+                    string.Equals(cached.DbLastWriteUtc, currentMtime, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
                 try { await IndexExternalDatabaseAsync(candidateDb, subDir, ct); } catch { }
             }
         }
@@ -301,54 +549,100 @@ public sealed class SqliteWorkspaceRepository(
 
     private async Task IndexExternalDatabaseAsync(string dbPath, string storageDir, CancellationToken ct)
     {
-        await using var conn = OpenWorkspaceConnection(dbPath);
-        await conn.OpenAsync(ct);
-
         string id, kind, subType;
-        await using (var metaCmd = conn.CreateCommand())
+        int itemCount = 0;
+        var entityIds = new List<string>();
+
+        await using (var conn = OpenWorkspaceConnection(dbPath))
         {
-            metaCmd.CommandText = "SELECT Id, Kind, SubType FROM WorkspaceMeta LIMIT 1;";
-            await using var r = await metaCmd.ExecuteReaderAsync(ct);
-            if (!await r.ReadAsync(ct)) return;
-            (id, kind, subType) = (r.GetString(0), r.GetString(1), r.GetString(2));
+            await conn.OpenAsync(ct);
+
+            await using (var metaCmd = conn.CreateCommand())
+            {
+                metaCmd.CommandText = "SELECT Id, Kind, SubType FROM WorkspaceMeta LIMIT 1;";
+                await using var r = await metaCmd.ExecuteReaderAsync(ct);
+                if (!await r.ReadAsync(ct)) return;
+                (id, kind, subType) = (r.GetString(0), r.GetString(1), r.GetString(2));
+            }
+
+            entityIds.Add(id);
+            bool isSession = string.Equals(kind, "session", StringComparison.OrdinalIgnoreCase);
+            foreach (var table in new[] { "Components", "ArticleBlocks", "Questions" })
+            {
+                await using var cmd = conn.CreateCommand();
+                cmd.CommandText = $"SELECT Id FROM {table};";
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                int tableRows = 0;
+                while (await r.ReadAsync(ct))
+                {
+                    entityIds.Add(r.GetString(0));
+                    tableRows++;
+                }
+                if ((isSession && table == "Components") || (!isSession && table == "Questions"))
+                    itemCount = tableRows;
+            }
         }
 
-        var entityIds = new List<string> { id };
-        foreach (var table in new[] { "Components", "ArticleBlocks", "Questions" })
-        {
-            await using var cmd = conn.CreateCommand();
-            cmd.CommandText = $"SELECT Id FROM {table};";
-            await using var r = await cmd.ExecuteReaderAsync(ct);
-            while (await r.ReadAsync(ct)) entityIds.Add(r.GetString(0));
-        }
-        await RegisterWorkspaceAsync(id, kind, subType, dbPath, storageDir, entityIds, ct);
+        await RegisterWorkspaceAsync(id, kind, subType, dbPath, storageDir, itemCount, entityIds, ct);
     }
 
     private async Task RegisterWorkspaceAsync(
-        string workspaceId, string kind, string subType, string dbPath, string storageDir, IEnumerable<string> entityIds, CancellationToken ct)
+        string workspaceId, string kind, string subType, string dbPath, string storageDir, int itemCount, IEnumerable<string> entityIds, CancellationToken ct)
     {
         await appRegistry.EnsureInitializedAsync(ct);
+        string? dbLastWriteUtc = File.Exists(dbPath) ? File.GetLastWriteTimeUtc(dbPath).ToString("O") : null;
+
         await using var conn = appRegistry.OpenAppConnection();
         await conn.OpenAsync(ct);
+        await ExecAsync(conn, null, "PRAGMA synchronous = NORMAL;", ct);
         await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(ct);
 
         await ExecAsync(conn, tx, """
-            INSERT INTO WorkspaceRegistry (WorkspaceId, Kind, SubType, DbPath, StorageDirectory, UpdatedAtUtc)
-            VALUES ($id, $k, $st, $db, $sd, $ts)
+            INSERT INTO WorkspaceRegistry (WorkspaceId, Kind, SubType, DbPath, StorageDirectory, UpdatedAtUtc, ItemCount, DbLastWriteUtc)
+            VALUES ($id, $k, $st, $db, $sd, $ts, $cnt, $mtime)
             ON CONFLICT(WorkspaceId) DO UPDATE SET Kind = excluded.Kind, SubType = excluded.SubType,
-                DbPath = excluded.DbPath, StorageDirectory = excluded.StorageDirectory, UpdatedAtUtc = excluded.UpdatedAtUtc;
-            """, ct, ("$id", workspaceId), ("$k", kind), ("$st", subType), ("$db", dbPath), ("$sd", storageDir), ("$ts", DateTimeOffset.UtcNow.ToString("O")));
+                DbPath = excluded.DbPath, StorageDirectory = excluded.StorageDirectory, UpdatedAtUtc = excluded.UpdatedAtUtc,
+                ItemCount = excluded.ItemCount, DbLastWriteUtc = excluded.DbLastWriteUtc;
+            """, ct,
+            ("$id", workspaceId), ("$k", kind), ("$st", subType), ("$db", dbPath), ("$sd", storageDir),
+            ("$ts", DateTimeOffset.UtcNow.ToString("O")), ("$cnt", itemCount), ("$mtime", dbLastWriteUtc));
 
         await ExecAsync(conn, tx, "DELETE FROM EntityIndex WHERE WorkspaceId = $id;", ct, ("$id", workspaceId));
-        foreach (var eid in entityIds.Distinct(StringComparer.Ordinal))
-            await ExecAsync(conn, tx, "INSERT OR REPLACE INTO EntityIndex (EntityId, WorkspaceId) VALUES ($eid, $wid);", ct, ("$eid", eid), ("$wid", workspaceId));
+        await using (var idxCmd = conn.CreateCommand())
+        {
+            idxCmd.Transaction = tx;
+            idxCmd.CommandText = "INSERT OR REPLACE INTO EntityIndex (EntityId, WorkspaceId) VALUES ($eid, $wid);";
+            var eidParam = idxCmd.Parameters.Add("$eid", SqliteType.Text);
+            var widParam = idxCmd.Parameters.Add("$wid", SqliteType.Text);
+            widParam.Value = workspaceId;
+            foreach (var eid in entityIds.Distinct(StringComparer.Ordinal))
+            {
+                eidParam.Value = eid;
+                await idxCmd.ExecuteNonQueryAsync(ct);
+            }
+        }
 
         await tx.CommitAsync(ct);
     }
 
+    private async Task RefreshRegistryTimestampAsync(string workspaceId, string dbPath, CancellationToken ct)
+    {
+        if (!File.Exists(dbPath)) return;
+        await appRegistry.EnsureInitializedAsync(ct);
+        var dbLastWriteUtc = File.GetLastWriteTimeUtc(dbPath).ToString("O");
+        await using var conn = appRegistry.OpenAppConnection();
+        await conn.OpenAsync(ct);
+        await ExecAsync(conn, null,
+            "UPDATE WorkspaceRegistry SET DbLastWriteUtc = $mtime, UpdatedAtUtc = $ts WHERE WorkspaceId = $id;",
+            ct,
+            ("$id", workspaceId),
+            ("$mtime", dbLastWriteUtc),
+            ("$ts", DateTimeOffset.UtcNow.ToString("O")));
+    }
+
     private async Task RemoveWorkspaceFilesAndIndexAsync(string workspaceId, string storageDirectory, CancellationToken ct)
     {
-        transactionManager?.NotifyWorkspaceMutating(storageDirectory);
+        transactionManager?.NotifyWorkspaceDeleting(storageDirectory);
         await appRegistry.EnsureInitializedAsync(ct);
         await using (var conn = appRegistry.OpenAppConnection())
         {
@@ -364,8 +658,17 @@ public sealed class SqliteWorkspaceRepository(
 
     private static SqliteConnection OpenWorkspaceConnection(string dbPath) => new($"Data Source={dbPath};Pooling=False");
 
+    private static async Task<int> ReadUserVersionAsync(SqliteConnection conn, CancellationToken ct)
+    {
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "PRAGMA user_version;";
+        var raw = await cmd.ExecuteScalarAsync(ct);
+        return raw is null or DBNull ? 0 : Convert.ToInt32(raw);
+    }
+
     private static async Task EnsureWorkspaceSchemaAsync(SqliteConnection conn, CancellationToken ct)
     {
+        int userVersion = await ReadUserVersionAsync(conn, ct);
         await ExecAsync(conn, null, """
             CREATE TABLE IF NOT EXISTS WorkspaceMeta (Id TEXT PRIMARY KEY, Kind TEXT NOT NULL, SubType TEXT NOT NULL, ActiveComponentId TEXT NULL, Name TEXT NULL, Description TEXT NULL);
             CREATE TABLE IF NOT EXISTS Components (Id TEXT PRIMARY KEY, SortIndex INTEGER NOT NULL, Kind TEXT NOT NULL, QuizType TEXT NULL, LayoutOverridesJson TEXT NULL, Title TEXT NULL, RefKey TEXT NULL, LinksJson TEXT NULL);
@@ -373,10 +676,14 @@ public sealed class SqliteWorkspaceRepository(
             CREATE TABLE IF NOT EXISTS Questions (Id TEXT PRIMARY KEY, ContainerId TEXT NOT NULL, SortIndex INTEGER NOT NULL, QuestionType TEXT NOT NULL, PromptText TEXT NULL, MaxOptions INTEGER NOT NULL, IsMultiCorrect INTEGER NOT NULL, FrontText TEXT NULL, FrontImagePath TEXT NULL, FrontPosition TEXT NULL, BackText TEXT NULL, BackImagePath TEXT NULL, BackPosition TEXT NULL, LayoutOverridesJson TEXT NULL, PromptImagePath TEXT NULL, Explanation TEXT NULL, RefKey TEXT NULL, PayloadJson TEXT NULL);
             CREATE TABLE IF NOT EXISTS McqOptions (QuestionId TEXT NOT NULL, OptionIndex INTEGER NOT NULL, OptionText TEXT NULL, ImagePath TEXT NULL, IsCorrect INTEGER NOT NULL, PRIMARY KEY (QuestionId, OptionIndex));
             """, ct);
-        await EnsureTableColumnsAsync(conn, ct, "WorkspaceMeta", "Name", "Description");
-        await EnsureTableColumnsAsync(conn, ct, "Components", "Title", "RefKey", "LinksJson");
-        await EnsureTableColumnsAsync(conn, ct, "ArticleBlocks", "RefKey", "Caption", "Alt", "CalloutTone", "CalloutTitle", "PayloadJson");
-        await EnsureTableColumnsAsync(conn, ct, "Questions", "PromptImagePath", "Explanation", "RefKey", "PayloadJson");
+        if (userVersion < CurrentWorkspaceSchemaVersion)
+        {
+            await EnsureTableColumnsAsync(conn, ct, "WorkspaceMeta", "Name", "Description");
+            await EnsureTableColumnsAsync(conn, ct, "Components", "Title", "RefKey", "LinksJson");
+            await EnsureTableColumnsAsync(conn, ct, "ArticleBlocks", "RefKey", "Caption", "Alt", "CalloutTone", "CalloutTitle", "PayloadJson");
+            await EnsureTableColumnsAsync(conn, ct, "Questions", "PromptImagePath", "Explanation", "RefKey", "PayloadJson");
+            await ExecAsync(conn, null, $"PRAGMA user_version = {CurrentWorkspaceSchemaVersion};", ct);
+        }
     }
 
     private static async Task EnsureTableColumnsAsync(SqliteConnection conn, CancellationToken ct, string tableName, params string[] columns)
@@ -392,28 +699,156 @@ public sealed class SqliteWorkspaceRepository(
             await ExecAsync(conn, null, $"ALTER TABLE {tableName} ADD COLUMN {col} TEXT NULL;", ct);
     }
 
-    private static async Task InsertQuestionAsync(SqliteConnection conn, SqliteTransaction tx, Question question, CancellationToken ct)
+    private static SqliteCommand PrepareInsertComponentCommand(SqliteConnection conn, SqliteTransaction tx)
     {
-        var mcq = question as McqQuestion;
-        var card = question as FlashcardQuestion;
-        await ExecAsync(conn, tx, """
+        var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "INSERT INTO Components (Id, SortIndex, Kind, QuizType, LayoutOverridesJson, Title, RefKey, LinksJson) VALUES ($id, $idx, $kind, $qt, $lj, $title, $ref, $links);";
+        cmd.Parameters.Add("$id", SqliteType.Text);
+        cmd.Parameters.Add("$idx", SqliteType.Integer);
+        cmd.Parameters.Add("$kind", SqliteType.Text);
+        cmd.Parameters.Add("$qt", SqliteType.Text);
+        cmd.Parameters.Add("$lj", SqliteType.Text);
+        cmd.Parameters.Add("$title", SqliteType.Text);
+        cmd.Parameters.Add("$ref", SqliteType.Text);
+        cmd.Parameters.Add("$links", SqliteType.Text);
+        return cmd;
+    }
+
+    private static Task ExecuteInsertComponentAsync(SqliteCommand cmd, SessionComponent comp, CancellationToken ct)
+    {
+        var linksJson = comp.LinkCards.Count > 0 ? Phase1PayloadCodec.Serialize(comp.LinkCards) : null;
+        cmd.Parameters["$id"].Value = comp.Id;
+        cmd.Parameters["$idx"].Value = comp.Index;
+        cmd.Parameters["$kind"].Value = comp.Kind.ToString();
+        cmd.Parameters["$qt"].Value = (object?)comp.Quiz?.Type.ToString() ?? DBNull.Value;
+        cmd.Parameters["$lj"].Value = JsonSerializer.Serialize(comp.LayoutOverrides);
+        cmd.Parameters["$title"].Value = (object?)comp.Title ?? DBNull.Value;
+        cmd.Parameters["$ref"].Value = (object?)comp.RefKey ?? DBNull.Value;
+        cmd.Parameters["$links"].Value = (object?)linksJson ?? DBNull.Value;
+        return cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    private static SqliteCommand PrepareInsertArticleBlockCommand(SqliteConnection conn, SqliteTransaction tx)
+    {
+        var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "INSERT INTO ArticleBlocks (Id, ComponentId, SortIndex, BlockKind, TextContent, ImagePath, RefKey, Caption, Alt, CalloutTone, CalloutTitle, PayloadJson) VALUES ($id, $cid, $idx, $kind, $txt, $img, $ref, $cap, $alt, $tone, $ctitle, $pj);";
+        cmd.Parameters.Add("$id", SqliteType.Text);
+        cmd.Parameters.Add("$cid", SqliteType.Text);
+        cmd.Parameters.Add("$idx", SqliteType.Integer);
+        cmd.Parameters.Add("$kind", SqliteType.Text);
+        cmd.Parameters.Add("$txt", SqliteType.Text);
+        cmd.Parameters.Add("$img", SqliteType.Text);
+        cmd.Parameters.Add("$ref", SqliteType.Text);
+        cmd.Parameters.Add("$cap", SqliteType.Text);
+        cmd.Parameters.Add("$alt", SqliteType.Text);
+        cmd.Parameters.Add("$tone", SqliteType.Text);
+        cmd.Parameters.Add("$ctitle", SqliteType.Text);
+        cmd.Parameters.Add("$pj", SqliteType.Text);
+        return cmd;
+    }
+
+    private static Task ExecuteInsertArticleBlockAsync(SqliteCommand cmd, ArticleBlock b, CancellationToken ct)
+    {
+        string? toneStr = b.CalloutTone.HasValue ? ArticleBlock.CalloutToneToString(b.CalloutTone.Value) : null;
+        cmd.Parameters["$id"].Value = b.Id;
+        cmd.Parameters["$cid"].Value = b.ComponentId;
+        cmd.Parameters["$idx"].Value = b.Index;
+        cmd.Parameters["$kind"].Value = b.Kind.ToString();
+        cmd.Parameters["$txt"].Value = (object?)b.TextContent ?? DBNull.Value;
+        cmd.Parameters["$img"].Value = (object?)b.ImagePath ?? DBNull.Value;
+        cmd.Parameters["$ref"].Value = (object?)b.RefKey ?? DBNull.Value;
+        cmd.Parameters["$cap"].Value = (object?)b.Caption ?? DBNull.Value;
+        cmd.Parameters["$alt"].Value = (object?)b.Alt ?? DBNull.Value;
+        cmd.Parameters["$tone"].Value = (object?)toneStr ?? DBNull.Value;
+        cmd.Parameters["$ctitle"].Value = (object?)b.CalloutTitle ?? DBNull.Value;
+        cmd.Parameters["$pj"].Value = (object?)b.PayloadJson ?? DBNull.Value;
+        return cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    private static SqliteCommand PrepareInsertQuestionCommand(SqliteConnection conn, SqliteTransaction tx)
+    {
+        var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = """
             INSERT INTO Questions (Id, ContainerId, SortIndex, QuestionType, PromptText, MaxOptions, IsMultiCorrect,
                 FrontText, FrontImagePath, FrontPosition, BackText, BackImagePath, BackPosition, LayoutOverridesJson, PromptImagePath, Explanation, RefKey, PayloadJson)
             VALUES ($id, $cid, $idx, $qt, $pt, $mo, $im, $ft, $fi, $fp, $bt, $bi, $bp, $lj, $pimg, $exp, $ref, $pj);
-            """, ct,
-            ("$id", question.Id), ("$cid", question.ContainerId), ("$idx", question.Index), ("$qt", question.Type.ToString()),
-            ("$pt", mcq?.Text), ("$mo", mcq?.MaxOptions ?? 0), ("$im", mcq?.IsMultiCorrect == true ? 1 : 0),
-            ("$ft", card?.Front.Text), ("$fi", card?.Front.ImagePath), ("$fp", card is null ? null : FormatSidePosition(card.Front)),
-            ("$bt", card?.Back.Text), ("$bi", card?.Back.ImagePath), ("$bp", card is null ? null : FormatSidePosition(card.Back)),
-            ("$lj", JsonSerializer.Serialize(question.LayoutOverrides)),
-            ("$pimg", mcq?.ImagePath), ("$exp", mcq?.Explanation), ("$ref", question.RefKey), ("$pj", question.PayloadJson));
+            """;
+        cmd.Parameters.Add("$id", SqliteType.Text);
+        cmd.Parameters.Add("$cid", SqliteType.Text);
+        cmd.Parameters.Add("$idx", SqliteType.Integer);
+        cmd.Parameters.Add("$qt", SqliteType.Text);
+        cmd.Parameters.Add("$pt", SqliteType.Text);
+        cmd.Parameters.Add("$mo", SqliteType.Integer);
+        cmd.Parameters.Add("$im", SqliteType.Integer);
+        cmd.Parameters.Add("$ft", SqliteType.Text);
+        cmd.Parameters.Add("$fi", SqliteType.Text);
+        cmd.Parameters.Add("$fp", SqliteType.Text);
+        cmd.Parameters.Add("$bt", SqliteType.Text);
+        cmd.Parameters.Add("$bi", SqliteType.Text);
+        cmd.Parameters.Add("$bp", SqliteType.Text);
+        cmd.Parameters.Add("$lj", SqliteType.Text);
+        cmd.Parameters.Add("$pimg", SqliteType.Text);
+        cmd.Parameters.Add("$exp", SqliteType.Text);
+        cmd.Parameters.Add("$ref", SqliteType.Text);
+        cmd.Parameters.Add("$pj", SqliteType.Text);
+        return cmd;
+    }
+
+    private static SqliteCommand PrepareInsertMcqOptionCommand(SqliteConnection conn, SqliteTransaction tx)
+    {
+        var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "INSERT INTO McqOptions (QuestionId, OptionIndex, OptionText, ImagePath, IsCorrect) VALUES ($qid, $idx, $txt, $img, $cor);";
+        cmd.Parameters.Add("$qid", SqliteType.Text);
+        cmd.Parameters.Add("$idx", SqliteType.Integer);
+        cmd.Parameters.Add("$txt", SqliteType.Text);
+        cmd.Parameters.Add("$img", SqliteType.Text);
+        cmd.Parameters.Add("$cor", SqliteType.Integer);
+        return cmd;
+    }
+
+    private static async Task ExecuteInsertQuestionAsync(SqliteCommand qCmd, SqliteCommand optCmd, Question question, CancellationToken ct)
+    {
+        var mcq = question as McqQuestion;
+        var card = question as FlashcardQuestion;
+        qCmd.Parameters["$id"].Value = question.Id;
+        qCmd.Parameters["$cid"].Value = question.ContainerId;
+        qCmd.Parameters["$idx"].Value = question.Index;
+        qCmd.Parameters["$qt"].Value = question.Type.ToString();
+        qCmd.Parameters["$pt"].Value = (object?)mcq?.Text ?? DBNull.Value;
+        qCmd.Parameters["$mo"].Value = mcq?.MaxOptions ?? 0;
+        qCmd.Parameters["$im"].Value = mcq?.IsMultiCorrect == true ? 1 : 0;
+        qCmd.Parameters["$ft"].Value = (object?)card?.Front.Text ?? DBNull.Value;
+        qCmd.Parameters["$fi"].Value = (object?)card?.Front.ImagePath ?? DBNull.Value;
+        qCmd.Parameters["$fp"].Value = card is null ? DBNull.Value : FormatSidePosition(card.Front);
+        qCmd.Parameters["$bt"].Value = (object?)card?.Back.Text ?? DBNull.Value;
+        qCmd.Parameters["$bi"].Value = (object?)card?.Back.ImagePath ?? DBNull.Value;
+        qCmd.Parameters["$bp"].Value = card is null ? DBNull.Value : FormatSidePosition(card.Back);
+        qCmd.Parameters["$lj"].Value = JsonSerializer.Serialize(question.LayoutOverrides);
+        qCmd.Parameters["$pimg"].Value = (object?)mcq?.ImagePath ?? DBNull.Value;
+        qCmd.Parameters["$exp"].Value = (object?)mcq?.Explanation ?? DBNull.Value;
+        qCmd.Parameters["$ref"].Value = (object?)question.RefKey ?? DBNull.Value;
+        qCmd.Parameters["$pj"].Value = (object?)question.PayloadJson ?? DBNull.Value;
+        await qCmd.ExecuteNonQueryAsync(ct);
 
         if (mcq is not null)
         {
             foreach (var opt in mcq.Options)
-                await ExecAsync(conn, tx, "INSERT INTO McqOptions (QuestionId, OptionIndex, OptionText, ImagePath, IsCorrect) VALUES ($qid, $idx, $txt, $img, $cor);",
-                    ct, ("$qid", mcq.Id), ("$idx", opt.Index), ("$txt", opt.Text), ("$img", opt.ImagePath), ("$cor", opt.IsCorrect ? 1 : 0));
+                await ExecuteInsertMcqOptionAsync(optCmd, mcq.Id, opt, ct);
         }
+    }
+
+    private static Task ExecuteInsertMcqOptionAsync(SqliteCommand optCmd, string questionId, McqOption opt, CancellationToken ct)
+    {
+        optCmd.Parameters["$qid"].Value = questionId;
+        optCmd.Parameters["$idx"].Value = opt.Index;
+        optCmd.Parameters["$txt"].Value = (object?)opt.Text ?? DBNull.Value;
+        optCmd.Parameters["$img"].Value = (object?)opt.ImagePath ?? DBNull.Value;
+        optCmd.Parameters["$cor"].Value = opt.IsCorrect ? 1 : 0;
+        return optCmd.ExecuteNonQueryAsync(ct);
     }
 
     private static string FormatSidePosition(FlashcardSide side) =>
@@ -432,10 +867,15 @@ public sealed class SqliteWorkspaceRepository(
         if (!File.Exists(dbPath)) return null;
         await using var conn = OpenWorkspaceConnection(dbPath);
         await conn.OpenAsync(ct);
-        await EnsureTableColumnsAsync(conn, ct, "WorkspaceMeta", "Name", "Description");
-        await EnsureTableColumnsAsync(conn, ct, "Components", "Title", "RefKey", "LinksJson");
-        await EnsureTableColumnsAsync(conn, ct, "ArticleBlocks", "RefKey", "Caption", "Alt", "CalloutTone", "CalloutTitle", "PayloadJson");
-        await EnsureTableColumnsAsync(conn, ct, "Questions", "PromptImagePath", "Explanation", "RefKey", "PayloadJson");
+        int userVersion = await ReadUserVersionAsync(conn, ct);
+        if (userVersion < CurrentWorkspaceSchemaVersion)
+        {
+            await EnsureTableColumnsAsync(conn, ct, "WorkspaceMeta", "Name", "Description");
+            await EnsureTableColumnsAsync(conn, ct, "Components", "Title", "RefKey", "LinksJson");
+            await EnsureTableColumnsAsync(conn, ct, "ArticleBlocks", "RefKey", "Caption", "Alt", "CalloutTone", "CalloutTitle", "PayloadJson");
+            await EnsureTableColumnsAsync(conn, ct, "Questions", "PromptImagePath", "Explanation", "RefKey", "PayloadJson");
+            try { await ExecAsync(conn, null, $"PRAGMA user_version = {CurrentWorkspaceSchemaVersion};", ct); } catch { }
+        }
 
         string sessionId; string? activeId, name, desc;
         await using (var metaCmd = conn.CreateCommand())
@@ -488,8 +928,13 @@ public sealed class SqliteWorkspaceRepository(
         if (!File.Exists(dbPath)) return null;
         await using var conn = OpenWorkspaceConnection(dbPath);
         await conn.OpenAsync(ct);
-        await EnsureTableColumnsAsync(conn, ct, "WorkspaceMeta", "Name", "Description");
-        await EnsureTableColumnsAsync(conn, ct, "Questions", "PromptImagePath", "Explanation", "RefKey", "PayloadJson");
+        int userVersion = await ReadUserVersionAsync(conn, ct);
+        if (userVersion < CurrentWorkspaceSchemaVersion)
+        {
+            await EnsureTableColumnsAsync(conn, ct, "WorkspaceMeta", "Name", "Description");
+            await EnsureTableColumnsAsync(conn, ct, "Questions", "PromptImagePath", "Explanation", "RefKey", "PayloadJson");
+            try { await ExecAsync(conn, null, $"PRAGMA user_version = {CurrentWorkspaceSchemaVersion};", ct); } catch { }
+        }
 
         string quizId; QuizType quizType; string? name, desc;
         await using (var metaCmd = conn.CreateCommand())

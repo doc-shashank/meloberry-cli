@@ -404,15 +404,30 @@ public sealed class MbypkgExporter(
         {
             if (comp.Kind == ComponentKind.Article)
             {
-                assets.AddRange(comp.ArticleBlocks.Where(b => b.Kind is ArticleBlockKind.Image or ArticleBlockKind.DiagramExplore && !string.IsNullOrWhiteSpace(b.ImagePath)).Select(b => b.ImagePath!));
-                assets.AddRange(comp.ArticleBlocks
-                    .Where(b => b.Kind == ArticleBlockKind.DiagramExplore && Phase1PayloadCodec.TryDeserialize<DiagramExplorePayload>(b.PayloadJson, out var dp) && !string.IsNullOrWhiteSpace(dp?.ImagePath))
-                    .Select(b => Phase1PayloadCodec.TryDeserialize<DiagramExplorePayload>(b.PayloadJson, out var dp) ? dp!.ImagePath : string.Empty)
-                    .Where(p => !string.IsNullOrWhiteSpace(p)));
-                assets.AddRange(comp.LinkCards.Where(l => !string.IsNullOrWhiteSpace(l.ImagePath)).Select(l => l.ImagePath!));
+                List<string>? diagPayloadPaths = null;
+                foreach (var b in comp.ArticleBlocks)
+                {
+                    if (b.Kind is ArticleBlockKind.Image or ArticleBlockKind.DiagramExplore && !string.IsNullOrWhiteSpace(b.ImagePath))
+                        assets.Add(b.ImagePath);
+                    if (b.Kind == ArticleBlockKind.DiagramExplore &&
+                        Phase1PayloadCodec.TryDeserialize<DiagramExplorePayload>(b.PayloadJson, out var dp) &&
+                        !string.IsNullOrWhiteSpace(dp?.ImagePath))
+                    {
+                        (diagPayloadPaths ??= []).Add(dp.ImagePath);
+                    }
+                }
+                if (diagPayloadPaths is not null)
+                    assets.AddRange(diagPayloadPaths);
+                foreach (var l in comp.LinkCards)
+                {
+                    if (!string.IsNullOrWhiteSpace(l.ImagePath))
+                        assets.Add(l.ImagePath);
+                }
             }
             else if (comp.Quiz is not null)
+            {
                 assets.AddRange(CollectQuizAssets(comp.Quiz));
+            }
         }
         return assets;
     }

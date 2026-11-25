@@ -215,6 +215,21 @@ public interface IWorkspaceRepository
     Task<QuestionOwnerContext?> FindQuestionOwnerAsync(string questionId, CancellationToken cancellationToken = default);
     Task<IReadOnlyList<WorkspaceListItem>> ListWorkspacesAsync(string? directoryFilter = null, bool includeAll = false, CancellationToken cancellationToken = default);
     Task SaveOwnerAsync(QuizOwnerContext owner, CancellationToken cancellationToken = default);
+
+    Task UpdateSessionMetadataAsync(StudySession session, CancellationToken cancellationToken = default) =>
+        SaveSessionAsync(session, cancellationToken);
+
+    Task UpdateQuizMetadataAsync(Quiz quiz, CancellationToken cancellationToken = default) =>
+        SaveQuizAsync(quiz, cancellationToken);
+
+    Task UpdateArticleBlockAsync(StudySession session, ArticleBlock block, CancellationToken cancellationToken = default) =>
+        SaveSessionAsync(session, cancellationToken);
+
+    Task UpdateQuestionAsync(QuizOwnerContext owner, Question question, CancellationToken cancellationToken = default) =>
+        SaveOwnerAsync(owner, cancellationToken);
+
+    Task UpdateComponentAsync(StudySession session, SessionComponent component, CancellationToken cancellationToken = default) =>
+        SaveSessionAsync(session, cancellationToken);
 }
 
 public interface ILayoutRepository

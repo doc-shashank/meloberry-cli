@@ -51,6 +51,11 @@ public sealed class SqliteLayoutRepository(MeloberryStorageOptions options) : IL
         await using var conn = OpenAppConnection();
         await conn.OpenAsync(cancellationToken);
         await ConfigureBusyTimeoutAsync(conn, cancellationToken);
+        await using (var pragma = conn.CreateCommand())
+        {
+            pragma.CommandText = "PRAGMA synchronous = NORMAL;";
+            await pragma.ExecuteNonQueryAsync(cancellationToken);
+        }
 
         await using var tx = await conn.BeginTransactionAsync(cancellationToken);
         await using var cmd = conn.CreateCommand();
@@ -87,16 +92,42 @@ public sealed class SqliteLayoutRepository(MeloberryStorageOptions options) : IL
             await using var conn = OpenAppConnection();
             await conn.OpenAsync(cancellationToken);
             await ConfigureBusyTimeoutAsync(conn, cancellationToken);
-            await using var cmd = conn.CreateCommand();
-            cmd.CommandText = """
-                CREATE TABLE IF NOT EXISTS LayoutProfiles (TargetType TEXT PRIMARY KEY, PropertiesJson TEXT NOT NULL, UpdatedAtUtc TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS WorkspaceRegistry (WorkspaceId TEXT PRIMARY KEY, Kind TEXT NOT NULL, SubType TEXT NOT NULL, DbPath TEXT NOT NULL, StorageDirectory TEXT NOT NULL, UpdatedAtUtc TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS EntityIndex (EntityId TEXT PRIMARY KEY, WorkspaceId TEXT NOT NULL);
-                """;
-            await cmd.ExecuteNonQueryAsync(cancellationToken);
+            await using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = """
+                    CREATE TABLE IF NOT EXISTS LayoutProfiles (TargetType TEXT PRIMARY KEY, PropertiesJson TEXT NOT NULL, UpdatedAtUtc TEXT NOT NULL);
+                    CREATE TABLE IF NOT EXISTS WorkspaceRegistry (WorkspaceId TEXT PRIMARY KEY, Kind TEXT NOT NULL, SubType TEXT NOT NULL, DbPath TEXT NOT NULL, StorageDirectory TEXT NOT NULL, UpdatedAtUtc TEXT NOT NULL, ItemCount INTEGER NULL, DbLastWriteUtc TEXT NULL);
+                    CREATE TABLE IF NOT EXISTS EntityIndex (EntityId TEXT PRIMARY KEY, WorkspaceId TEXT NOT NULL);
+                    """;
+                await cmd.ExecuteNonQueryAsync(cancellationToken);
+            }
+            await EnsureWorkspaceRegistryColumnsAsync(conn, cancellationToken);
             _initialized = true;
         }
         finally { _initLock.Release(); }
+    }
+
+    private static async Task EnsureWorkspaceRegistryColumnsAsync(SqliteConnection conn, CancellationToken ct)
+    {
+        var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        await using (var pragma = conn.CreateCommand())
+        {
+            pragma.CommandText = "PRAGMA table_info(WorkspaceRegistry);";
+            await using var r = await pragma.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct)) existing.Add(r.GetString(1));
+        }
+        if (!existing.Contains("ItemCount"))
+        {
+            await using var alter = conn.CreateCommand();
+            alter.CommandText = "ALTER TABLE WorkspaceRegistry ADD COLUMN ItemCount INTEGER NULL;";
+            await alter.ExecuteNonQueryAsync(ct);
+        }
+        if (!existing.Contains("DbLastWriteUtc"))
+        {
+            await using var alter = conn.CreateCommand();
+            alter.CommandText = "ALTER TABLE WorkspaceRegistry ADD COLUMN DbLastWriteUtc TEXT NULL;";
+            await alter.ExecuteNonQueryAsync(ct);
+        }
     }
 
     private static async Task ConfigureBusyTimeoutAsync(SqliteConnection conn, CancellationToken ct)

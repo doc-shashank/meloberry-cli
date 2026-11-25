@@ -43,6 +43,17 @@ public static class LayoutBoundsCatalog
     public static bool IsGlobalOnlyProperty(string propertyName) =>
         GlobalOnlyProperties.Contains(propertyName.Trim(), StringComparer.OrdinalIgnoreCase);
 
+    public static Dictionary<string, string> StripGlobalOnlyProperties(IReadOnlyDictionary<string, string> values)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (key, val) in values)
+        {
+            if (!IsGlobalOnlyProperty(key))
+                result[key] = val;
+        }
+        return result;
+    }
+
     public static bool IsValidPropertyForTarget(string targetType, string propertyName) =>
         FindSpec(targetType.Trim().ToLowerInvariant(), propertyName) is not null;
 

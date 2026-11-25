@@ -133,14 +133,22 @@ public sealed class LocalPreviewHost(
                 var ext = Path.GetExtension(safePath);
                 if (string.Equals(ext, ".svg", StringComparison.OrdinalIgnoreCase))
                     ctx.Response.AddHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox");
+                if (IsImmutableHashedAsset(rel))
+                    ctx.Response.AddHeader("Cache-Control", "public, max-age=31536000, immutable");
 
-                var bytes = await File.ReadAllBytesAsync(safePath, cancellationToken);
-                await TryWriteBytesAsync(ctx.Response, 200, WebHostUtilities.GetMimeType(ext), bytes, cancellationToken);
+                await TryWriteFileStreamAsync(ctx.Response, 200, WebHostUtilities.GetMimeType(ext), safePath, cancellationToken);
                 return false;
             });
         }
 
         return ExitCodes.Success;
+    }
+
+    private static bool IsImmutableHashedAsset(string relativePath)
+    {
+        var norm = relativePath.Replace('\\', '/').TrimStart('/');
+        return norm.StartsWith("assets/", StringComparison.OrdinalIgnoreCase) ||
+               norm.StartsWith("katex/fonts/", StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task<bool> HandleAnalysisPostAsync(
@@ -151,8 +159,13 @@ public sealed class LocalPreviewHost(
         bool jsonOutput,
         CancellationToken cancellationToken)
     {
-        using var reader = new StreamReader(ctx.Request.InputStream, Encoding.UTF8);
-        var body = await reader.ReadToEndAsync(cancellationToken);
+        const int MaxAnalysisRequestBodyBytes = 5 * 1024 * 1024;
+        var (tooLarge, body) = await ReadRequestBodyBoundedAsync(ctx.Request, MaxAnalysisRequestBodyBytes, cancellationToken);
+        if (tooLarge)
+        {
+            await TryWriteJsonAsync(ctx.Response, 413, new { saved = false, error = "Analysis payload exceeds 5 MB limit." }, cancellationToken);
+            return false;
+        }
 
         string reportElement;
         string? markdownText = null;
@@ -758,6 +771,31 @@ public sealed class LocalPreviewHost(
     private static async Task TryWriteStatusAsync(HttpListenerResponse response, int statusCode, CancellationToken cancellationToken)
     {
         await TryWriteBytesAsync(response, statusCode, "text/plain; charset=utf-8", [], cancellationToken);
+    }
+
+    private static async Task TryWriteFileStreamAsync(
+        HttpListenerResponse response,
+        int statusCode,
+        string contentType,
+        string filePath,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var fs = new FileStream(
+                filePath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                bufferSize: 81920, FileOptions.Asynchronous | FileOptions.SequentialScan);
+            response.StatusCode = statusCode;
+            response.ContentType = contentType;
+            response.ContentLength64 = fs.Length;
+            if (fs.Length > 0)
+                await fs.CopyToAsync(response.OutputStream, 81920, cancellationToken);
+            response.Close();
+        }
+        catch (Exception ex) when (ex is HttpListenerException or IOException or ObjectDisposedException or OperationCanceledException)
+        {
+            // Client disconnected or listener closed; avoid crashing the server loop.
+        }
     }
 
     private static async Task TryWriteBytesAsync(

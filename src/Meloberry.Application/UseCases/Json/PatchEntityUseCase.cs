@@ -180,10 +180,56 @@ public sealed class PatchEntityHandler(
                 updatedFields.Add("index");
             }
 
-            if (target.Session is not null)
+            if (target.Session is not null && string.IsNullOrWhiteSpace(command.MoveSpec))
+            {
+                switch (target.EntityKind)
+                {
+                    case "session":
+                        await repository.UpdateSessionMetadataAsync(target.Session, cancellationToken);
+                        break;
+                    case "component":
+                        await repository.UpdateComponentAsync(target.Session, target.Component!, cancellationToken);
+                        break;
+                    case "articleBlock":
+                        await repository.UpdateArticleBlockAsync(target.Session, target.ArticleBlock!, cancellationToken);
+                        break;
+                    case "question":
+                        await repository.UpdateQuestionAsync(
+                            new QuizOwnerContext(target.Session, target.Component, target.Quiz!, target.StorageDirectory),
+                            target.Question!,
+                            cancellationToken);
+                        break;
+                    default:
+                        await repository.SaveSessionAsync(target.Session, cancellationToken);
+                        break;
+                }
+            }
+            else if (target.Quiz is not null && string.IsNullOrWhiteSpace(command.MoveSpec))
+            {
+                switch (target.EntityKind)
+                {
+                    case "quiz":
+                        await repository.UpdateQuizMetadataAsync(target.Quiz, cancellationToken);
+                        break;
+                    case "question":
+                        await repository.UpdateQuestionAsync(
+                            new QuizOwnerContext(null, null, target.Quiz, target.StorageDirectory),
+                            target.Question!,
+                            cancellationToken);
+                        break;
+                    default:
+                        await repository.SaveQuizAsync(target.Quiz, cancellationToken);
+                        break;
+                }
+            }
+            else if (target.Session is not null)
+            {
                 await repository.SaveSessionAsync(target.Session, cancellationToken);
+            }
             else if (target.Quiz is not null)
+            {
                 await repository.SaveQuizAsync(target.Quiz, cancellationToken);
+            }
 
             persisted = true;
             return new PatchEntityResponse(

@@ -26,7 +26,7 @@ public sealed class LayoutEditorPageBuilder : ILayoutEditorPageBuilder
   <link rel="icon" href="data:," />
   <title>Meloberry Component Layout Editor — {{encodedTitleVersion}}</title>
   <style>
-{{WebAppSharedStyles.BuildCoreCss()}}
+{{WebAppSharedStyles.BuildEditorCss()}}
 html, body { height: 100%; overflow: hidden; }
 .ed-shell { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 .ed-topbar { flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; padding: 12px 20px; background: var(--surface); border-bottom: 1px solid var(--border); }
@@ -149,7 +149,7 @@ html, body { height: 100%; overflow: hidden; }
     <div id="editorZoomStage" class="mby-zoom-stage"><img id="editorZoomImg" class="mby-zoom-img" alt="Zoomed preview diagram" /></div>
   </div>
   <script>
-{{WebAppSharedStyles.BuildCoreJs()}}
+{{WebAppSharedStyles.BuildEditorCoreJs()}}
     const INITIAL_COMPONENT = {{encodedInitial}};
     const EDITOR_CSRF_TOKEN = {{encodedCsrf}};
     const COMPONENTS = [
