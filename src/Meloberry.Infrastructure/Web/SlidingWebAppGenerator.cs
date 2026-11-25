@@ -513,28 +513,7 @@ public sealed class SlidingWebAppGenerator(
                 if (sub is null || !Quiz.TryParseQuestionType(sub.Type, out var subType) || subType == QuestionType.CaseGroup)
                     continue;
                 var subId = $"{question.Id}_sub{sub.Index}";
-                Question childDomain = subType switch
-                {
-                    QuestionType.Mcq when sub.Mcq is not null => McqQuestion.Rehydrate(
-                        subId,
-                        question.ContainerId,
-                        sub.Index + 1,
-                        sub.Mcq.Text ?? string.Empty,
-                        Math.Max(2, sub.Mcq.MaxOptions),
-                        sub.Mcq.IsMultiCorrect,
-                        (sub.Mcq.Options ?? []).Select(o => McqOption.Create(o.Index, o.Text, o.ImagePath, o.IsCorrect)),
-                        imagePath: sub.Mcq.ImagePath,
-                        explanation: sub.Mcq.Explanation),
-                    QuestionType.Flashcard when sub.Flashcard is not null => FlashcardQuestion.Rehydrate(
-                        subId,
-                        question.ContainerId,
-                        sub.Index + 1,
-                        FlashcardSide.Rehydrate(sub.Flashcard.Front.Text, sub.Flashcard.Front.ImagePath,
-                            string.Equals(sub.Flashcard.Front.Position, "aboveImage", StringComparison.OrdinalIgnoreCase) ? MediaPosition.TextAboveImage : MediaPosition.TextBelowImage),
-                        FlashcardSide.Rehydrate(sub.Flashcard.Back.Text, sub.Flashcard.Back.ImagePath,
-                            string.Equals(sub.Flashcard.Back.Position, "aboveImage", StringComparison.OrdinalIgnoreCase) ? MediaPosition.TextAboveImage : MediaPosition.TextBelowImage)),
-                    _ => PayloadQuestion.Rehydrate(subId, question.ContainerId, sub.Index + 1, subType, sub.PayloadJson ?? "{}")
-                };
+                var childDomain = sub.RehydrateToDomainQuestion(subType, subId, question.ContainerId);
                 subSlides.Add(BuildQuestionSlide(childDomain, layouts, mergedLayout));
             }
 
@@ -1018,14 +997,6 @@ html, body { height: 100%; overflow: hidden; }
 .mby-modal-title { margin: 0 0 8px; font-size: 19px; font-weight: 800; }
 .mby-modal-text { margin: 0 0 20px; font-size: 14px; color: var(--muted); line-height: 1.5; }
 .mby-modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
-.mby-zoom-modal { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.94); display: flex; flex-direction: column; z-index: 60; }
-.mby-zoom-topbar { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; z-index: 2; }
-.mby-zoom-pill { padding: 6px 12px; border-radius: 999px; background: rgba(255, 255, 255, 0.14); color: #ffffff; font-size: 13px; font-weight: 600; }
-.mby-zoom-actions { display: flex; gap: 8px; }
-.mby-zoom-btn { padding: 6px 12px; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.22); background: rgba(255, 255, 255, 0.12); color: #ffffff; font-weight: 700; cursor: pointer; }
-.mby-zoom-stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; cursor: grab; }
-.mby-zoom-stage:active { cursor: grabbing; }
-.mby-zoom-img { max-width: 90vw; max-height: 82vh; object-fit: contain; user-select: none; transform-origin: center center; }
 .mby-search-modal { align-items: flex-start; padding-top: 8vh; z-index: 55; backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); }
 .mby-search-card { width: 100%; max-width: 700px; background: var(--surface); border: 1px solid var(--border); border-radius: 18px; box-shadow: 0 26px 68px rgba(0, 0, 0, 0.32); overflow: hidden; display: flex; flex-direction: column; max-height: 78vh; }
 .mby-search-header { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--border); background: var(--bg); }
@@ -1079,6 +1050,41 @@ function createRetryBtn(onRetry, visible, label = 'Retry', compact = false) {
   btn.addEventListener('click', () => { if (onRetry) onRetry(); });
   return btn;
 }
+function createExplanationBox(html, initiallyVisible = false) {
+  if (!html) return null;
+  const content = mk('div');
+  content.innerHTML = html;
+  renderMathIn(content);
+  return mk('div', 'mby-explanation-box' + (initiallyVisible ? '' : ' hidden'), null, [mk('div', 'mby-explanation-title', 'Explanation'), content]);
+}
+function recordGradeAttempt(m, isCorrect) {
+  if (!m) return;
+  m.checkAttempts = (m.checkAttempts || 0) + 1;
+  if (m.firstTryCorrect === null) m.firstTryCorrect = isCorrect;
+  m.isCorrect = isCorrect;
+}
+function setFeedbackMessage(el, text, isCorrect) {
+  el.textContent = text;
+  el.style.color = isCorrect ? 'var(--ok)' : 'var(--bad)';
+  el.style.fontWeight = '600';
+}
+function bindDropTarget(el, mimeTypes, onDrop, checkContains = false) {
+  const accepted = Array.isArray(mimeTypes) ? mimeTypes : [mimeTypes];
+  el.addEventListener('dragover', e => {
+    if (e.dataTransfer && accepted.some(t => e.dataTransfer.types.includes(t))) {
+      e.preventDefault();
+      el.classList.add('mby-drop-over');
+    }
+  });
+  el.addEventListener('dragleave', e => {
+    if (!checkContains || !el.contains(e.relatedTarget)) el.classList.remove('mby-drop-over');
+  });
+  el.addEventListener('drop', e => {
+    e.preventDefault();
+    el.classList.remove('mby-drop-over');
+    onDrop(e);
+  });
+}
 
 let currentIndex = 0, isFinished = false, sessionStartedAt = new Date(), activeLeafEnterMs = null, lastVisitedLeafId = null, autoSaveSent = false;
 const activeQuizQuestionIdx = new Map(), quizControllers = new Map(), mcqStateMap = new Map(), flashcardStateMap = new Map(), gradedStateMap = new Map();
@@ -1119,7 +1125,7 @@ function populateGeneratorFooter(footerEl, includeTimestamp) {
   if (!footerEl || !DATA.generator) return;
   const g = DATA.generator;
   const appName = g.appName || 'Meloberry';
-  const rawVer = String(g.version || '2.0.0').trim();
+  const rawVer = String(g.version || '2.1.0').trim();
   const ver = rawVer.startsWith('v') ? rawVer : ('v' + rawVer);
   const repoUrl = g.repositoryUrl || 'https://github.com/doc-shashank/meloberry-cli/';
   footerEl.innerHTML = '';
@@ -1201,11 +1207,7 @@ function buildMcqCard(slide, onAnswered) {
 
   const checkBtn = mk('button', 'mby-check-btn', 'Check Answer'); checkBtn.type = 'button';
   const feedback = mk('span'); if (st.checked) renderMcqFeedback(feedback, st.isCorrect);
-  let explanationBox = null;
-  if (mcq.explanationHtml) {
-    const expContent = mk('div'); expContent.innerHTML = mcq.explanationHtml; renderMathIn(expContent);
-    explanationBox = mk('div', 'mby-explanation-box' + (st.checked ? '' : ' hidden'), null, [mk('div', 'mby-explanation-title', 'Explanation'), expContent]);
-  }
+  const explanationBox = createExplanationBox(mcq.explanationHtml, st.checked);
   const retryBtn = createRetryBtn(() => {
     st.selected.clear();
     st.checked = false;
@@ -1228,12 +1230,8 @@ function buildMcqCard(slide, onAnswered) {
       if (picked !== opt.isCorrect) allCorrect = false;
     });
     st.checked = true; st.isCorrect = allCorrect;
-    if (m) {
-      m.checkAttempts = (m.checkAttempts || 0) + 1;
-      m.selectedOptionIndices = Array.from(st.selected).sort((a, b) => a - b);
-      if (m.firstTryCorrect === null) m.firstTryCorrect = allCorrect;
-      m.isCorrect = allCorrect;
-    }
+    if (m) m.selectedOptionIndices = Array.from(st.selected).sort((a, b) => a - b);
+    recordGradeAttempt(m, allCorrect);
     renderMcqFeedback(feedback, allCorrect);
     retryBtn.classList.remove('hidden');
     if (explanationBox) explanationBox.classList.remove('hidden');
@@ -1434,11 +1432,7 @@ function buildFillBlankCard(slide, onAnswered) {
   const checkBtn = mk('button', 'mby-check-btn', 'Check Answer'); checkBtn.type = 'button';
   const overrideBtn = mk('button', 'mby-override-btn hidden', 'Override: Mark Correct'); overrideBtn.type = 'button';
   const feedback = mk('span');
-  let explanationBox = null;
-  if (fb.explanationHtml) {
-    const expContent = mk('div'); expContent.innerHTML = fb.explanationHtml; renderMathIn(expContent);
-    explanationBox = mk('div', 'mby-explanation-box' + (st.checked ? '' : ' hidden'), null, [mk('div', 'mby-explanation-title', 'Explanation'), expContent]);
-  }
+  const explanationBox = createExplanationBox(fb.explanationHtml, st.checked);
   const retryBtn = createRetryBtn(() => {
     st.values = [];
     st.checked = false;
@@ -1459,9 +1453,7 @@ function buildFillBlankCard(slide, onAnswered) {
   }, st.checked);
 
   function applyGradeUi(allOk, anyFuzzy) {
-    feedback.textContent = allOk ? (anyFuzzy ? 'Almost Correct!' : 'Correct!') : 'Review highlighted blanks.';
-    feedback.style.color = allOk ? 'var(--ok)' : 'var(--bad)';
-    feedback.style.fontWeight = '600';
+    setFeedbackMessage(feedback, allOk ? (anyFuzzy ? 'Almost Correct!' : 'Correct!') : 'Review highlighted blanks.', allOk);
     overrideBtn.classList.toggle('hidden', allOk);
     retryBtn.classList.remove('hidden');
     if (explanationBox) explanationBox.classList.remove('hidden');
@@ -1479,11 +1471,7 @@ function buildFillBlankCard(slide, onAnswered) {
       else { inp.classList.add('wrong'); allOk = false; if (expectedEls[idx]) { expectedEls[idx].innerHTML = 'Answer: ' + (slot?.primaryAnswerHtml || ''); renderMathIn(expectedEls[idx]); expectedEls[idx].classList.remove('hidden'); } }
     });
     st.checked = true; st.isCorrect = allOk; st.overridden = false;
-    if (m) {
-      m.checkAttempts = (m.checkAttempts || 0) + 1;
-      if (m.firstTryCorrect === null) m.firstTryCorrect = allOk;
-      m.isCorrect = allOk;
-    }
+    recordGradeAttempt(m, allOk);
     applyGradeUi(allOk, anyFuzzy);
     if (onAnswered) onAnswered();
     requestAnimationFrame(updateScrollDownHint);
@@ -1493,8 +1481,7 @@ function buildFillBlankCard(slide, onAnswered) {
     st.isCorrect = true; st.overridden = true;
     inputs.forEach(inp => { inp.classList.remove('wrong'); inp.classList.add('correct'); });
     if (m) m.isCorrect = true;
-    feedback.textContent = 'Marked correct (self-override).';
-    feedback.style.color = 'var(--ok)';
+    setFeedbackMessage(feedback, 'Marked correct (self-override).', true);
     overrideBtn.classList.add('hidden');
     retryBtn.classList.remove('hidden');
     if (onAnswered) onAnswered();
@@ -1533,11 +1520,7 @@ function buildAssertionReasonCard(slide, onAnswered) {
 
   const checkBtn = mk('button', 'mby-check-btn', 'Check Answer'); checkBtn.type = 'button';
   const feedback = mk('span');
-  let explanationBox = null;
-  if (ar.explanationHtml) {
-    const expContent = mk('div'); expContent.innerHTML = ar.explanationHtml; renderMathIn(expContent);
-    explanationBox = mk('div', 'mby-explanation-box' + (st.checked ? '' : ' hidden'), null, [mk('div', 'mby-explanation-title', 'Explanation'), expContent]);
-  }
+  const explanationBox = createExplanationBox(ar.explanationHtml, st.checked);
   const retryBtn = createRetryBtn(() => {
     st.selectedCode = null;
     st.checked = false;
@@ -1560,11 +1543,7 @@ function buildAssertionReasonCard(slide, onAnswered) {
       else if (code === st.selectedCode) btn.classList.add('wrong');
     });
     st.checked = true; st.isCorrect = isCorrect;
-    if (m) {
-      m.checkAttempts = (m.checkAttempts || 0) + 1;
-      if (m.firstTryCorrect === null) m.firstTryCorrect = isCorrect;
-      m.isCorrect = isCorrect;
-    }
+    recordGradeAttempt(m, isCorrect);
     renderMcqFeedback(feedback, isCorrect);
     retryBtn.classList.remove('hidden');
     if (explanationBox) explanationBox.classList.remove('hidden');
@@ -1645,11 +1624,7 @@ function buildSpotErrorCard(slide, onAnswered) {
 
   rebuildFixInputs();
   const feedback = mk('span');
-  let explanationBox = null;
-  if (se.explanationHtml) {
-    const expContent = mk('div'); expContent.innerHTML = se.explanationHtml; renderMathIn(expContent);
-    explanationBox = mk('div', 'mby-explanation-box' + (st.checked ? '' : ' hidden'), null, [mk('div', 'mby-explanation-title', 'Explanation'), expContent]);
-  }
+  const explanationBox = createExplanationBox(se.explanationHtml, st.checked);
   const retryBtn = createRetryBtn(() => {
     st.selectedSpans.clear();
     st.pickedNoError = false;
@@ -1709,14 +1684,8 @@ function buildSpotErrorCard(slide, onAnswered) {
     }
 
     st.checked = true; st.isCorrect = allOk;
-    if (m) {
-      m.checkAttempts = (m.checkAttempts || 0) + 1;
-      if (m.firstTryCorrect === null) m.firstTryCorrect = allOk;
-      m.isCorrect = allOk;
-    }
-    feedback.textContent = allOk ? 'Correct!' : 'Review highlighted segments.';
-    feedback.style.color = allOk ? 'var(--ok)' : 'var(--bad)';
-    feedback.style.fontWeight = '600';
+    recordGradeAttempt(m, allOk);
+    setFeedbackMessage(feedback, allOk ? 'Correct!' : 'Review highlighted segments.', allOk);
     retryBtn.classList.remove('hidden');
     if (explanationBox) explanationBox.classList.remove('hidden');
     if (onAnswered) onAnswered();
@@ -1778,11 +1747,7 @@ function buildDiffCard(slide, onAnswered) {
   const checkBtn = mk('button', 'mby-check-btn', 'Check Answer'); checkBtn.type = 'button';
   const overrideBtn = mk('button', 'mby-override-btn hidden', 'Override: Mark Correct'); overrideBtn.type = 'button';
   const feedback = mk('span');
-  let explanationBox = null;
-  if (d.explanationHtml) {
-    const expContent = mk('div'); expContent.innerHTML = d.explanationHtml; renderMathIn(expContent);
-    explanationBox = mk('div', 'mby-explanation-box' + (st.checked ? '' : ' hidden'), null, [mk('div', 'mby-explanation-title', 'Explanation'), expContent]);
-  }
+  const explanationBox = createExplanationBox(d.explanationHtml, st.checked);
 
   const blankInputs = new Map();
   const expectedEls = new Map();
@@ -1923,16 +1888,7 @@ function buildDiffCard(slide, onAnswered) {
               }
             });
             if (d.bank) {
-              inp.addEventListener('dragover', e => {
-                if (e.dataTransfer && (e.dataTransfer.types.includes('application/x-mby-diff-bank') || e.dataTransfer.types.includes('text/plain'))) {
-                  e.preventDefault();
-                  inp.classList.add('mby-drop-over');
-                }
-              });
-              inp.addEventListener('dragleave', () => inp.classList.remove('mby-drop-over'));
-              inp.addEventListener('drop', e => {
-                e.preventDefault();
-                inp.classList.remove('mby-drop-over');
+              bindDropTarget(inp, ['application/x-mby-diff-bank', 'text/plain'], e => {
                 const rawChipId = e.dataTransfer?.getData('application/x-mby-diff-bank');
                 if (rawChipId !== undefined && rawChipId !== '') {
                   const chipIdx = Number(rawChipId);
@@ -1980,16 +1936,7 @@ function buildDiffCard(slide, onAnswered) {
             btn.classList.add('is-dragging');
           });
           btn.addEventListener('dragend', () => btn.classList.remove('is-dragging'));
-          btn.addEventListener('dragover', e => {
-            if (e.dataTransfer?.types.includes('application/x-mby-diff-rearr')) {
-              e.preventDefault();
-              btn.classList.add('mby-drop-over');
-            }
-          });
-          btn.addEventListener('dragleave', () => btn.classList.remove('mby-drop-over'));
-          btn.addEventListener('drop', e => {
-            e.preventDefault();
-            btn.classList.remove('mby-drop-over');
+          bindDropTarget(btn, 'application/x-mby-diff-rearr', e => {
             try {
               const src = JSON.parse(e.dataTransfer?.getData('application/x-mby-diff-rearr') || 'null');
               if (src && src.r === r && src.c !== c) {
@@ -2162,15 +2109,10 @@ function buildDiffCard(slide, onAnswered) {
       feedback.textContent = allOk ? 'Correct!' : 'Review swapped cells.';
     }
 
-    feedback.style.color = allOk ? 'var(--ok)' : 'var(--bad)';
-    feedback.style.fontWeight = '600';
+    setFeedbackMessage(feedback, feedback.textContent, allOk);
     st.checked = true; st.isCorrect = allOk; st.overridden = false;
     retryBtn.classList.remove('hidden');
-    if (m) {
-      m.checkAttempts = (m.checkAttempts || 0) + 1;
-      if (m.firstTryCorrect === null) m.firstTryCorrect = allOk;
-      m.isCorrect = allOk;
-    }
+    recordGradeAttempt(m, allOk);
     if (explanationBox) explanationBox.classList.remove('hidden');
     if (onAnswered) onAnswered();
     requestAnimationFrame(updateScrollDownHint);
@@ -2216,11 +2158,7 @@ function buildMechanismCard(slide, onAnswered) {
   const canonicalBox = mk('div', 'mby-mech-canonical hidden');
   const checkBtn = mk('button', 'mby-check-btn', 'Check Sequence'); checkBtn.type = 'button';
   const feedback = mk('span');
-  let explanationBox = null;
-  if (mech.explanationHtml) {
-    const expContent = mk('div'); expContent.innerHTML = mech.explanationHtml; renderMathIn(expContent);
-    explanationBox = mk('div', 'mby-explanation-box' + (st.checked ? '' : ' hidden'), null, [mk('div', 'mby-explanation-title', 'Explanation'), expContent]);
-  }
+  const explanationBox = createExplanationBox(mech.explanationHtml, st.checked);
 
   const animateSeqUpdate = mutateFn => {
     const firstRects = new Map();
@@ -2252,16 +2190,7 @@ function buildMechanismCard(slide, onAnswered) {
     });
   };
 
-  bankEl.addEventListener('dragover', e => {
-    if (e.dataTransfer?.types.includes('application/x-mby-mech-step')) {
-      e.preventDefault();
-      bankEl.classList.add('mby-drop-over');
-    }
-  });
-  bankEl.addEventListener('dragleave', e => { if (!bankEl.contains(e.relatedTarget)) bankEl.classList.remove('mby-drop-over'); });
-  bankEl.addEventListener('drop', e => {
-    e.preventDefault();
-    bankEl.classList.remove('mby-drop-over');
+  bindDropTarget(bankEl, 'application/x-mby-mech-step', e => {
     try {
       const payload = JSON.parse(e.dataTransfer?.getData('application/x-mby-mech-step') || 'null');
       if (payload && payload.source === 'seq' && st.placedIds.includes(payload.sid)) {
@@ -2271,7 +2200,7 @@ function buildMechanismCard(slide, onAnswered) {
         });
       }
     } catch {}
-  });
+  }, true);
 
   seqEl.addEventListener('dragover', e => {
     if (e.dataTransfer?.types.includes('application/x-mby-mech-step')) {
@@ -2457,14 +2386,8 @@ function buildMechanismCard(slide, onAnswered) {
     }
 
     st.checked = true; st.isCorrect = allOk;
-    if (m) {
-      m.checkAttempts = (m.checkAttempts || 0) + 1;
-      if (m.firstTryCorrect === null) m.firstTryCorrect = allOk;
-      m.isCorrect = allOk;
-    }
-    feedback.textContent = allOk ? 'Sequence correct!' : 'Review highlighted steps.';
-    feedback.style.color = allOk ? 'var(--ok)' : 'var(--bad)';
-    feedback.style.fontWeight = '600';
+    recordGradeAttempt(m, allOk);
+    setFeedbackMessage(feedback, allOk ? 'Sequence correct!' : 'Review highlighted steps.', allOk);
     retryBtn.classList.remove('hidden');
     if (explanationBox) explanationBox.classList.remove('hidden');
     if (onAnswered) onAnswered();
@@ -2527,11 +2450,7 @@ function buildRelabelCard(slide, onAnswered) {
 
   const unlockZoom = () => { st.zoomUnlocked = true; zoomBtn.classList.remove('hidden'); };
 
-  let explanationBox = null;
-  if (rel.explanationHtml) {
-    const expContent = mk('div'); expContent.innerHTML = rel.explanationHtml; renderMathIn(expContent);
-    explanationBox = mk('div', 'mby-explanation-box' + (st.checked ? '' : ' hidden'), null, [mk('div', 'mby-explanation-title', 'Explanation'), expContent]);
-  }
+  const explanationBox = createExplanationBox(rel.explanationHtml, st.checked);
 
   const syncBoxVisuals = () => {
     boxes.forEach(b => {
@@ -2572,16 +2491,7 @@ function buildRelabelCard(slide, onAnswered) {
       }
     });
     if (mode === 'bank') {
-      btn.addEventListener('dragover', e => {
-        if (e.dataTransfer?.types.includes('application/x-mby-relabel-chip')) {
-          e.preventDefault();
-          btn.classList.add('mby-drop-over');
-        }
-      });
-      btn.addEventListener('dragleave', () => btn.classList.remove('mby-drop-over'));
-      btn.addEventListener('drop', e => {
-        e.preventDefault();
-        btn.classList.remove('mby-drop-over');
+      bindDropTarget(btn, 'application/x-mby-relabel-chip', e => {
         const raw = e.dataTransfer?.getData('application/x-mby-relabel-chip');
         if (raw !== undefined && raw !== '' && assignChipToBox) {
           const cid = Number(raw);
@@ -2637,15 +2547,9 @@ function buildRelabelCard(slide, onAnswered) {
       unlockZoom();
       knownBtn.classList.toggle('active-known', ok);
       reviewBtn.classList.toggle('active-review', !ok);
-      if (m) {
-        m.checkAttempts = (m.checkAttempts || 0) + 1;
-        if (m.firstTryCorrect === null) m.firstTryCorrect = ok;
-        m.isCorrect = ok;
-        m.flashcardRating = r;
-      }
-      feedback.textContent = ok ? 'Marked as known!' : 'Flagged for review.';
-      feedback.style.color = ok ? 'var(--ok)' : 'var(--bad)';
-      feedback.style.fontWeight = '600';
+      recordGradeAttempt(m, ok);
+      if (m) m.flashcardRating = r;
+      setFeedbackMessage(feedback, ok ? 'Marked as known!' : 'Flagged for review.', ok);
       retryBtn.classList.remove('hidden');
       if (explanationBox) explanationBox.classList.remove('hidden');
       if (onAnswered) onAnswered();
@@ -2713,16 +2617,7 @@ function buildRelabelCard(slide, onAnswered) {
           syncBoxVisuals();
           renderBankUi();
         });
-        row.addEventListener('dragover', e => {
-          if (e.dataTransfer?.types.includes('application/x-mby-relabel-chip')) {
-            e.preventDefault();
-            row.classList.add('mby-drop-over');
-          }
-        });
-        row.addEventListener('dragleave', () => row.classList.remove('mby-drop-over'));
-        row.addEventListener('drop', e => {
-          e.preventDefault();
-          row.classList.remove('mby-drop-over');
+        bindDropTarget(row, 'application/x-mby-relabel-chip', e => {
           const raw = e.dataTransfer?.getData('application/x-mby-relabel-chip');
           if (raw !== undefined && raw !== '') {
             const cid = Number(raw);
@@ -2765,14 +2660,8 @@ function buildRelabelCard(slide, onAnswered) {
       st.checked = true; st.isCorrect = allOk;
       unlockZoom();
       renderBankUi();
-      if (m) {
-        m.checkAttempts = (m.checkAttempts || 0) + 1;
-        if (m.firstTryCorrect === null) m.firstTryCorrect = allOk;
-        m.isCorrect = allOk;
-      }
-      feedback.textContent = allOk ? 'All labels correct!' : 'Review highlighted boxes.';
-      feedback.style.color = allOk ? 'var(--ok)' : 'var(--bad)';
-      feedback.style.fontWeight = '600';
+      recordGradeAttempt(m, allOk);
+      setFeedbackMessage(feedback, allOk ? 'All labels correct!' : 'Review highlighted boxes.', allOk);
       retryBtn.classList.remove('hidden');
       if (explanationBox) explanationBox.classList.remove('hidden');
       if (onAnswered) onAnswered();
@@ -2849,14 +2738,8 @@ function buildRelabelCard(slide, onAnswered) {
       });
       st.checked = true; st.isCorrect = allOk;
       unlockZoom();
-      if (m) {
-        m.checkAttempts = (m.checkAttempts || 0) + 1;
-        if (m.firstTryCorrect === null) m.firstTryCorrect = allOk;
-        m.isCorrect = allOk;
-      }
-      feedback.textContent = allOk ? (anyFuzzy ? 'Almost Correct!' : 'All labels correct!') : 'Review highlighted labels.';
-      feedback.style.color = allOk ? 'var(--ok)' : 'var(--bad)';
-      feedback.style.fontWeight = '600';
+      recordGradeAttempt(m, allOk);
+      setFeedbackMessage(feedback, allOk ? (anyFuzzy ? 'Almost Correct!' : 'All labels correct!') : 'Review highlighted labels.', allOk);
       overrideBtn.classList.toggle('hidden', allOk);
       retryBtn.classList.remove('hidden');
       if (explanationBox) explanationBox.classList.remove('hidden');
@@ -2946,7 +2829,7 @@ function buildDiagramExploreBlock(b) {
   const nextSpotBtn = mk('button', 'mby-retry-btn is-compact', 'Next'); nextSpotBtn.type = 'button';
   const showAllBtn = mk('button', 'mby-retry-btn is-compact', 'Show All'); showAllBtn.type = 'button';
   const zoomBtn = mk('button', 'mby-retry-btn is-compact', 'Zoom'); zoomBtn.type = 'button';
-  zoomBtn.addEventListener('click', () => openLightbox(diag.imagePath, diag.alt || diag.title || 'Diagram'));
+  zoomBtn.addEventListener('click', () => openZoomLightbox(diag.imagePath, diag.alt || diag.title || 'Diagram'));
   nav.appendChild(prevSpotBtn); nav.appendChild(nextSpotBtn); nav.appendChild(showAllBtn); nav.appendChild(zoomBtn);
   head.appendChild(nav);
   wrap.appendChild(head);
@@ -3111,7 +2994,7 @@ function buildClassifyCard(slide, onAnswered) {
 
   const checkBtn = mk('button', 'mby-check-btn', 'Check Answer'); checkBtn.type = 'button';
   const feedback = mk('span');
-  const explanationBox = createExplanationBox(cl.explanationHtml);
+  const explanationBox = createExplanationBox(cl.explanationHtml, st.checked);
 
   function assignItem(itemId, bucketId) {
     if (bucketId === null || bucketId === undefined) delete st.placements[itemId];
@@ -3162,9 +3045,7 @@ function buildClassifyCard(slide, onAnswered) {
     return chip;
   }
 
-  poolEl.addEventListener('dragover', e => { if (e.dataTransfer?.types.includes('application/x-mby-classify-item')) e.preventDefault(); });
-  poolEl.addEventListener('drop', e => {
-    e.preventDefault();
+  bindDropTarget(poolEl, 'application/x-mby-classify-item', e => {
     const raw = e.dataTransfer?.getData('application/x-mby-classify-item');
     if (raw !== undefined && raw !== '') assignItem(Number(raw), null);
   });
@@ -3188,9 +3069,7 @@ function buildClassifyCard(slide, onAnswered) {
       st.order.filter(id => st.placements[id] === b.bucketId).map(id => itemsById.get(id)).filter(Boolean).forEach(it => itemsRow.appendChild(createChipNode(it)));
       box.appendChild(itemsRow);
 
-      box.addEventListener('dragover', e => { if (e.dataTransfer?.types.includes('application/x-mby-classify-item')) e.preventDefault(); });
-      box.addEventListener('drop', e => {
-        e.preventDefault();
+      bindDropTarget(box, 'application/x-mby-classify-item', e => {
         const raw = e.dataTransfer?.getData('application/x-mby-classify-item');
         if (raw !== undefined && raw !== '') assignItem(Number(raw), b.bucketId);
       });
@@ -3205,11 +3084,8 @@ function buildClassifyCard(slide, onAnswered) {
     const ok = placedCount === cl.items.length && cl.items.every(it => st.placements[it.itemId] === it.bucketId);
     st.checked = true;
     st.isCorrect = ok;
-    const m = metricById.get(slide.id);
-    if (m) { m.checkAttempts = (m.checkAttempts || 0) + 1; if (m.firstTryCorrect === null) m.firstTryCorrect = ok; m.isCorrect = ok; }
-    feedback.textContent = ok ? `Correct! All ${cl.items.length} items sorted.` : `${cl.items.filter(it => st.placements[it.itemId] === it.bucketId).length} / ${cl.items.length} correct.`;
-    feedback.style.color = ok ? 'var(--ok)' : 'var(--bad)';
-    feedback.style.fontWeight = '600';
+    recordGradeAttempt(metricById.get(slide.id), ok);
+    setFeedbackMessage(feedback, ok ? `Correct! All ${cl.items.length} items sorted.` : `${cl.items.filter(it => st.placements[it.itemId] === it.bucketId).length} / ${cl.items.length} correct.`, ok);
     if (explanationBox) explanationBox.classList.remove('hidden');
     renderClassifyUi();
     if (onAnswered) onAnswered();
@@ -3218,10 +3094,7 @@ function buildClassifyCard(slide, onAnswered) {
   renderClassifyUi();
   const actionRow = mk('div', 'mby-action-row', null, [checkBtn, retryBtn, feedback]);
   body.appendChild(actionRow);
-  if (explanationBox) {
-    if (st.checked) explanationBox.classList.remove('hidden');
-    body.appendChild(explanationBox);
-  }
+  if (explanationBox) body.appendChild(explanationBox);
   card.appendChild(body);
   return card;
 }
@@ -3256,7 +3129,7 @@ function buildMatchCard(slide, onAnswered) {
 
   const checkBtn = mk('button', 'mby-check-btn', 'Check Answer'); checkBtn.type = 'button';
   const feedback = mk('span');
-  const explanationBox = createExplanationBox(mt.explanationHtml);
+  const explanationBox = createExplanationBox(mt.explanationHtml, st.checked);
 
   function assignOption(pairId, optId) {
     if (optId !== null && optId !== undefined) {
@@ -3322,9 +3195,7 @@ function buildMatchCard(slide, onAnswered) {
         }
       }
 
-      slot.addEventListener('dragover', e => { if (e.dataTransfer?.types.includes('application/x-mby-match-opt')) e.preventDefault(); });
-      slot.addEventListener('drop', e => {
-        e.preventDefault();
+      bindDropTarget(slot, 'application/x-mby-match-opt', e => {
         const raw = e.dataTransfer?.getData('application/x-mby-match-opt');
         if (raw !== undefined && raw !== '') assignOption(pair.pairId, Number(raw));
       });
@@ -3364,11 +3235,8 @@ function buildMatchCard(slide, onAnswered) {
     const ok = okCount === mt.pairs.length;
     st.checked = true;
     st.isCorrect = ok;
-    const m = metricById.get(slide.id);
-    if (m) { m.checkAttempts = (m.checkAttempts || 0) + 1; if (m.firstTryCorrect === null) m.firstTryCorrect = ok; m.isCorrect = ok; }
-    feedback.textContent = ok ? 'Correct!' : `${okCount} / ${mt.pairs.length} pairs correct.`;
-    feedback.style.color = ok ? 'var(--ok)' : 'var(--bad)';
-    feedback.style.fontWeight = '600';
+    recordGradeAttempt(metricById.get(slide.id), ok);
+    setFeedbackMessage(feedback, ok ? 'Correct!' : `${okCount} / ${mt.pairs.length} pairs correct.`, ok);
     if (explanationBox) explanationBox.classList.remove('hidden');
     renderMatchUi();
     if (onAnswered) onAnswered();
@@ -3376,10 +3244,7 @@ function buildMatchCard(slide, onAnswered) {
 
   renderMatchUi();
   body.appendChild(mk('div', 'mby-action-row', null, [checkBtn, retryBtn, feedback]));
-  if (explanationBox) {
-    if (st.checked) explanationBox.classList.remove('hidden');
-    body.appendChild(explanationBox);
-  }
+  if (explanationBox) body.appendChild(explanationBox);
   card.appendChild(body);
   return card;
 }
@@ -3411,7 +3276,7 @@ function buildNumericCard(slide, onAnswered) {
 
   const checkBtn = mk('button', 'mby-check-btn', 'Check Answer'); checkBtn.type = 'button';
   const feedback = mk('span');
-  const explanationBox = createExplanationBox(num.explanationHtml);
+  const explanationBox = createExplanationBox(num.explanationHtml, st.checked);
 
   const tolRadius = num.toleranceMode === 'percent' ? Math.abs(num.answer * (num.tolerance / 100)) : Math.abs(num.tolerance);
 
@@ -3423,9 +3288,7 @@ function buildNumericCard(slide, onAnswered) {
       const unitTxt = num.unit ? ` ${num.unit}` : '';
       if (tolRadius > 0) rangeEl.textContent = `Accepted: ${(num.answer - tolRadius).toPrecision(4)} .. ${(num.answer + tolRadius).toPrecision(4)}${unitTxt}`;
       else rangeEl.textContent = `Exact answer: ${num.answer}${unitTxt}`;
-      feedback.textContent = st.isCorrect ? 'Correct!' : 'Out of accepted range.';
-      feedback.style.color = st.isCorrect ? 'var(--ok)' : 'var(--bad)';
-      feedback.style.fontWeight = '600';
+      setFeedbackMessage(feedback, st.isCorrect ? 'Correct!' : 'Out of accepted range.', st.isCorrect);
       if (explanationBox) explanationBox.classList.remove('hidden');
     } else {
       feedback.textContent = '';
@@ -3452,8 +3315,7 @@ function buildNumericCard(slide, onAnswered) {
     const ok = Number.isFinite(parsed) && Math.abs(parsed - num.answer) <= tolRadius + 1e-9;
     st.checked = true;
     st.isCorrect = ok;
-    const m = metricById.get(slide.id);
-    if (m) { m.checkAttempts = (m.checkAttempts || 0) + 1; if (m.firstTryCorrect === null) m.firstTryCorrect = ok; m.isCorrect = ok; }
+    recordGradeAttempt(metricById.get(slide.id), ok);
     syncVisual();
     if (onAnswered) onAnswered();
   }

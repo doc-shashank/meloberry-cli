@@ -107,6 +107,67 @@ public static class PathConfinement
         fullPath = candidate;
         return true;
     }
+
+    public static bool TryResolveConfinedInputFile(
+        string rawPath,
+        string componentBaseDir,
+        string? specRootDir,
+        string? cwdDir,
+        out string resolvedPath)
+    {
+        resolvedPath = string.Empty;
+        if (string.IsNullOrWhiteSpace(rawPath)) return false;
+
+        if (TryResolveInside(componentBaseDir, rawPath, out var compCandidate))
+            resolvedPath = compCandidate;
+        else if (!string.IsNullOrWhiteSpace(specRootDir) && TryResolveRelativeInsideRoot(componentBaseDir, rawPath, specRootDir, out var nestedCandidate))
+            resolvedPath = nestedCandidate;
+        else if (!string.IsNullOrWhiteSpace(specRootDir) && TryResolveInside(specRootDir, rawPath, out var rootCandidate))
+            resolvedPath = rootCandidate;
+        else
+            return false;
+
+        if (!File.Exists(resolvedPath) && !StartsWithParentTraversal(rawPath))
+        {
+            if (!string.IsNullOrWhiteSpace(specRootDir) && TryResolveInside(specRootDir, rawPath, out var rootFallback) && File.Exists(rootFallback))
+                resolvedPath = rootFallback;
+            else if (!string.IsNullOrWhiteSpace(cwdDir) && TryResolveInside(cwdDir, rawPath, out var cwdFallback) && File.Exists(cwdFallback))
+                resolvedPath = cwdFallback;
+        }
+
+        return true;
+    }
+
+    private static bool TryResolveRelativeInsideRoot(string baseDir, string rawPath, string rootDir, out string resolvedPath)
+    {
+        resolvedPath = string.Empty;
+        if (string.IsNullOrWhiteSpace(rawPath) || rawPath.Contains('\0')) return false;
+        var trimmed = rawPath.Trim();
+        if (Path.IsPathRooted(trimmed)) return false;
+        try
+        {
+            var rootFull = Path.GetFullPath(rootDir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var candidateFull = Path.GetFullPath(Path.Combine(baseDir, trimmed));
+            var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+            if (candidateFull.StartsWith(rootFull + Path.DirectorySeparatorChar, comparison))
+            {
+                resolvedPath = candidateFull;
+                return true;
+            }
+            return false;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool StartsWithParentTraversal(string rawPath)
+    {
+        var normalized = rawPath.Trim().Replace('/', '\\');
+        return normalized.Equals("..", StringComparison.Ordinal) ||
+               normalized.StartsWith("..\\", StringComparison.Ordinal);
+    }
 }
 
 public interface IWorkingDirectoryProvider

@@ -293,14 +293,13 @@ public static partial class Phase2PayloadRules
     public static string NormalizeRelabelStyle(string? style) =>
         string.IsNullOrWhiteSpace(style) ? string.Empty : style.Trim().ToLowerInvariant();
 
+    public static bool HasValidNormalizedBox(double x, double y, double w, double h) =>
+        double.IsFinite(x) && double.IsFinite(y) && double.IsFinite(w) && double.IsFinite(h) &&
+        x >= 0.0 && y >= 0.0 && w > 0.0 && h > 0.0 &&
+        x + w <= 1.001 && y + h <= 1.001;
+
     public static bool HasValidRelabelBoxBounds(RelabelBox box) =>
-        !double.IsNaN(box.X) && !double.IsInfinity(box.X) &&
-        !double.IsNaN(box.Y) && !double.IsInfinity(box.Y) &&
-        !double.IsNaN(box.W) && !double.IsInfinity(box.W) &&
-        !double.IsNaN(box.H) && !double.IsInfinity(box.H) &&
-        box.X >= 0.0 && box.Y >= 0.0 &&
-        box.W > 0.0 && box.H > 0.0 &&
-        box.X + box.W <= 1.001 && box.Y + box.H <= 1.001;
+        HasValidNormalizedBox(box.X, box.Y, box.W, box.H);
 
     public static bool ValidateRelabelBox(RelabelBox box) =>
         box is not null &&

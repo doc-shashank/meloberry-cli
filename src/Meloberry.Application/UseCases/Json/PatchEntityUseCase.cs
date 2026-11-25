@@ -9,6 +9,7 @@ using Meloberry.Domain.Payloads;
 using Meloberry.Domain.Questions;
 using Meloberry.Domain.Quizzes;
 using Meloberry.Domain.Sessions;
+using static Meloberry.Application.UseCases.Json.JsonNodeReaders;
 
 namespace Meloberry.Application.UseCases.Json;
 
@@ -141,7 +142,7 @@ public sealed class PatchEntityHandler(
             {
                 if (!allowedKeys.Contains(kv.Key))
                 {
-                    var hint = FindClosest(kv.Key, allowedKeys);
+                    var hint = TextSimilarity.FindClosest(kv.Key, allowedKeys);
                     return new Error(
                         "Patch.UnknownField",
                         $"Unknown or unsupported field '{kv.Key}' for {schemaKey}.",
@@ -463,14 +464,9 @@ public sealed class PatchEntityHandler(
         }
         if (TryGetProp(patch, "imagePath", out var imgNode))
         {
-            var rawImg = imgNode?.GetValueKind() == JsonValueKind.String ? imgNode.GetValue<string>() : null;
-            if (string.IsNullOrWhiteSpace(rawImg))
-                return new Error("Patch.InvalidValue", "'imagePath' must be a non-empty string.", ErrorType.Validation, Path: "imagePath");
-            var imgRes = await JsonQuestionMaterializer.CopyConfinedImageAsync(rawImg, jsonDir, storageDir, contentInspector, ct, workspaceCwdDirectory: workingDirectoryProvider.GetCurrentDirectory());
+            var imgRes = await TryCopyPatchedImageAsync(imgNode, "imagePath", allowNull: false, "'imagePath' must be a non-empty string.", storageDir, jsonDir, ct);
             if (!imgRes.IsSuccess) return imgRes.Error!;
-            if (string.IsNullOrWhiteSpace(imgRes.Value))
-                return new Error("Patch.InvalidValue", "'imagePath' must resolve to a valid image.", ErrorType.Validation, Path: "imagePath");
-            var res = block.UpdateImage(imgRes.Value);
+            var res = block.UpdateImage(imgRes.Value!);
             if (!res.IsSuccess) return res.Error!;
         }
         if (TryGetProp(patch, "caption", out var capNode))
@@ -486,6 +482,104 @@ public sealed class PatchEntityHandler(
                 return new Error("Patch.InvalidValue", "'alt' must be a string or null.", ErrorType.Validation, Path: "alt");
             var res = block.SetImageAlt(altNode?.GetValue<string>());
             if (!res.IsSuccess) return res.Error!;
+        }
+        return Result.Success();
+    }
+
+    private async Task<Result<string?>> TryCopyPatchedImageAsync(
+        JsonNode? imgNode,
+        string path,
+        bool allowNull,
+        string invalidMsg,
+        string storageDir,
+        string jsonDir,
+        CancellationToken ct,
+        bool treatWhitespaceAsNull = true)
+    {
+        if (imgNode is null)
+            return allowNull ? (string?)null : new Error("Patch.InvalidValue", invalidMsg, ErrorType.Validation, Path: path);
+        if (imgNode.GetValueKind() != JsonValueKind.String)
+            return new Error("Patch.InvalidValue", allowNull ? "'imagePath' must be a string or null." : invalidMsg, ErrorType.Validation, Path: path);
+
+        var rawImg = imgNode.GetValue<string>();
+        if (string.IsNullOrWhiteSpace(rawImg))
+            return allowNull && treatWhitespaceAsNull ? (string?)null : new Error("Patch.InvalidValue", invalidMsg, ErrorType.Validation, Path: path);
+
+        var copyRes = await JsonQuestionMaterializer.CopyConfinedImageAsync(
+            rawImg, jsonDir, storageDir, contentInspector, ct,
+            workspaceCwdDirectory: workingDirectoryProvider.GetCurrentDirectory());
+        if (!copyRes.IsSuccess) return copyRes.Error!;
+        if (!allowNull && string.IsNullOrWhiteSpace(copyRes.Value))
+            return new Error("Patch.InvalidValue", "'imagePath' must resolve to a valid image.", ErrorType.Validation, Path: path);
+        return copyRes.Value;
+    }
+
+    private static Result PatchTableGridFields(
+        JsonObject patch,
+        int minHeaders,
+        string ownerLabel,
+        ref IReadOnlyList<string> headers,
+        ref IReadOnlyList<string> alignments,
+        ref IReadOnlyList<IReadOnlyList<string>> rows,
+        out bool recomputeSpecial)
+    {
+        recomputeSpecial = false;
+        if (TryGetProp(patch, "headers", out var hdrNode))
+        {
+            if (hdrNode is not JsonArray hdrArr || hdrArr.Count < minHeaders)
+                return new Error("Patch.InvalidValue", minHeaders == 1 ? "'headers' must be a non-empty array of strings." : $"'headers' must be an array of at least {minHeaders} column strings.", ErrorType.Validation, Path: "headers");
+            var parsed = new List<string>(hdrArr.Count);
+            foreach (var item in hdrArr)
+            {
+                if (item is null || item.GetValueKind() != JsonValueKind.String)
+                    return new Error("Patch.InvalidValue", "'headers' entries must be strings.", ErrorType.Validation, Path: "headers");
+                parsed.Add(item.GetValue<string>());
+            }
+            if (parsed.All(string.IsNullOrWhiteSpace))
+                return new Error("Patch.InvalidValue", "'headers' must contain at least one non-whitespace column label.", ErrorType.Validation, Path: "headers");
+            headers = parsed;
+            if (!TryGetProp(patch, "alignments", out _) && alignments.Count != headers.Count)
+                alignments = Enumerable.Repeat("left", headers.Count).ToList();
+            recomputeSpecial = true;
+        }
+        if (TryGetProp(patch, "alignments", out var alignNode))
+        {
+            if (alignNode is not JsonArray alignArr)
+                return new Error("Patch.InvalidValue", "'alignments' must be an array of 'left', 'center', or 'right'.", ErrorType.Validation, Path: "alignments");
+            var parsed = new List<string>(alignArr.Count);
+            foreach (var item in alignArr)
+            {
+                if (item is null || item.GetValueKind() != JsonValueKind.String)
+                    return new Error("Patch.InvalidValue", "'alignments' entries must be strings.", ErrorType.Validation, Path: "alignments");
+                var val = item.GetValue<string>().Trim().ToLowerInvariant();
+                if (val is not ("left" or "center" or "right"))
+                    return new Error("Patch.InvalidValue", $"Invalid alignment '{val}'. Use 'left', 'center', or 'right'.", ErrorType.Validation, Path: "alignments");
+                parsed.Add(val);
+            }
+            if (parsed.Count != headers.Count)
+                return new Error("Patch.InvalidValue", $"'alignments' length ({parsed.Count}) must match 'headers' length ({headers.Count}).", ErrorType.Validation, Path: "alignments");
+            alignments = parsed;
+        }
+        if (TryGetProp(patch, "rows", out var rowsNode))
+        {
+            if (rowsNode is not JsonArray rowsArr || rowsArr.Count == 0)
+                return new Error("Patch.InvalidValue", "'rows' must be a non-empty array of string arrays.", ErrorType.Validation, Path: "rows");
+            var parsedRows = new List<IReadOnlyList<string>>(rowsArr.Count);
+            foreach (var rItem in rowsArr)
+            {
+                if (rItem is not JsonArray cellArr)
+                    return new Error("Patch.InvalidValue", "Each row in 'rows' must be an array of strings.", ErrorType.Validation, Path: "rows");
+                var row = new List<string>(cellArr.Count);
+                foreach (var cItem in cellArr)
+                {
+                    if (cItem is null || cItem.GetValueKind() != JsonValueKind.String)
+                        return new Error("Patch.InvalidValue", $"{ownerLabel} cell values must be strings.", ErrorType.Validation, Path: "rows");
+                    row.Add(cItem.GetValue<string>());
+                }
+                parsedRows.Add(row);
+            }
+            rows = parsedRows;
+            recomputeSpecial = true;
         }
         return Result.Success();
     }
@@ -546,30 +640,15 @@ public sealed class PatchEntityHandler(
         var footnote = current.Footnote;
         bool updateTitle = false;
 
-        if (TryGetProp(patch, "title", out var titleNode))
-        {
-            if (titleNode is not null && titleNode.GetValueKind() != JsonValueKind.String)
-                return new Error("Patch.InvalidValue", "'title' must be a string or null.", ErrorType.Validation, Path: "title");
-            title = string.IsNullOrWhiteSpace(titleNode?.GetValue<string>()) ? null : titleNode!.GetValue<string>().Trim();
-            updateTitle = true;
-        }
-        if (TryGetProp(patch, "caption", out var capNode))
-        {
-            if (capNode is not null && capNode.GetValueKind() != JsonValueKind.String)
-                return new Error("Patch.InvalidValue", "'caption' must be a string or null.", ErrorType.Validation, Path: "caption");
-            caption = string.IsNullOrWhiteSpace(capNode?.GetValue<string>()) ? null : capNode!.GetValue<string>().Trim();
-        }
-        if (TryGetProp(patch, "footnote", out var fnNode))
-        {
-            if (fnNode is not null && fnNode.GetValueKind() != JsonValueKind.String)
-                return new Error("Patch.InvalidValue", "'footnote' must be a string or null.", ErrorType.Validation, Path: "footnote");
-            footnote = string.IsNullOrWhiteSpace(fnNode?.GetValue<string>()) ? null : fnNode!.GetValue<string>().Trim();
-        }
-        if (TryGetProp(patch, "stickyFirstCol", out var stickyNode))
-        {
-            if (stickyNode is not JsonValue sv || !sv.TryGetValue<bool>(out sticky))
-                return new Error("Patch.InvalidValue", "'stickyFirstCol' must be a boolean.", ErrorType.Validation, Path: "stickyFirstCol");
-        }
+        if (TryReadNullableString(patch, "title", out var titleVal, out var titleErr)) { title = titleVal; updateTitle = true; }
+        else if (titleErr is not null) return titleErr;
+        if (TryReadNullableString(patch, "caption", out var capVal, out var capErr)) caption = capVal;
+        else if (capErr is not null) return capErr;
+        if (TryReadNullableString(patch, "footnote", out var fnVal, out var fnErr)) footnote = fnVal;
+        else if (fnErr is not null) return fnErr;
+        if (TryReadBool(patch, "stickyFirstCol", out var stickyVal, out var stickyErr)) sticky = stickyVal;
+        else if (stickyErr is not null) return stickyErr;
+
         if (TryGetProp(patch, "hideableCols", out var hcNode))
         {
             if (hcNode is not JsonArray hcArr)
@@ -583,61 +662,9 @@ public sealed class PatchEntityHandler(
             }
             hideableCols = cols;
         }
-        if (TryGetProp(patch, "headers", out var hdrNode))
-        {
-            if (hdrNode is not JsonArray hdrArr || hdrArr.Count == 0)
-                return new Error("Patch.InvalidValue", "'headers' must be a non-empty array of strings.", ErrorType.Validation, Path: "headers");
-            var parsed = new List<string>(hdrArr.Count);
-            foreach (var item in hdrArr)
-            {
-                if (item is null || item.GetValueKind() != JsonValueKind.String)
-                    return new Error("Patch.InvalidValue", "'headers' entries must be strings.", ErrorType.Validation, Path: "headers");
-                parsed.Add(item.GetValue<string>());
-            }
-            if (parsed.All(string.IsNullOrWhiteSpace))
-                return new Error("Patch.InvalidValue", "'headers' must contain at least one non-whitespace column label.", ErrorType.Validation, Path: "headers");
-            headers = parsed;
-            if (!TryGetProp(patch, "alignments", out _) && alignments.Count != headers.Count)
-                alignments = Enumerable.Repeat("left", headers.Count).ToList();
-        }
-        if (TryGetProp(patch, "alignments", out var alignNode))
-        {
-            if (alignNode is not JsonArray alignArr)
-                return new Error("Patch.InvalidValue", "'alignments' must be an array of 'left', 'center', or 'right'.", ErrorType.Validation, Path: "alignments");
-            var parsed = new List<string>(alignArr.Count);
-            foreach (var item in alignArr)
-            {
-                if (item is null || item.GetValueKind() != JsonValueKind.String)
-                    return new Error("Patch.InvalidValue", "'alignments' entries must be strings.", ErrorType.Validation, Path: "alignments");
-                var val = item.GetValue<string>().Trim().ToLowerInvariant();
-                if (val is not ("left" or "center" or "right"))
-                    return new Error("Patch.InvalidValue", $"Invalid alignment '{val}'. Use 'left', 'center', or 'right'.", ErrorType.Validation, Path: "alignments");
-                parsed.Add(val);
-            }
-            if (parsed.Count != headers.Count)
-                return new Error("Patch.InvalidValue", $"'alignments' length ({parsed.Count}) must match 'headers' length ({headers.Count}).", ErrorType.Validation, Path: "alignments");
-            alignments = parsed;
-        }
-        if (TryGetProp(patch, "rows", out var rowsNode))
-        {
-            if (rowsNode is not JsonArray rowsArr || rowsArr.Count == 0)
-                return new Error("Patch.InvalidValue", "'rows' must be a non-empty array of string arrays.", ErrorType.Validation, Path: "rows");
-            var parsedRows = new List<IReadOnlyList<string>>(rowsArr.Count);
-            foreach (var rItem in rowsArr)
-            {
-                if (rItem is not JsonArray cellArr)
-                    return new Error("Patch.InvalidValue", "Each row in 'rows' must be an array of strings.", ErrorType.Validation, Path: "rows");
-                var row = new List<string>(cellArr.Count);
-                foreach (var cItem in cellArr)
-                {
-                    if (cItem is null || cItem.GetValueKind() != JsonValueKind.String)
-                        return new Error("Patch.InvalidValue", "Table cell values must be strings.", ErrorType.Validation, Path: "rows");
-                    row.Add(cItem.GetValue<string>());
-                }
-                parsedRows.Add(row);
-            }
-            rows = parsedRows;
-        }
+
+        var gridRes = PatchTableGridFields(patch, 1, "Table", ref headers, ref alignments, ref rows, out _);
+        if (!gridRes.IsSuccess) return gridRes.Error!;
 
         for (int r = 0; r < rows.Count; r++)
         {
@@ -672,35 +699,18 @@ public sealed class PatchEntityHandler(
         var hotspots = current.Hotspots ?? [];
         bool updateTitle = false, updateCaption = false, updateAlt = false;
 
-        if (TryGetProp(patch, "title", out var tN))
-        {
-            if (tN is not null && tN.GetValueKind() != JsonValueKind.String)
-                return new Error("Patch.InvalidValue", "'title' must be a string or null.", ErrorType.Validation, Path: "title");
-            title = string.IsNullOrWhiteSpace(tN?.GetValue<string>()) ? null : tN!.GetValue<string>().Trim();
-            updateTitle = true;
-        }
-        if (TryGetProp(patch, "caption", out var cN))
-        {
-            if (cN is not null && cN.GetValueKind() != JsonValueKind.String)
-                return new Error("Patch.InvalidValue", "'caption' must be a string or null.", ErrorType.Validation, Path: "caption");
-            caption = string.IsNullOrWhiteSpace(cN?.GetValue<string>()) ? null : cN!.GetValue<string>().Trim();
-            updateCaption = true;
-        }
-        if (TryGetProp(patch, "alt", out var aN))
-        {
-            if (aN is not null && aN.GetValueKind() != JsonValueKind.String)
-                return new Error("Patch.InvalidValue", "'alt' must be a string or null.", ErrorType.Validation, Path: "alt");
-            alt = string.IsNullOrWhiteSpace(aN?.GetValue<string>()) ? null : aN!.GetValue<string>().Trim();
-            updateAlt = true;
-        }
+        if (TryReadNullableString(patch, "title", out var tVal, out var tErr)) { title = tVal; updateTitle = true; }
+        else if (tErr is not null) return tErr;
+        if (TryReadNullableString(patch, "caption", out var cVal, out var cErr)) { caption = cVal; updateCaption = true; }
+        else if (cErr is not null) return cErr;
+        if (TryReadNullableString(patch, "alt", out var aVal, out var aErr)) { alt = aVal; updateAlt = true; }
+        else if (aErr is not null) return aErr;
+
         if (TryGetProp(patch, "imagePath", out var imgN))
         {
-            var rawImg = imgN?.GetValueKind() == JsonValueKind.String ? imgN.GetValue<string>() : null;
-            if (string.IsNullOrWhiteSpace(rawImg))
-                return new Error("Patch.InvalidValue", "'imagePath' must be a non-empty string.", ErrorType.Validation, Path: "imagePath");
-            var copyRes = await JsonQuestionMaterializer.CopyConfinedImageAsync(rawImg, jsonDir, storageDir, contentInspector, ct, workspaceCwdDirectory: workingDirectoryProvider.GetCurrentDirectory());
-            if (!copyRes.IsSuccess) return copyRes.Error!;
-            imagePath = copyRes.Value ?? imagePath;
+            var imgRes = await TryCopyPatchedImageAsync(imgN, "imagePath", allowNull: false, "'imagePath' must be a non-empty string.", storageDir, jsonDir, ct);
+            if (!imgRes.IsSuccess) return imgRes.Error!;
+            imagePath = imgRes.Value ?? imagePath;
         }
         if (TryGetProp(patch, "hotspots", out var hsN))
         {
@@ -709,31 +719,23 @@ public sealed class PatchEntityHandler(
             var parsed = new List<DiagramHotspot>(hArr.Count);
             for (int i = 0; i < hArr.Count; i++)
             {
-                if (hArr[i] is not JsonObject ho ||
-                    !TryGetProp(ho, "label", out var lN) || lN is null || lN.GetValueKind() != JsonValueKind.String ||
-                    !TryGetProp(ho, "note", out var nN) || nN is null || nN.GetValueKind() != JsonValueKind.String)
+                if (hArr[i] is not JsonObject ho)
                     return new Error("Patch.InvalidValue", $"Hotspot at index {i} must specify 'label' and 'note' strings.", ErrorType.Validation, Path: "hotspots");
 
-                double bx, by, bw, bh;
-                if (TryGetProp(ho, "rect", out var rectN) && rectN is JsonArray rArr && rArr.Count == 4 &&
-                    rArr[0] is JsonValue r0 && r0.TryGetValue<double>(out bx) &&
-                    rArr[1] is JsonValue r1 && r1.TryGetValue<double>(out by) &&
-                    rArr[2] is JsonValue r2 && r2.TryGetValue<double>(out bw) &&
-                    rArr[3] is JsonValue r3 && r3.TryGetValue<double>(out bh))
+                if (!TryReadRequiredString(ho, "label", out var labelStr, out _, trim: true) ||
+                    !TryReadRequiredString(ho, "note", out var noteStr, out _, trim: true))
                 {
-                }
-                else if (TryGetProp(ho, "x", out var xN) && xN is JsonValue xv && xv.TryGetValue<double>(out bx) &&
-                         TryGetProp(ho, "y", out var yN) && yN is JsonValue yv && yv.TryGetValue<double>(out by) &&
-                         TryGetProp(ho, "w", out var wN) && wN is JsonValue wv && wv.TryGetValue<double>(out bw) &&
-                         TryGetProp(ho, "h", out var hN) && hN is JsonValue hv && hv.TryGetValue<double>(out bh))
-                {
-                }
-                else
-                {
-                    return new Error("Patch.InvalidValue", $"Hotspot at index {i} must specify 'rect: [x,y,w,h]' or 'x','y','w','h'.", ErrorType.Validation, Path: "hotspots");
+                    if (!TryGetProp(ho, "label", out var lN) || lN is null || lN.GetValueKind() != JsonValueKind.String ||
+                        !TryGetProp(ho, "note", out var nN) || nN is null || nN.GetValueKind() != JsonValueKind.String)
+                        return new Error("Patch.InvalidValue", $"Hotspot at index {i} must specify 'label' and 'note' strings.", ErrorType.Validation, Path: "hotspots");
+                    labelStr = lN.GetValue<string>().Trim();
+                    noteStr = nN.GetValue<string>().Trim();
                 }
 
-                var candidate = new DiagramHotspot(i, lN.GetValue<string>().Trim(), nN.GetValue<string>().Trim(), bx, by, bw, bh);
+                var rectRes = ReadNormalizedRect(ho, $"hotspots[{i}]");
+                if (!rectRes.IsSuccess) return rectRes.Error!;
+
+                var candidate = new DiagramHotspot(i, labelStr, noteStr, rectRes.Value.X, rectRes.Value.Y, rectRes.Value.W, rectRes.Value.H);
                 if (!Phase3PayloadRules.HasValidHotspotBounds(candidate))
                     return new Error("Patch.InvalidValue", $"Hotspot at index {i} bounds are out of [0..1] range.", ErrorType.Validation, Path: "hotspots");
                 parsed.Add(candidate);
@@ -755,18 +757,10 @@ public sealed class PatchEntityHandler(
         var steps = current.Steps ?? [];
         bool updateTitle = false;
 
-        if (TryGetProp(patch, "title", out var tN))
-        {
-            if (tN is not null && tN.GetValueKind() != JsonValueKind.String)
-                return new Error("Patch.InvalidValue", "'title' must be a string or null.", ErrorType.Validation, Path: "title");
-            title = string.IsNullOrWhiteSpace(tN?.GetValue<string>()) ? null : tN!.GetValue<string>().Trim();
-            updateTitle = true;
-        }
-        if (TryGetProp(patch, "showFirst", out var sfN))
-        {
-            if (sfN is not JsonValue sfv || !sfv.TryGetValue<bool>(out showFirst))
-                return new Error("Patch.InvalidValue", "'showFirst' must be a boolean.", ErrorType.Validation, Path: "showFirst");
-        }
+        if (TryReadNullableString(patch, "title", out var tVal, out var tErr)) { title = tVal; updateTitle = true; }
+        else if (tErr is not null) return tErr;
+        if (TryReadBool(patch, "showFirst", out var sfVal, out var sfErr)) showFirst = sfVal;
+        else if (sfErr is not null) return sfErr;
         if (TryGetProp(patch, "steps", out var stN))
         {
             if (stN is not JsonArray stArr || stArr.Count == 0)
@@ -811,28 +805,14 @@ public sealed class PatchEntityHandler(
                     if (!slotsRes.IsSuccess) return slotsRes.Error!;
                     blanks = slotsRes.Value;
                 }
-                if (TryGetProp(patch, "fuzzy", out var fuzzyNode))
-                {
-                    if (fuzzyNode is not JsonValue fv || !fv.TryGetValue<bool>(out fuzzy))
-                        return new Error("Patch.InvalidValue", "'fuzzy' must be a boolean.", ErrorType.Validation, Path: "fuzzy");
-                }
-                if (TryGetProp(patch, "caseSensitive", out var csNode))
-                {
-                    if (csNode is not JsonValue cv || !cv.TryGetValue<bool>(out caseSensitive))
-                        return new Error("Patch.InvalidValue", "'caseSensitive' must be a boolean.", ErrorType.Validation, Path: "caseSensitive");
-                }
-                if (TryGetProp(patch, "placeholder", out var phNode))
-                {
-                    if (phNode is not null && phNode.GetValueKind() != JsonValueKind.String)
-                        return new Error("Patch.InvalidValue", "'placeholder' must be a string or null.", ErrorType.Validation, Path: "placeholder");
-                    placeholder = string.IsNullOrWhiteSpace(phNode?.GetValue<string>()) ? null : phNode!.GetValue<string>().Trim();
-                }
-                if (TryGetProp(patch, "explanation", out var expNode))
-                {
-                    if (expNode is not null && expNode.GetValueKind() != JsonValueKind.String)
-                        return new Error("Patch.InvalidValue", "'explanation' must be a string or null.", ErrorType.Validation, Path: "explanation");
-                    explanation = string.IsNullOrWhiteSpace(expNode?.GetValue<string>()) ? null : expNode!.GetValue<string>().Trim();
-                }
+                if (TryReadBool(patch, "fuzzy", out var fv, out var fErr)) fuzzy = fv;
+                else if (fErr is not null) return fErr;
+                if (TryReadBool(patch, "caseSensitive", out var csVal, out var csErr)) caseSensitive = csVal;
+                else if (csErr is not null) return csErr;
+                if (TryReadNullableString(patch, "placeholder", out var phVal, out var phErr)) placeholder = phVal;
+                else if (phErr is not null) return phErr;
+                if (TryReadNullableString(patch, "explanation", out var expVal, out var expErr)) explanation = expVal;
+                else if (expErr is not null) return expErr;
 
                 return pq.SetPayloadJson(Phase1PayloadCodec.Serialize(new FillBlankPayload(template, blanks, fuzzy, caseSensitive, explanation, placeholder)));
             }
@@ -848,18 +828,10 @@ public sealed class PatchEntityHandler(
                 var explanation = current.Explanation;
                 bool schemeExplicit = false;
 
-                if (TryGetProp(patch, "assertion", out var aNode))
-                {
-                    if (aNode is null || aNode.GetValueKind() != JsonValueKind.String || string.IsNullOrWhiteSpace(aNode.GetValue<string>()))
-                        return new Error("Patch.InvalidValue", "'assertion' must be a non-empty string.", ErrorType.Validation, Path: "assertion");
-                    assertion = aNode.GetValue<string>().Trim();
-                }
-                if (TryGetProp(patch, "reason", out var rNode))
-                {
-                    if (rNode is null || rNode.GetValueKind() != JsonValueKind.String || string.IsNullOrWhiteSpace(rNode.GetValue<string>()))
-                        return new Error("Patch.InvalidValue", "'reason' must be a non-empty string.", ErrorType.Validation, Path: "reason");
-                    reason = rNode.GetValue<string>().Trim();
-                }
+                if (TryReadRequiredString(patch, "assertion", out var aVal, out var aErr)) assertion = aVal;
+                else if (aErr is not null) return aErr;
+                if (TryReadRequiredString(patch, "reason", out var rVal, out var rErr)) reason = rVal;
+                else if (rErr is not null) return rErr;
                 if (TryGetProp(patch, "answer", out var ansNode))
                 {
                     if (ansNode is null || ansNode.GetValueKind() != JsonValueKind.String)
@@ -885,12 +857,8 @@ public sealed class PatchEntityHandler(
                         return new Error("Patch.InvalidValue", "Answer 'both-false' requires scheme '5opt'.", ErrorType.Validation, Path: "scheme");
                     scheme = "5opt";
                 }
-                if (TryGetProp(patch, "explanation", out var expNode))
-                {
-                    if (expNode is not null && expNode.GetValueKind() != JsonValueKind.String)
-                        return new Error("Patch.InvalidValue", "'explanation' must be a string or null.", ErrorType.Validation, Path: "explanation");
-                    explanation = string.IsNullOrWhiteSpace(expNode?.GetValue<string>()) ? null : expNode!.GetValue<string>().Trim();
-                }
+                if (TryReadNullableString(patch, "explanation", out var expVal, out var expErr)) explanation = expVal;
+                else if (expErr is not null) return expErr;
 
                 return pq.SetPayloadJson(Phase1PayloadCodec.Serialize(new AssertionReasonPayload(assertion, reason, answer, scheme, explanation)));
             }
@@ -918,46 +886,25 @@ public sealed class PatchEntityHandler(
                 }
                 if (TryGetProp(patch, "imagePath", out var imgNode))
                 {
-                    if (imgNode is null || string.IsNullOrWhiteSpace(imgNode.GetValueKind() == JsonValueKind.String ? imgNode.GetValue<string>() : null))
-                    {
-                        if (imgNode is not null && imgNode.GetValueKind() != JsonValueKind.String)
-                            return new Error("Patch.InvalidValue", "'imagePath' must be a string or null.", ErrorType.Validation, Path: "imagePath");
-                        imagePath = null;
-                    }
-                    else
-                    {
-                        var copyRes = await JsonQuestionMaterializer.CopyConfinedImageAsync(
-                            imgNode.GetValue<string>(), jsonDir, storageDir, contentInspector, ct,
-                            workspaceCwdDirectory: workingDirectoryProvider.GetCurrentDirectory());
-                        if (!copyRes.IsSuccess) return copyRes.Error!;
-                        imagePath = copyRes.Value;
-                    }
+                    var imgRes = await TryCopyPatchedImageAsync(imgNode, "imagePath", allowNull: true, "'imagePath' must be a string or null.", storageDir, jsonDir, ct);
+                    if (!imgRes.IsSuccess) return imgRes.Error!;
+                    imagePath = imgRes.Value;
                 }
-                if (TryGetProp(patch, "requireFix", out var rfNode))
+                if (TryReadBool(patch, "requireFix", out var rfVal, out var rfErr)) requireFix = rfVal;
+                else if (rfErr is not null) return rfErr;
+                bool allowNoErrorExplicit = TryReadBool(patch, "allowNoError", out var aneVal, out var aneErr);
+                if (aneErr is not null) return aneErr;
+                if (allowNoErrorExplicit) allowNoError = aneVal;
+                if (TryReadBool(patch, "noError", out var neVal, out var neErr))
                 {
-                    if (rfNode is not JsonValue rv || !rv.TryGetValue<bool>(out requireFix))
-                        return new Error("Patch.InvalidValue", "'requireFix' must be a boolean.", ErrorType.Validation, Path: "requireFix");
-                }
-                bool allowNoErrorExplicit = TryGetProp(patch, "allowNoError", out var aneNode);
-                if (allowNoErrorExplicit)
-                {
-                    if (aneNode is not JsonValue av || !av.TryGetValue<bool>(out allowNoError))
-                        return new Error("Patch.InvalidValue", "'allowNoError' must be a boolean.", ErrorType.Validation, Path: "allowNoError");
-                }
-                if (TryGetProp(patch, "noError", out var neNode))
-                {
-                    if (neNode is not JsonValue nv || !nv.TryGetValue<bool>(out noError))
-                        return new Error("Patch.InvalidValue", "'noError' must be a boolean.", ErrorType.Validation, Path: "noError");
+                    noError = neVal;
                     if (noError && !allowNoErrorExplicit) allowNoError = true;
                 }
+                else if (neErr is not null) return neErr;
                 if (noError && !allowNoError)
                     return new Error("Patch.InvalidValue", "Spot-the-error question cannot have 'noError=true' with 'allowNoError=false'.", ErrorType.Validation, Path: "allowNoError");
-                if (TryGetProp(patch, "explanation", out var expNode))
-                {
-                    if (expNode is not null && expNode.GetValueKind() != JsonValueKind.String)
-                        return new Error("Patch.InvalidValue", "'explanation' must be a string or null.", ErrorType.Validation, Path: "explanation");
-                    explanation = string.IsNullOrWhiteSpace(expNode?.GetValue<string>()) ? null : expNode!.GetValue<string>().Trim();
-                }
+                if (TryReadNullableString(patch, "explanation", out var expVal, out var expErr)) explanation = expVal;
+                else if (expErr is not null) return expErr;
 
                 return pq.SetPayloadJson(Phase1PayloadCodec.Serialize(new SpotErrorPayload(template, segments, requireFix, allowNoError, noError, explanation, imagePath)));
             }
@@ -989,95 +936,23 @@ public sealed class PatchEntityHandler(
                     mode = normMode;
                     recomputeSpecial = true;
                 }
-                if (TryGetProp(patch, "title", out var titleNode))
-                {
-                    if (titleNode is not null && titleNode.GetValueKind() != JsonValueKind.String)
-                        return new Error("Patch.InvalidValue", "'title' must be a string or null.", ErrorType.Validation, Path: "title");
-                    title = string.IsNullOrWhiteSpace(titleNode?.GetValue<string>()) ? null : titleNode!.GetValue<string>().Trim();
-                }
-                if (TryGetProp(patch, "bank", out var bankNode))
-                {
-                    if (bankNode is not JsonValue bv || !bv.TryGetValue<bool>(out bank))
-                        return new Error("Patch.InvalidValue", "'bank' must be a boolean.", ErrorType.Validation, Path: "bank");
-                }
-                if (TryGetProp(patch, "fuzzy", out var fuzzyNode))
-                {
-                    if (fuzzyNode is not JsonValue fv || !fv.TryGetValue<bool>(out fuzzy))
-                        return new Error("Patch.InvalidValue", "'fuzzy' must be a boolean.", ErrorType.Validation, Path: "fuzzy");
-                }
-                if (TryGetProp(patch, "caseSensitive", out var csNode))
-                {
-                    if (csNode is not JsonValue cv || !cv.TryGetValue<bool>(out caseSensitive))
-                        return new Error("Patch.InvalidValue", "'caseSensitive' must be a boolean.", ErrorType.Validation, Path: "caseSensitive");
-                }
-                if (TryGetProp(patch, "allowNoError", out var aneNode))
-                {
-                    if (aneNode is not JsonValue av || !av.TryGetValue<bool>(out allowNoError))
-                        return new Error("Patch.InvalidValue", "'allowNoError' must be a boolean.", ErrorType.Validation, Path: "allowNoError");
-                }
-                if (TryGetProp(patch, "headers", out var hdrNode))
-                {
-                    if (hdrNode is not JsonArray hdrArr || hdrArr.Count < 2)
-                        return new Error("Patch.InvalidValue", "'headers' must be an array of at least 2 column strings.", ErrorType.Validation, Path: "headers");
-                    var parsed = new List<string>(hdrArr.Count);
-                    foreach (var item in hdrArr)
-                    {
-                        if (item is null || item.GetValueKind() != JsonValueKind.String)
-                            return new Error("Patch.InvalidValue", "'headers' entries must be strings.", ErrorType.Validation, Path: "headers");
-                        parsed.Add(item.GetValue<string>());
-                    }
-                    if (parsed.All(string.IsNullOrWhiteSpace))
-                        return new Error("Patch.InvalidValue", "'headers' must contain at least one non-whitespace column label.", ErrorType.Validation, Path: "headers");
-                    headers = parsed;
-                    if (!TryGetProp(patch, "alignments", out _) && alignments.Count != headers.Count)
-                        alignments = Enumerable.Repeat("left", headers.Count).ToList();
-                    recomputeSpecial = true;
-                }
-                if (TryGetProp(patch, "alignments", out var alignNode))
-                {
-                    if (alignNode is not JsonArray alignArr)
-                        return new Error("Patch.InvalidValue", "'alignments' must be an array of 'left', 'center', or 'right'.", ErrorType.Validation, Path: "alignments");
-                    var parsed = new List<string>(alignArr.Count);
-                    foreach (var item in alignArr)
-                    {
-                        if (item is null || item.GetValueKind() != JsonValueKind.String)
-                            return new Error("Patch.InvalidValue", "'alignments' entries must be strings.", ErrorType.Validation, Path: "alignments");
-                        var val = item.GetValue<string>().Trim().ToLowerInvariant();
-                        if (val is not ("left" or "center" or "right"))
-                            return new Error("Patch.InvalidValue", $"Invalid alignment '{val}'. Use 'left', 'center', or 'right'.", ErrorType.Validation, Path: "alignments");
-                        parsed.Add(val);
-                    }
-                    if (parsed.Count != headers.Count)
-                        return new Error("Patch.InvalidValue", $"'alignments' length ({parsed.Count}) must match 'headers' length ({headers.Count}).", ErrorType.Validation, Path: "alignments");
-                    alignments = parsed;
-                }
-                if (TryGetProp(patch, "rows", out var rowsNode))
-                {
-                    if (rowsNode is not JsonArray rowsArr || rowsArr.Count == 0)
-                        return new Error("Patch.InvalidValue", "'rows' must be a non-empty array of string arrays.", ErrorType.Validation, Path: "rows");
-                    var parsedRows = new List<IReadOnlyList<string>>(rowsArr.Count);
-                    foreach (var rItem in rowsArr)
-                    {
-                        if (rItem is not JsonArray cellArr)
-                            return new Error("Patch.InvalidValue", "Each row in 'rows' must be an array of strings.", ErrorType.Validation, Path: "rows");
-                        var row = new List<string>(cellArr.Count);
-                        foreach (var cItem in cellArr)
-                        {
-                            if (cItem is null || cItem.GetValueKind() != JsonValueKind.String)
-                                return new Error("Patch.InvalidValue", "Differentiation cell values must be strings.", ErrorType.Validation, Path: "rows");
-                            row.Add(cItem.GetValue<string>());
-                        }
-                        parsedRows.Add(row);
-                    }
-                    rows = parsedRows;
-                    recomputeSpecial = true;
-                }
-                if (TryGetProp(patch, "explanation", out var expNode))
-                {
-                    if (expNode is not null && expNode.GetValueKind() != JsonValueKind.String)
-                        return new Error("Patch.InvalidValue", "'explanation' must be a string or null.", ErrorType.Validation, Path: "explanation");
-                    explanation = string.IsNullOrWhiteSpace(expNode?.GetValue<string>()) ? null : expNode!.GetValue<string>().Trim();
-                }
+                if (TryReadNullableString(patch, "title", out var tVal, out var tErr)) title = tVal;
+                else if (tErr is not null) return tErr;
+                if (TryReadBool(patch, "bank", out var bVal, out var bErr)) bank = bVal;
+                else if (bErr is not null) return bErr;
+                if (TryReadBool(patch, "fuzzy", out var fVal, out var fErr)) fuzzy = fVal;
+                else if (fErr is not null) return fErr;
+                if (TryReadBool(patch, "caseSensitive", out var csVal, out var csErr)) caseSensitive = csVal;
+                else if (csErr is not null) return csErr;
+                if (TryReadBool(patch, "allowNoError", out var aneVal, out var aneErr)) allowNoError = aneVal;
+                else if (aneErr is not null) return aneErr;
+
+                var gridRes = PatchTableGridFields(patch, 2, "Differentiation", ref headers, ref alignments, ref rows, out bool gridChanged);
+                if (!gridRes.IsSuccess) return gridRes.Error!;
+                if (gridChanged) recomputeSpecial = true;
+
+                if (TryReadNullableString(patch, "explanation", out var expVal, out var expErr)) explanation = expVal;
+                else if (expErr is not null) return expErr;
 
                 if (headers.Count < 2)
                     return new Error("Patch.InvalidValue", "Differentiation table requires at least 2 columns.", ErrorType.Validation, Path: "headers");
@@ -1108,12 +983,8 @@ public sealed class PatchEntityHandler(
                 var steps = current.Steps ?? [];
                 var explanation = current.Explanation;
 
-                if (TryGetProp(patch, "title", out var titleNode))
-                {
-                    if (titleNode is not null && titleNode.GetValueKind() != JsonValueKind.String)
-                        return new Error("Patch.InvalidValue", "'title' must be a string or null.", ErrorType.Validation, Path: "title");
-                    title = string.IsNullOrWhiteSpace(titleNode?.GetValue<string>()) ? null : titleNode!.GetValue<string>().Trim();
-                }
+                if (TryReadNullableString(patch, "title", out var tVal, out var tErr)) title = tVal;
+                else if (tErr is not null) return tErr;
                 if (TryGetProp(patch, "steps", out var stepsNode))
                 {
                     if (stepsNode is not JsonArray stepsArr || stepsArr.Count < 2)
@@ -1138,11 +1009,8 @@ public sealed class PatchEntityHandler(
                             return new Error("Patch.InvalidValue", $"Mechanism step at index {sIdx} requires non-empty 'text'.", ErrorType.Validation, Path: "steps");
 
                         bool isDistractor = false;
-                        if (TryGetProp(sObj, "isDistractor", out var dNode) && dNode is not null)
-                        {
-                            if (dNode is not JsonValue dv || !dv.TryGetValue<bool>(out isDistractor))
-                                return new Error("Patch.InvalidValue", "'isDistractor' must be a boolean.", ErrorType.Validation, Path: "steps");
-                        }
+                        if (TryReadBool(sObj, "isDistractor", out var dVal, out var dErr)) isDistractor = dVal;
+                        else if (dErr is not null) return new Error("Patch.InvalidValue", "'isDistractor' must be a boolean.", ErrorType.Validation, Path: "steps");
 
                         int orderGroup = 0;
                         if (!isDistractor)
@@ -1158,12 +1026,8 @@ public sealed class PatchEntityHandler(
                         return new Error("Patch.InvalidValue", "Mechanism question requires at least 2 non-distractor ordered steps.", ErrorType.Validation, Path: "steps");
                     steps = parsedSteps;
                 }
-                if (TryGetProp(patch, "explanation", out var expNode))
-                {
-                    if (expNode is not null && expNode.GetValueKind() != JsonValueKind.String)
-                        return new Error("Patch.InvalidValue", "'explanation' must be a string or null.", ErrorType.Validation, Path: "explanation");
-                    explanation = string.IsNullOrWhiteSpace(expNode?.GetValue<string>()) ? null : expNode!.GetValue<string>().Trim();
-                }
+                if (TryReadNullableString(patch, "explanation", out var expVal, out var expErr)) explanation = expVal;
+                else if (expErr is not null) return expErr;
 
                 return pq.SetPayloadJson(Phase1PayloadCodec.Serialize(new MechanismPayload(title, steps, explanation)));
             }
@@ -1184,22 +1048,12 @@ public sealed class PatchEntityHandler(
 
                 if (TryGetProp(patch, "imagePath", out var imgNode))
                 {
-                    if (imgNode is null || imgNode.GetValueKind() != JsonValueKind.String || string.IsNullOrWhiteSpace(imgNode.GetValue<string>()))
-                        return new Error("Patch.InvalidValue", "'imagePath' must be a non-empty string for relabel questions.", ErrorType.Validation, Path: "imagePath");
-                    var copyRes = await JsonQuestionMaterializer.CopyConfinedImageAsync(
-                        imgNode.GetValue<string>(), jsonDir, storageDir, contentInspector, ct,
-                        workspaceCwdDirectory: workingDirectoryProvider.GetCurrentDirectory());
-                    if (!copyRes.IsSuccess) return copyRes.Error!;
-                    if (string.IsNullOrWhiteSpace(copyRes.Value))
-                        return new Error("Patch.InvalidValue", "'imagePath' must resolve to a valid image.", ErrorType.Validation, Path: "imagePath");
-                    imagePath = copyRes.Value;
+                    var imgRes = await TryCopyPatchedImageAsync(imgNode, "imagePath", allowNull: false, "'imagePath' must be a non-empty string for relabel questions.", storageDir, jsonDir, ct);
+                    if (!imgRes.IsSuccess) return imgRes.Error!;
+                    imagePath = imgRes.Value!;
                 }
-                if (TryGetProp(patch, "prompt", out var promptNode))
-                {
-                    if (promptNode is not null && promptNode.GetValueKind() != JsonValueKind.String)
-                        return new Error("Patch.InvalidValue", "'prompt' must be a string or null.", ErrorType.Validation, Path: "prompt");
-                    prompt = string.IsNullOrWhiteSpace(promptNode?.GetValue<string>()) ? null : promptNode!.GetValue<string>().Trim();
-                }
+                if (TryReadNullableString(patch, "prompt", out var prVal, out var prErr)) prompt = prVal;
+                else if (prErr is not null) return prErr;
                 if (TryGetProp(patch, "mode", out var modeNode))
                 {
                     if (modeNode is null || modeNode.GetValueKind() != JsonValueKind.String)
@@ -1218,45 +1072,16 @@ public sealed class PatchEntityHandler(
                         return new Error("Patch.InvalidValue", $"Invalid relabel style '{normStyle}'. Use 'solid', 'blur', 'pixelate', or 'whiteout'.", ErrorType.Validation, Path: "style");
                     style = normStyle;
                 }
-                if (TryGetProp(patch, "fuzzy", out var fuzzyNode))
-                {
-                    if (fuzzyNode is not JsonValue fv || !fv.TryGetValue<bool>(out fuzzy))
-                        return new Error("Patch.InvalidValue", "'fuzzy' must be a boolean.", ErrorType.Validation, Path: "fuzzy");
-                }
-                if (TryGetProp(patch, "caseSensitive", out var csNode))
-                {
-                    if (csNode is not JsonValue cv || !cv.TryGetValue<bool>(out caseSensitive))
-                        return new Error("Patch.InvalidValue", "'caseSensitive' must be a boolean.", ErrorType.Validation, Path: "caseSensitive");
-                }
-                if (TryGetProp(patch, "explanation", out var expNode))
-                {
-                    if (expNode is not null && expNode.GetValueKind() != JsonValueKind.String)
-                        return new Error("Patch.InvalidValue", "'explanation' must be a string or null.", ErrorType.Validation, Path: "explanation");
-                    explanation = string.IsNullOrWhiteSpace(expNode?.GetValue<string>()) ? null : expNode!.GetValue<string>().Trim();
-                }
-                if (TryGetProp(patch, "distractors", out var distNode))
-                {
-                    if (distNode is null)
-                    {
-                        distractors = [];
-                    }
-                    else if (distNode is JsonArray distArr)
-                    {
-                        var parsedDist = new List<string>(distArr.Count);
-                        foreach (var item in distArr)
-                        {
-                            if (item is null || item.GetValueKind() != JsonValueKind.String)
-                                return new Error("Patch.InvalidValue", "'distractors' entries must be strings.", ErrorType.Validation, Path: "distractors");
-                            var s = item.GetValue<string>().Trim();
-                            if (!string.IsNullOrEmpty(s)) parsedDist.Add(s);
-                        }
-                        distractors = parsedDist;
-                    }
-                    else
-                    {
-                        return new Error("Patch.InvalidValue", "'distractors' must be an array of strings or null.", ErrorType.Validation, Path: "distractors");
-                    }
-                }
+                if (TryReadBool(patch, "fuzzy", out var fVal, out var fErr)) fuzzy = fVal;
+                else if (fErr is not null) return fErr;
+                if (TryReadBool(patch, "caseSensitive", out var csVal, out var csErr)) caseSensitive = csVal;
+                else if (csErr is not null) return csErr;
+                if (TryReadNullableString(patch, "explanation", out var expVal, out var expErr)) explanation = expVal;
+                else if (expErr is not null) return expErr;
+                if (TryReadStringArray(patch, "distractors", allowNull: true, allowEmpty: true, out var parsedDist, out var distErr))
+                    distractors = (parsedDist ?? []).Where(s => !string.IsNullOrEmpty(s)).ToList();
+                else if (distErr is not null) return distErr;
+
                 if (TryGetProp(patch, "boxes", out var boxesNode))
                 {
                     if (boxesNode is not JsonArray boxesArr || boxesArr.Count == 0)
@@ -1281,43 +1106,20 @@ public sealed class PatchEntityHandler(
                             return new Error("Patch.InvalidValue", $"Relabel box at index {bIdx} requires non-empty 'label'.", ErrorType.Validation, Path: "boxes");
 
                         var aliases = new List<string>();
-                        if (TryGetProp(bObj, "aliases", out var alNode) && alNode is not null)
+                        if (TryReadStringArray(bObj, "aliases", allowNull: true, allowEmpty: true, out var alParsed, out var alErr))
                         {
-                            if (alNode is not JsonArray alArr)
-                                return new Error("Patch.InvalidValue", "'aliases' on relabel box must be an array of strings.", ErrorType.Validation, Path: "boxes");
-                            foreach (var aItem in alArr)
-                            {
-                                if (aItem is null || aItem.GetValueKind() != JsonValueKind.String)
-                                    return new Error("Patch.InvalidValue", "'aliases' entries must be strings.", ErrorType.Validation, Path: "boxes");
-                                var aStr = aItem.GetValue<string>().Trim();
-                                if (!string.IsNullOrEmpty(aStr)) aliases.Add(aStr);
-                            }
+                            if (alParsed is not null)
+                                aliases.AddRange(alParsed.Where(s => !string.IsNullOrEmpty(s)));
+                        }
+                        else if (alErr is not null)
+                        {
+                            return new Error("Patch.InvalidValue", "'aliases' on relabel box must be an array of strings.", ErrorType.Validation, Path: "boxes");
                         }
 
-                        double bx, by, bw, bh;
-                        if (TryGetProp(bObj, "rect", out var rectNode) && rectNode is not null)
-                        {
-                            if (rectNode is not JsonArray rArr || rArr.Count != 4 ||
-                                rArr[0] is not JsonValue r0 || !r0.TryGetValue<double>(out bx) ||
-                                rArr[1] is not JsonValue r1 || !r1.TryGetValue<double>(out by) ||
-                                rArr[2] is not JsonValue r2 || !r2.TryGetValue<double>(out bw) ||
-                                rArr[3] is not JsonValue r3 || !r3.TryGetValue<double>(out bh))
-                            {
-                                return new Error("Patch.InvalidValue", $"Relabel box at index {bIdx} 'rect' must be [x, y, w, h] of 4 numbers.", ErrorType.Validation, Path: "boxes");
-                            }
-                        }
-                        else if (TryGetProp(bObj, "x", out var xN) && xN is JsonValue xv && xv.TryGetValue<double>(out bx) &&
-                                 TryGetProp(bObj, "y", out var yN) && yN is JsonValue yv && yv.TryGetValue<double>(out by) &&
-                                 TryGetProp(bObj, "w", out var wN) && wN is JsonValue wv && wv.TryGetValue<double>(out bw) &&
-                                 TryGetProp(bObj, "h", out var hN) && hN is JsonValue hv && hv.TryGetValue<double>(out bh))
-                        {
-                        }
-                        else
-                        {
-                            return new Error("Patch.InvalidValue", $"Relabel box at index {bIdx} must specify 'rect: [x,y,w,h]' or numeric 'x', 'y', 'w', 'h'.", ErrorType.Validation, Path: "boxes");
-                        }
+                        var rectRes = ReadNormalizedRect(bObj, $"boxes[{bIdx}]");
+                        if (!rectRes.IsSuccess) return rectRes.Error!;
 
-                        var candidate = new RelabelBox(bIdx + 1, lbl, aliases, bx, by, bw, bh);
+                        var candidate = new RelabelBox(bIdx + 1, lbl, aliases, rectRes.Value.X, rectRes.Value.Y, rectRes.Value.W, rectRes.Value.H);
                         if (!Phase2PayloadRules.ValidateRelabelBox(candidate))
                             return new Error("Patch.InvalidValue", $"Relabel box at index {bIdx} coordinates are out of normalized [0..1] bounds.", ErrorType.Validation, Path: "boxes");
                         parsedBoxes.Add(candidate);
@@ -1338,18 +1140,10 @@ public sealed class PatchEntityHandler(
                 var items = current.Items ?? [];
                 var explanation = current.Explanation;
 
-                if (TryGetProp(patch, "title", out var titleN))
-                {
-                    if (titleN is not null && titleN.GetValueKind() != JsonValueKind.String)
-                        return new Error("Patch.InvalidValue", "'title' must be a string or null.", ErrorType.Validation, Path: "title");
-                    title = string.IsNullOrWhiteSpace(titleN?.GetValue<string>()) ? null : titleN!.GetValue<string>().Trim();
-                }
-                if (TryGetProp(patch, "explanation", out var expN))
-                {
-                    if (expN is not null && expN.GetValueKind() != JsonValueKind.String)
-                        return new Error("Patch.InvalidValue", "'explanation' must be a string or null.", ErrorType.Validation, Path: "explanation");
-                    explanation = string.IsNullOrWhiteSpace(expN?.GetValue<string>()) ? null : expN!.GetValue<string>().Trim();
-                }
+                if (TryReadNullableString(patch, "title", out var tVal, out var tErr)) title = tVal;
+                else if (tErr is not null) return tErr;
+                if (TryReadNullableString(patch, "explanation", out var expVal, out var expErr)) explanation = expVal;
+                else if (expErr is not null) return expErr;
                 if (TryGetProp(patch, "buckets", out var bN))
                 {
                     if (bN is not JsonArray bArr || bArr.Count == 0)
@@ -1400,18 +1194,10 @@ public sealed class PatchEntityHandler(
                 var distractors = current.Distractors ?? [];
                 var explanation = current.Explanation;
 
-                if (TryGetProp(patch, "title", out var titleN))
-                {
-                    if (titleN is not null && titleN.GetValueKind() != JsonValueKind.String)
-                        return new Error("Patch.InvalidValue", "'title' must be a string or null.", ErrorType.Validation, Path: "title");
-                    title = string.IsNullOrWhiteSpace(titleN?.GetValue<string>()) ? null : titleN!.GetValue<string>().Trim();
-                }
-                if (TryGetProp(patch, "explanation", out var expN))
-                {
-                    if (expN is not null && expN.GetValueKind() != JsonValueKind.String)
-                        return new Error("Patch.InvalidValue", "'explanation' must be a string or null.", ErrorType.Validation, Path: "explanation");
-                    explanation = string.IsNullOrWhiteSpace(expN?.GetValue<string>()) ? null : expN!.GetValue<string>().Trim();
-                }
+                if (TryReadNullableString(patch, "title", out var tVal, out var tErr)) title = tVal;
+                else if (tErr is not null) return tErr;
+                if (TryReadNullableString(patch, "explanation", out var expVal, out var expErr)) explanation = expVal;
+                else if (expErr is not null) return expErr;
                 if (TryGetProp(patch, "pairs", out var pairsN))
                 {
                     if (pairsN is not JsonArray pArr || pArr.Count == 0)
@@ -1427,14 +1213,9 @@ public sealed class PatchEntityHandler(
                     }
                     pairs = parsedPairs;
                 }
-                if (TryGetProp(patch, "distractors", out var distN))
-                {
-                    if (distN is null) distractors = [];
-                    else if (distN is JsonArray dArr)
-                        distractors = dArr.Select(x => x?.GetValue<string>()?.Trim() ?? string.Empty).Where(s => !string.IsNullOrEmpty(s)).ToList();
-                    else
-                        return new Error("Patch.InvalidValue", "'distractors' must be an array of strings or null.", ErrorType.Validation, Path: "distractors");
-                }
+                if (TryReadStringArray(patch, "distractors", allowNull: true, allowEmpty: true, out var parsedDist, out var distErr))
+                    distractors = (parsedDist ?? []).Where(s => !string.IsNullOrEmpty(s)).ToList();
+                else if (distErr is not null) return distErr;
 
                 return pq.SetPayloadJson(Phase1PayloadCodec.Serialize(new MatchPayload(title, pairs, distractors, explanation)));
             }
@@ -1458,11 +1239,8 @@ public sealed class PatchEntityHandler(
                         return new Error("Patch.InvalidValue", "'prompt'/'text' must be a non-empty string.", ErrorType.Validation, Path: "prompt");
                     prompt = prN.GetValue<string>().Trim();
                 }
-                if (TryGetProp(patch, "answer", out var ansN))
-                {
-                    if (ansN is not JsonValue av || !av.TryGetValue<double>(out answer) || !double.IsFinite(answer))
-                        return new Error("Patch.InvalidValue", "'answer' must be a finite number.", ErrorType.Validation, Path: "answer");
-                }
+                if (TryReadDouble(patch, "answer", out var ansVal, out var ansErr)) answer = ansVal;
+                else if (ansErr is not null) return ansErr;
                 if (TryGetProp(patch, "tolerance", out var tolN))
                 {
                     if (tolN is JsonValue tv && tv.GetValueKind() == JsonValueKind.Number && tv.TryGetValue<double>(out double dblTol) && double.IsFinite(dblTol) && dblTol >= 0)
@@ -1486,34 +1264,17 @@ public sealed class PatchEntityHandler(
                         return new Error("Patch.InvalidValue", "'toleranceMode' must be 'absolute' or 'percent'.", ErrorType.Validation, Path: "toleranceMode");
                     tolMode = Phase3PayloadRules.NormalizeToleranceMode(tmN.GetValue<string>());
                 }
-                if (TryGetProp(patch, "unit", out var uN))
-                {
-                    if (uN is not null && uN.GetValueKind() != JsonValueKind.String)
-                        return new Error("Patch.InvalidValue", "'unit' must be a string or null.", ErrorType.Validation, Path: "unit");
-                    unit = string.IsNullOrWhiteSpace(uN?.GetValue<string>()) ? null : uN!.GetValue<string>().Trim();
-                }
-                if (TryGetProp(patch, "placeholder", out var phN))
-                {
-                    if (phN is not null && phN.GetValueKind() != JsonValueKind.String)
-                        return new Error("Patch.InvalidValue", "'placeholder' must be a string or null.", ErrorType.Validation, Path: "placeholder");
-                    placeholder = string.IsNullOrWhiteSpace(phN?.GetValue<string>()) ? null : phN!.GetValue<string>().Trim();
-                }
-                if (TryGetProp(patch, "explanation", out var expN))
-                {
-                    if (expN is not null && expN.GetValueKind() != JsonValueKind.String)
-                        return new Error("Patch.InvalidValue", "'explanation' must be a string or null.", ErrorType.Validation, Path: "explanation");
-                    explanation = string.IsNullOrWhiteSpace(expN?.GetValue<string>()) ? null : expN!.GetValue<string>().Trim();
-                }
+                if (TryReadNullableString(patch, "unit", out var uVal, out var uErr)) unit = uVal;
+                else if (uErr is not null) return uErr;
+                if (TryReadNullableString(patch, "placeholder", out var phVal, out var phErr)) placeholder = phVal;
+                else if (phErr is not null) return phErr;
+                if (TryReadNullableString(patch, "explanation", out var expVal, out var expErr)) explanation = expVal;
+                else if (expErr is not null) return expErr;
                 if (TryGetProp(patch, "imagePath", out var imgN))
                 {
-                    if (imgN is null) imagePath = null;
-                    else if (imgN.GetValueKind() == JsonValueKind.String)
-                    {
-                        var copyRes = await JsonQuestionMaterializer.CopyConfinedImageAsync(imgN.GetValue<string>(), jsonDir, storageDir, contentInspector, ct, workspaceCwdDirectory: workingDirectoryProvider.GetCurrentDirectory());
-                        if (!copyRes.IsSuccess) return copyRes.Error!;
-                        imagePath = copyRes.Value;
-                    }
-                    else return new Error("Patch.InvalidValue", "'imagePath' must be a string or null.", ErrorType.Validation, Path: "imagePath");
+                    var imgRes = await TryCopyPatchedImageAsync(imgN, "imagePath", allowNull: true, "'imagePath' must be a string or null.", storageDir, jsonDir, ct, treatWhitespaceAsNull: false);
+                    if (!imgRes.IsSuccess) return imgRes.Error!;
+                    imagePath = imgRes.Value;
                 }
 
                 return pq.SetPayloadJson(Phase1PayloadCodec.Serialize(new NumericPayload(prompt, answer, tolerance, tolMode, unit, placeholder, explanation, imagePath)));
@@ -1530,40 +1291,19 @@ public sealed class PatchEntityHandler(
                 var questions = current.Questions ?? [];
                 var explanation = current.Explanation;
 
-                if (TryGetProp(patch, "title", out var titleN))
-                {
-                    if (titleN is not null && titleN.GetValueKind() != JsonValueKind.String)
-                        return new Error("Patch.InvalidValue", "'title' must be a string or null.", ErrorType.Validation, Path: "title");
-                    title = string.IsNullOrWhiteSpace(titleN?.GetValue<string>()) ? null : titleN!.GetValue<string>().Trim();
-                }
-                if (TryGetProp(patch, "stem", out var stemN))
-                {
-                    if (stemN is null || stemN.GetValueKind() != JsonValueKind.String || string.IsNullOrWhiteSpace(stemN.GetValue<string>()))
-                        return new Error("Patch.InvalidValue", "'stem' must be a non-empty string.", ErrorType.Validation, Path: "stem");
-                    stem = stemN.GetValue<string>().Trim();
-                }
-                if (TryGetProp(patch, "caption", out var capN))
-                {
-                    if (capN is not null && capN.GetValueKind() != JsonValueKind.String)
-                        return new Error("Patch.InvalidValue", "'caption' must be a string or null.", ErrorType.Validation, Path: "caption");
-                    caption = string.IsNullOrWhiteSpace(capN?.GetValue<string>()) ? null : capN!.GetValue<string>().Trim();
-                }
-                if (TryGetProp(patch, "explanation", out var expN))
-                {
-                    if (expN is not null && expN.GetValueKind() != JsonValueKind.String)
-                        return new Error("Patch.InvalidValue", "'explanation' must be a string or null.", ErrorType.Validation, Path: "explanation");
-                    explanation = string.IsNullOrWhiteSpace(expN?.GetValue<string>()) ? null : expN!.GetValue<string>().Trim();
-                }
+                if (TryReadNullableString(patch, "title", out var tVal, out var tErr)) title = tVal;
+                else if (tErr is not null) return tErr;
+                if (TryReadRequiredString(patch, "stem", out var stemVal, out var stemErr)) stem = stemVal;
+                else if (stemErr is not null) return stemErr;
+                if (TryReadNullableString(patch, "caption", out var capVal, out var capErr)) caption = capVal;
+                else if (capErr is not null) return capErr;
+                if (TryReadNullableString(patch, "explanation", out var expVal, out var expErr)) explanation = expVal;
+                else if (expErr is not null) return expErr;
                 if (TryGetProp(patch, "imagePath", out var imgN))
                 {
-                    if (imgN is null) imagePath = null;
-                    else if (imgN.GetValueKind() == JsonValueKind.String)
-                    {
-                        var copyRes = await JsonQuestionMaterializer.CopyConfinedImageAsync(imgN.GetValue<string>(), jsonDir, storageDir, contentInspector, ct, workspaceCwdDirectory: workingDirectoryProvider.GetCurrentDirectory());
-                        if (!copyRes.IsSuccess) return copyRes.Error!;
-                        imagePath = copyRes.Value;
-                    }
-                    else return new Error("Patch.InvalidValue", "'imagePath' must be a string or null.", ErrorType.Validation, Path: "imagePath");
+                    var imgRes = await TryCopyPatchedImageAsync(imgN, "imagePath", allowNull: true, "'imagePath' must be a string or null.", storageDir, jsonDir, ct, treatWhitespaceAsNull: false);
+                    if (!imgRes.IsSuccess) return imgRes.Error!;
+                    imagePath = imgRes.Value;
                 }
                 if (TryGetProp(patch, "questions", out var qN))
                 {
@@ -1595,17 +1335,9 @@ public sealed class PatchEntityHandler(
         }
         if (TryGetProp(patch, "imagePath", out var imgNode))
         {
-            if (imgNode is null)
-            {
-                mcq.SetImage(null);
-            }
-            else if (imgNode.GetValueKind() == JsonValueKind.String)
-            {
-                var copyRes = await JsonQuestionMaterializer.CopyConfinedImageAsync(imgNode.GetValue<string>(), jsonDir, storageDir, contentInspector, ct, workspaceCwdDirectory: workingDirectoryProvider.GetCurrentDirectory());
-                if (!copyRes.IsSuccess) return copyRes.Error!;
-                mcq.SetImage(copyRes.Value);
-            }
-            else return new Error("Patch.InvalidValue", "'imagePath' must be a string or null.", ErrorType.Validation, Path: "imagePath");
+            var copyRes = await TryCopyPatchedImageAsync(imgNode, "imagePath", allowNull: true, "'imagePath' must be a string or null.", storageDir, jsonDir, ct, treatWhitespaceAsNull: false);
+            if (!copyRes.IsSuccess) return copyRes.Error!;
+            mcq.SetImage(copyRes.Value);
         }
         if (TryGetProp(patch, "explanation", out var expNode))
         {
@@ -1798,25 +1530,17 @@ public sealed class PatchEntityHandler(
 
         if (TryGetProp(sideObj, "imagePath", out var imgNode))
         {
-            if (imgNode is null) card.ClearSideImage(face);
-            else if (imgNode.GetValueKind() == JsonValueKind.String)
+            var copyRes = await TryCopyPatchedImageAsync(imgNode, $"{face.ToString().ToLowerInvariant()}.imagePath", allowNull: true, "Flashcard side 'imagePath' must be a string or null.", storageDir, jsonDir, ct);
+            if (!copyRes.IsSuccess) return copyRes.Error!;
+            if (copyRes.Value is null)
             {
-                var rawImg = imgNode.GetValue<string>();
-                if (string.IsNullOrWhiteSpace(rawImg))
-                {
-                    card.ClearSideImage(face);
-                }
-                else
-                {
-                    var copyRes = await JsonQuestionMaterializer.CopyConfinedImageAsync(rawImg, jsonDir, storageDir, contentInspector, ct, workspaceCwdDirectory: workingDirectoryProvider.GetCurrentDirectory());
-                    if (!copyRes.IsSuccess) return copyRes.Error!;
-                    if (string.IsNullOrWhiteSpace(copyRes.Value))
-                        return new Error("Patch.InvalidValue", "Flashcard side 'imagePath' must resolve to a valid image.", ErrorType.Validation, Path: $"{face.ToString().ToLowerInvariant()}.imagePath");
-                    var imgRes = card.SetSideImage(face, copyRes.Value);
-                    if (!imgRes.IsSuccess) return imgRes.Error!;
-                }
+                card.ClearSideImage(face);
             }
-            else return new Error("Patch.InvalidValue", "Flashcard side 'imagePath' must be a string or null.", ErrorType.Validation, Path: $"{face.ToString().ToLowerInvariant()}.imagePath");
+            else
+            {
+                var imgRes = card.SetSideImage(face, copyRes.Value);
+                if (!imgRes.IsSuccess) return imgRes.Error!;
+            }
         }
 
         if (TryGetProp(sideObj, "position", out var posNode) || TryGetProp(sideObj, "textPosition", out posNode))
@@ -1913,43 +1637,6 @@ public sealed class PatchEntityHandler(
             default:
                 return new Error("Patch.UnsupportedMove", $"Cannot move entity kind '{target.EntityKind}'.", ErrorType.Validation);
         }
-    }
-
-    private static bool TryGetProp(JsonObject obj, string name, out JsonNode? value)
-    {
-        foreach (var kv in obj)
-        {
-            if (string.Equals(kv.Key, name, StringComparison.OrdinalIgnoreCase))
-            {
-                value = kv.Value;
-                return true;
-            }
-        }
-        value = null;
-        return false;
-    }
-
-    private static string? FindClosest(string unknown, IEnumerable<string> candidates)
-    {
-        string? best = null;
-        int bestDist = 3;
-        foreach (var c in candidates)
-        {
-            int d = Levenshtein(unknown.ToLowerInvariant(), c.ToLowerInvariant());
-            if (d < bestDist) { bestDist = d; best = c; }
-        }
-        return best;
-    }
-
-    private static int Levenshtein(string a, string b)
-    {
-        var dp = new int[a.Length + 1, b.Length + 1];
-        for (int i = 0; i <= a.Length; i++) dp[i, 0] = i;
-        for (int j = 0; j <= b.Length; j++) dp[0, j] = j;
-        for (int i = 1; i <= a.Length; i++)
-            for (int j = 1; j <= b.Length; j++)
-                dp[i, j] = Math.Min(Math.Min(dp[i - 1, j] + 1, dp[i, j - 1] + 1), dp[i - 1, j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1));
-        return dp[a.Length, b.Length];
     }
 
     private sealed class PatchOptionDto

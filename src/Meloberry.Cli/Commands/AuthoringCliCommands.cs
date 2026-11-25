@@ -44,10 +44,8 @@ public sealed class ApplyCliCommand : CliCommand
             if (context.PositionalArgs.Count is < 1 or > 2)
                 return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Usage: {new ApplyCliCommand().Descriptor.Usage}", context.GlobalOptions.Json);
 
-            int timeout = 30;
-            var rawTimeout = context.GetOptionValue("timeout");
-            if (!string.IsNullOrWhiteSpace(rawTimeout) && (!int.TryParse(rawTimeout, out timeout) || timeout is < 5 or > 180))
-                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Invalid --timeout '{rawTimeout}'. Pass integer seconds between 5 and 180.", context.GlobalOptions.Json);
+            if (!CliCommandHelpers.TryParseTimeoutOption(context, out int timeout, out int? timeoutErr))
+                return timeoutErr!.Value;
 
             string? targetAddr = context.PositionalArgs.Count == 2 ? context.PositionalArgs[0] : null;
             string fileOrDash = context.PositionalArgs.Count == 2 ? context.PositionalArgs[1] : context.PositionalArgs[0];

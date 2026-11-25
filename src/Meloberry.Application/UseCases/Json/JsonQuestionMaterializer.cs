@@ -568,43 +568,8 @@ internal static class JsonQuestionMaterializer
     {
         if (string.IsNullOrWhiteSpace(rawPath)) return (string?)null;
 
-        string? resolvedPath = null;
-        if (PathConfinement.TryResolveInside(componentBaseDirectory, rawPath, out var compCandidate))
-        {
-            resolvedPath = compCandidate;
-        }
-        else if (!string.IsNullOrWhiteSpace(specRootDirectory) &&
-                 TryResolveRelativeInsideRoot(componentBaseDirectory, rawPath, specRootDirectory, out var nestedCandidate))
-        {
-            resolvedPath = nestedCandidate;
-        }
-        else if (!string.IsNullOrWhiteSpace(specRootDirectory) &&
-                 PathConfinement.TryResolveInside(specRootDirectory, rawPath, out var rootCandidate))
-        {
-            resolvedPath = rootCandidate;
-        }
-        else
-        {
+        if (!PathConfinement.TryResolveConfinedInputFile(rawPath, componentBaseDirectory, specRootDirectory, workspaceCwdDirectory, out var resolvedPath))
             return new Error("Asset.InvalidPath", $"JSON imagePath '{rawPath}' must be relative and stay inside the input directory.", ErrorType.Validation);
-        }
-
-        // If the asset path wasn't found inside the component/spec folder (e.g. ./articles/ referencing ./assets/fig_1.png),
-        // also check specRootDirectory and immediate workspaceCwdDirectory (only for non-traversal relative paths).
-        if (!File.Exists(resolvedPath) && !StartsWithParentTraversal(rawPath))
-        {
-            if (!string.IsNullOrWhiteSpace(specRootDirectory) &&
-                PathConfinement.TryResolveInside(specRootDirectory, rawPath, out var rootFallback) &&
-                File.Exists(rootFallback))
-            {
-                resolvedPath = rootFallback;
-            }
-            else if (!string.IsNullOrWhiteSpace(workspaceCwdDirectory) &&
-                     PathConfinement.TryResolveInside(workspaceCwdDirectory, rawPath, out var cwdFallback) &&
-                     File.Exists(cwdFallback))
-            {
-                resolvedPath = cwdFallback;
-            }
-        }
 
         var copyRes = await contentInspector.CopyAndVerifyImageAsync(resolvedPath, storageDirectory, cancellationToken);
         return copyRes.IsSuccess ? copyRes.Value : copyRes.Error!;
@@ -621,41 +586,8 @@ internal static class JsonQuestionMaterializer
         if (string.IsNullOrWhiteSpace(rawPath))
             return new Error("Asset.InvalidPath", "Relabel masksPath cannot be empty.", ErrorType.Validation);
 
-        string? resolvedPath;
-        if (PathConfinement.TryResolveInside(componentBaseDirectory, rawPath, out var compCandidate))
-        {
-            resolvedPath = compCandidate;
-        }
-        else if (!string.IsNullOrWhiteSpace(specRootDirectory) &&
-                 TryResolveRelativeInsideRoot(componentBaseDirectory, rawPath, specRootDirectory, out var nestedCandidate))
-        {
-            resolvedPath = nestedCandidate;
-        }
-        else if (!string.IsNullOrWhiteSpace(specRootDirectory) &&
-                 PathConfinement.TryResolveInside(specRootDirectory, rawPath, out var rootCandidate))
-        {
-            resolvedPath = rootCandidate;
-        }
-        else
-        {
+        if (!PathConfinement.TryResolveConfinedInputFile(rawPath, componentBaseDirectory, specRootDirectory, workspaceCwdDirectory, out var resolvedPath))
             return new Error("Asset.InvalidPath", $"Relabel masksPath '{rawPath}' must be relative and stay inside the input directory.", ErrorType.Validation);
-        }
-
-        if (!File.Exists(resolvedPath) && !StartsWithParentTraversal(rawPath))
-        {
-            if (!string.IsNullOrWhiteSpace(specRootDirectory) &&
-                PathConfinement.TryResolveInside(specRootDirectory, rawPath, out var rootFallback) &&
-                File.Exists(rootFallback))
-            {
-                resolvedPath = rootFallback;
-            }
-            else if (!string.IsNullOrWhiteSpace(workspaceCwdDirectory) &&
-                     PathConfinement.TryResolveInside(workspaceCwdDirectory, rawPath, out var cwdFallback) &&
-                     File.Exists(cwdFallback))
-            {
-                resolvedPath = cwdFallback;
-            }
-        }
 
         if (!File.Exists(resolvedPath))
             return new Error("Json.FileNotFound", $"Relabel masks sidecar file '{rawPath}' was not found.", ErrorType.NotFound);
@@ -665,36 +597,5 @@ internal static class JsonQuestionMaterializer
             return new Error("Relabel.SidecarTooLarge", $"Relabel masks sidecar '{rawPath}' exceeds the 5 MB limit ({fileInfo.Length} bytes).", ErrorType.Validation);
 
         return resolvedPath;
-    }
-
-    private static bool TryResolveRelativeInsideRoot(string baseDir, string rawPath, string rootDir, out string resolvedPath)
-    {
-        resolvedPath = string.Empty;
-        if (string.IsNullOrWhiteSpace(rawPath) || rawPath.Contains('\0')) return false;
-        var trimmed = rawPath.Trim();
-        if (Path.IsPathRooted(trimmed)) return false;
-        try
-        {
-            var rootFull = Path.GetFullPath(rootDir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-            var candidateFull = Path.GetFullPath(Path.Combine(baseDir, trimmed));
-            var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
-            if (candidateFull.StartsWith(rootFull + Path.DirectorySeparatorChar, comparison))
-            {
-                resolvedPath = candidateFull;
-                return true;
-            }
-            return false;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private static bool StartsWithParentTraversal(string rawPath)
-    {
-        var normalized = rawPath.Trim().Replace('/', '\\');
-        return normalized.Equals("..", StringComparison.Ordinal) ||
-               normalized.StartsWith("..\\", StringComparison.Ordinal);
     }
 }

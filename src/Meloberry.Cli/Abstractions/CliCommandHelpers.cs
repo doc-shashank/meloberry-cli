@@ -50,4 +50,21 @@ internal static class CliCommandHelpers
             ? JsonSerializer.Serialize(new { success = true, data = payload }, JsonOptions)
             : humanReadableText);
     }
+
+    public static bool TryParseTimeoutOption(CliInvocationContext context, out int timeout, out int? errorExit)
+    {
+        timeout = 30;
+        errorExit = null;
+        var rawTimeout = context.GetOptionValue("timeout");
+        if (!string.IsNullOrWhiteSpace(rawTimeout) && (!int.TryParse(rawTimeout, out timeout) || timeout is < 5 or > 180))
+        {
+            errorExit = CliResultExtensions.WriteValidationError(
+                context.Console,
+                "Cli.InvalidArgs",
+                $"Invalid --timeout '{rawTimeout}'. Pass integer seconds between 5 and 180.",
+                context.GlobalOptions.Json);
+            return false;
+        }
+        return true;
+    }
 }

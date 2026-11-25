@@ -452,17 +452,25 @@ public sealed class LintHandler(
         }
     }
 
+    private static bool TryDeserializePayload<T>(PayloadQuestion pq, string label, List<LintIssue> issues, out T payload) where T : class
+    {
+        if (Phase1PayloadCodec.TryDeserialize<T>(pq.PayloadJson, out var parsed) && parsed is not null)
+        {
+            payload = parsed;
+            return true;
+        }
+        issues.Add(new LintIssue("Error", "Lint.InvalidQuestionPayload", pq.Id, $"{label} question has invalid payload JSON."));
+        payload = null!;
+        return false;
+    }
+
     private async Task LintPayloadQuestionAsync(PayloadQuestion pq, string storageDirectory, List<LintIssue> issues, CancellationToken ct)
     {
         switch (pq.Type)
         {
             case QuestionType.FillBlank:
             {
-                if (!Phase1PayloadCodec.TryDeserialize<FillBlankPayload>(pq.PayloadJson, out var p) || p is null)
-                {
-                    issues.Add(new LintIssue("Error", "Lint.InvalidQuestionPayload", pq.Id, "Fill-in-the-blank question has invalid payload JSON."));
-                    return;
-                }
+                if (!TryDeserializePayload<FillBlankPayload>(pq, "Fill-in-the-blank", issues, out var p)) return;
                 if (string.IsNullOrWhiteSpace(p.Template))
                 {
                     issues.Add(new LintIssue("Error", "Lint.EmptyQuestionPrompt", pq.Id, "Fill-in-the-blank prompt text is missing."));
@@ -490,11 +498,7 @@ public sealed class LintHandler(
             }
             case QuestionType.AssertionReason:
             {
-                if (!Phase1PayloadCodec.TryDeserialize<AssertionReasonPayload>(pq.PayloadJson, out var p) || p is null)
-                {
-                    issues.Add(new LintIssue("Error", "Lint.InvalidQuestionPayload", pq.Id, "Assertion-Reason question has invalid payload JSON."));
-                    return;
-                }
+                if (!TryDeserializePayload<AssertionReasonPayload>(pq, "Assertion-Reason", issues, out var p)) return;
                 if (string.IsNullOrWhiteSpace(p.Assertion) || string.IsNullOrWhiteSpace(p.Reason))
                     issues.Add(new LintIssue("Error", "Lint.EmptyAssertionOrReason", pq.Id, "Assertion-Reason question requires non-empty Assertion (A) and Reason (R)."));
                 if (!Phase1PayloadRules.IsValidAssertionReasonAnswer(p.Answer))
@@ -509,11 +513,7 @@ public sealed class LintHandler(
             }
             case QuestionType.SpotError:
             {
-                if (!Phase1PayloadCodec.TryDeserialize<SpotErrorPayload>(pq.PayloadJson, out var p) || p is null)
-                {
-                    issues.Add(new LintIssue("Error", "Lint.InvalidQuestionPayload", pq.Id, "Spot-the-error question has invalid payload JSON."));
-                    return;
-                }
+                if (!TryDeserializePayload<SpotErrorPayload>(pq, "Spot-the-error", issues, out var p)) return;
                 if (string.IsNullOrWhiteSpace(p.Template))
                 {
                     issues.Add(new LintIssue("Error", "Lint.EmptyQuestionPrompt", pq.Id, "Spot-the-error statement text is missing."));
@@ -553,11 +553,7 @@ public sealed class LintHandler(
             }
             case QuestionType.Differentiation:
             {
-                if (!Phase1PayloadCodec.TryDeserialize<DifferentiationPayload>(pq.PayloadJson, out var p) || p is null)
-                {
-                    issues.Add(new LintIssue("Error", "Lint.InvalidQuestionPayload", pq.Id, "Differentiation question has invalid payload JSON."));
-                    return;
-                }
+                if (!TryDeserializePayload<DifferentiationPayload>(pq, "Differentiation", issues, out var p)) return;
                 var mode = Phase2PayloadRules.NormalizeDiffMode(p.Mode);
                 if (!Phase2PayloadRules.IsValidDiffMode(mode))
                 {
@@ -657,11 +653,7 @@ public sealed class LintHandler(
             }
             case QuestionType.RelabelImage:
             {
-                if (!Phase1PayloadCodec.TryDeserialize<RelabelImagePayload>(pq.PayloadJson, out var p) || p is null)
-                {
-                    issues.Add(new LintIssue("Error", "Lint.InvalidQuestionPayload", pq.Id, "Relabel question has invalid payload JSON."));
-                    return;
-                }
+                if (!TryDeserializePayload<RelabelImagePayload>(pq, "Relabel", issues, out var p)) return;
                 await CheckImageAssetAsync(storageDirectory, p.ImagePath, $"{pq.Id}:image", issues, ct);
                 if (!Phase2PayloadRules.IsValidRelabelMode(p.Mode))
                     issues.Add(new LintIssue("Error", "Lint.InvalidRelabelMode", pq.Id, $"Invalid relabel mode '{p.Mode}'. Supported modes: 'reveal', 'bank', 'recall'."));
@@ -689,11 +681,7 @@ public sealed class LintHandler(
             }
             case QuestionType.Classify:
             {
-                if (!Phase1PayloadCodec.TryDeserialize<ClassifyPayload>(pq.PayloadJson, out var p) || p is null)
-                {
-                    issues.Add(new LintIssue("Error", "Lint.InvalidQuestionPayload", pq.Id, "Classify question has invalid payload JSON."));
-                    return;
-                }
+                if (!TryDeserializePayload<ClassifyPayload>(pq, "Classify", issues, out var p)) return;
                 if (p.Buckets is null || p.Buckets.Count < 2)
                 {
                     issues.Add(new LintIssue("Error", "Lint.InsufficientClassifyBuckets", pq.Id, $"Classify question has {p.Buckets?.Count ?? 0} bucket(s); at least 2 are required."));
@@ -742,11 +730,7 @@ public sealed class LintHandler(
             }
             case QuestionType.Match:
             {
-                if (!Phase1PayloadCodec.TryDeserialize<MatchPayload>(pq.PayloadJson, out var p) || p is null)
-                {
-                    issues.Add(new LintIssue("Error", "Lint.InvalidQuestionPayload", pq.Id, "Match question has invalid payload JSON."));
-                    return;
-                }
+                if (!TryDeserializePayload<MatchPayload>(pq, "Match", issues, out var p)) return;
                 if (p.Pairs is null || p.Pairs.Count < 2)
                     issues.Add(new LintIssue("Error", "Lint.InsufficientMatchPairs", pq.Id, $"Match question has {p.Pairs?.Count ?? 0} pair(s); at least 2 are required."));
                 var seenLeft = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -782,11 +766,7 @@ public sealed class LintHandler(
             }
             case QuestionType.Numeric:
             {
-                if (!Phase1PayloadCodec.TryDeserialize<NumericPayload>(pq.PayloadJson, out var p) || p is null)
-                {
-                    issues.Add(new LintIssue("Error", "Lint.InvalidQuestionPayload", pq.Id, "Numeric question has invalid payload JSON."));
-                    return;
-                }
+                if (!TryDeserializePayload<NumericPayload>(pq, "Numeric", issues, out var p)) return;
                 if (string.IsNullOrWhiteSpace(p.Prompt))
                     issues.Add(new LintIssue("Error", "Lint.EmptyQuestionPrompt", pq.Id, "Numeric question prompt is empty."));
                 if (!double.IsFinite(p.Answer))
@@ -801,11 +781,7 @@ public sealed class LintHandler(
             }
             case QuestionType.CaseGroup:
             {
-                if (!Phase1PayloadCodec.TryDeserialize<CaseGroupPayload>(pq.PayloadJson, out var p) || p is null)
-                {
-                    issues.Add(new LintIssue("Error", "Lint.InvalidQuestionPayload", pq.Id, "Case question has invalid payload JSON."));
-                    return;
-                }
+                if (!TryDeserializePayload<CaseGroupPayload>(pq, "Case", issues, out var p)) return;
                 if (string.IsNullOrWhiteSpace(p.Stem))
                     issues.Add(new LintIssue("Error", "Lint.EmptyCaseStem", pq.Id, "Case question vignette stem cannot be empty."));
                 if (!string.IsNullOrWhiteSpace(p.ImagePath))
@@ -833,28 +809,7 @@ public sealed class LintHandler(
                         }
 
                         var subId = $"{pq.Id}:sub-{sub.Index}";
-                        Question? rehydrated = subType switch
-                        {
-                            QuestionType.Mcq when sub.Mcq is not null => McqQuestion.Rehydrate(
-                                subId,
-                                pq.ContainerId,
-                                sub.Index + 1,
-                                sub.Mcq.Text ?? string.Empty,
-                                Math.Max(2, sub.Mcq.MaxOptions),
-                                sub.Mcq.IsMultiCorrect,
-                                (sub.Mcq.Options ?? []).Select(o => McqOption.Create(o.Index, o.Text, o.ImagePath, o.IsCorrect)),
-                                imagePath: sub.Mcq.ImagePath,
-                                explanation: sub.Mcq.Explanation),
-                            QuestionType.Flashcard when sub.Flashcard is not null => FlashcardQuestion.Rehydrate(
-                                subId,
-                                pq.ContainerId,
-                                sub.Index + 1,
-                                FlashcardSide.Rehydrate(sub.Flashcard.Front.Text, sub.Flashcard.Front.ImagePath,
-                                    string.Equals(sub.Flashcard.Front.Position, "aboveImage", StringComparison.OrdinalIgnoreCase) ? MediaPosition.TextAboveImage : MediaPosition.TextBelowImage),
-                                FlashcardSide.Rehydrate(sub.Flashcard.Back.Text, sub.Flashcard.Back.ImagePath,
-                                    string.Equals(sub.Flashcard.Back.Position, "aboveImage", StringComparison.OrdinalIgnoreCase) ? MediaPosition.TextAboveImage : MediaPosition.TextBelowImage)),
-                            _ => PayloadQuestion.Rehydrate(subId, pq.ContainerId, sub.Index + 1, subType, sub.PayloadJson ?? "{}")
-                        };
+                        var rehydrated = sub.RehydrateToDomainQuestion(subType, subId, pq.ContainerId);
                         await LintQuestionAsync(rehydrated, storageDirectory, issues, ct);
                     }
                 }

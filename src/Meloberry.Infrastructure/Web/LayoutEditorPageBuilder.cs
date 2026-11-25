@@ -85,13 +85,9 @@ html, body { height: 100%; overflow: hidden; }
 .ed-slide-demo-wrap { width: 100%; display: flex; justify-content: center; transition: transform var(--slide-ms) cubic-bezier(0.22, 1, 0.36, 1), opacity 160ms ease; }
 .ed-slide-demo-wrap.is-sliding { transform: translateX(36px); opacity: 0.35; }
 .ed-mcq-question-note { margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--border); font-size: 12px; color: var(--muted); }
-.mby-zoom-modal { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.92); display: flex; flex-direction: column; z-index: 60; }
-.mby-zoom-topbar { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; z-index: 2; }
-.mby-zoom-pill { padding: 6px 12px; border-radius: 999px; background: rgba(255, 255, 255, 0.14); color: #ffffff; font-size: 13px; font-weight: 600; }
-.mby-zoom-actions { display: flex; gap: 8px; }
-.mby-zoom-btn { padding: 6px 12px; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.22); background: rgba(255, 255, 255, 0.12); color: #ffffff; font-weight: 700; cursor: pointer; }
-.mby-zoom-stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; padding: 16px; }
-.mby-zoom-img { max-width: 90vw; max-height: 82vh; object-fit: contain; user-select: none; transform-origin: center center; transition: transform 140ms ease; }
+.mby-zoom-modal { background: rgba(0, 0, 0, 0.92); }
+.mby-zoom-stage, .mby-zoom-stage:active { cursor: default; padding: 16px; }
+.mby-zoom-img { transition: transform 140ms ease; }
   </style>
 </head>
 <body>

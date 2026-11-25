@@ -61,10 +61,8 @@ public sealed partial class BuildCliCommand : CliCommand
             bool verify = context.HasFlag("verify");
             bool staticOnly = context.HasFlag("static-only");
             bool ephemeral = context.HasFlag("ephemeral");
-            int timeout = 30;
-            var rawTimeout = context.GetOptionValue("timeout");
-            if (!string.IsNullOrWhiteSpace(rawTimeout) && (!int.TryParse(rawTimeout, out timeout) || timeout is < 5 or > 180))
-                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Invalid --timeout '{rawTimeout}'. Pass integer seconds between 5 and 180.", context.GlobalOptions.Json);
+            if (!CliCommandHelpers.TryParseTimeoutOption(context, out int timeout, out int? timeoutErr))
+                return timeoutErr!.Value;
 
             bool isStdin = string.Equals(target, "-", StringComparison.Ordinal);
             bool isExistingFile = !isStdin && File.Exists(target);
@@ -387,10 +385,8 @@ public sealed class AnalyzeCliCommand : CliCommand
 
             if (headless || staticOnly)
             {
-                int timeout = 30;
-                var rawTimeout = context.GetOptionValue("timeout");
-                if (!string.IsNullOrWhiteSpace(rawTimeout) && (!int.TryParse(rawTimeout, out timeout) || timeout is < 5 or > 180))
-                    return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Invalid --timeout '{rawTimeout}'. Pass integer seconds between 5 and 180.", context.GlobalOptions.Json);
+                if (!CliCommandHelpers.TryParseTimeoutOption(context, out int timeout, out int? timeoutErr))
+                    return timeoutErr!.Value;
 
                 var verRes = await verifyUseCase.HandleAsync(new VerifyWebAppCommand(targetPath, staticOnly, timeout), context.CancellationToken);
                 if (!verRes.IsSuccess) return verRes.ToExitCode(context.Console, context.GlobalOptions.Json);

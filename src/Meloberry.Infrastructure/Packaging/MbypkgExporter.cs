@@ -421,70 +421,51 @@ public sealed class MbypkgExporter(
     {
         var assets = new List<string>();
         foreach (var q in quiz.Questions)
+            CollectQuestionAssets(q, assets);
+        return assets;
+    }
+
+    private static void CollectQuestionAssets(Question q, List<string> assets)
+    {
+        if (q is McqQuestion mcq)
         {
-            if (q is McqQuestion mcq)
-            {
-                if (!string.IsNullOrWhiteSpace(mcq.ImagePath)) assets.Add(mcq.ImagePath);
-                assets.AddRange(mcq.Options.Where(o => !string.IsNullOrWhiteSpace(o.ImagePath)).Select(o => o.ImagePath!));
-            }
-            else if (q is FlashcardQuestion card)
-            {
-                if (!string.IsNullOrWhiteSpace(card.Front.ImagePath)) assets.Add(card.Front.ImagePath);
-                if (!string.IsNullOrWhiteSpace(card.Back.ImagePath)) assets.Add(card.Back.ImagePath);
-            }
-            else if (q is PayloadQuestion pq && pq.Type == QuestionType.RelabelImage &&
-                     Phase1PayloadCodec.TryDeserialize<RelabelImagePayload>(pq.PayloadJson, out var rel) &&
-                     !string.IsNullOrWhiteSpace(rel?.ImagePath))
-            {
+            if (!string.IsNullOrWhiteSpace(mcq.ImagePath)) assets.Add(mcq.ImagePath);
+            assets.AddRange(mcq.Options.Where(o => !string.IsNullOrWhiteSpace(o.ImagePath)).Select(o => o.ImagePath!));
+            return;
+        }
+        if (q is FlashcardQuestion card)
+        {
+            if (!string.IsNullOrWhiteSpace(card.Front.ImagePath)) assets.Add(card.Front.ImagePath);
+            if (!string.IsNullOrWhiteSpace(card.Back.ImagePath)) assets.Add(card.Back.ImagePath);
+            return;
+        }
+        if (q is not PayloadQuestion pq)
+            return;
+
+        switch (pq.Type)
+        {
+            case QuestionType.RelabelImage when Phase1PayloadCodec.TryDeserialize<RelabelImagePayload>(pq.PayloadJson, out var rel) && !string.IsNullOrWhiteSpace(rel?.ImagePath):
                 assets.Add(rel.ImagePath);
-            }
-            else if (q is PayloadQuestion sePq && sePq.Type == QuestionType.SpotError &&
-                     Phase1PayloadCodec.TryDeserialize<SpotErrorPayload>(sePq.PayloadJson, out var se) &&
-                     !string.IsNullOrWhiteSpace(se?.ImagePath))
-            {
+                break;
+            case QuestionType.SpotError when Phase1PayloadCodec.TryDeserialize<SpotErrorPayload>(pq.PayloadJson, out var se) && !string.IsNullOrWhiteSpace(se?.ImagePath):
                 assets.Add(se.ImagePath);
-            }
-            else if (q is PayloadQuestion numPq && numPq.Type == QuestionType.Numeric &&
-                     Phase1PayloadCodec.TryDeserialize<NumericPayload>(numPq.PayloadJson, out var numP) &&
-                     !string.IsNullOrWhiteSpace(numP?.ImagePath))
-            {
+                break;
+            case QuestionType.Numeric when Phase1PayloadCodec.TryDeserialize<NumericPayload>(pq.PayloadJson, out var numP) && !string.IsNullOrWhiteSpace(numP?.ImagePath):
                 assets.Add(numP.ImagePath);
-            }
-            else if (q is PayloadQuestion casePq && casePq.Type == QuestionType.CaseGroup &&
-                     Phase1PayloadCodec.TryDeserialize<CaseGroupPayload>(casePq.PayloadJson, out var caseP) &&
-                     caseP is not null)
-            {
+                break;
+            case QuestionType.CaseGroup when Phase1PayloadCodec.TryDeserialize<CaseGroupPayload>(pq.PayloadJson, out var caseP) && caseP is not null:
                 if (!string.IsNullOrWhiteSpace(caseP.ImagePath))
                     assets.Add(caseP.ImagePath);
                 if (caseP.Questions is not null)
                 {
                     foreach (var sub in caseP.Questions)
                     {
-                        if (sub is null) continue;
-                        if (sub.Mcq is not null)
-                        {
-                            if (!string.IsNullOrWhiteSpace(sub.Mcq.ImagePath)) assets.Add(sub.Mcq.ImagePath);
-                            assets.AddRange((sub.Mcq.Options ?? []).Where(o => !string.IsNullOrWhiteSpace(o.ImagePath)).Select(o => o.ImagePath!));
-                        }
-                        if (sub.Flashcard is not null)
-                        {
-                            if (!string.IsNullOrWhiteSpace(sub.Flashcard.Front.ImagePath)) assets.Add(sub.Flashcard.Front.ImagePath);
-                            if (!string.IsNullOrWhiteSpace(sub.Flashcard.Back.ImagePath)) assets.Add(sub.Flashcard.Back.ImagePath);
-                        }
-                        if (!string.IsNullOrWhiteSpace(sub.PayloadJson))
-                        {
-                            if (sub.Type == "relabel" && Phase1PayloadCodec.TryDeserialize<RelabelImagePayload>(sub.PayloadJson, out var sRel) && !string.IsNullOrWhiteSpace(sRel?.ImagePath))
-                                assets.Add(sRel.ImagePath);
-                            else if (sub.Type == "spot-error" && Phase1PayloadCodec.TryDeserialize<SpotErrorPayload>(sub.PayloadJson, out var sSe) && !string.IsNullOrWhiteSpace(sSe?.ImagePath))
-                                assets.Add(sSe.ImagePath);
-                            else if (sub.Type == "numeric" && Phase1PayloadCodec.TryDeserialize<NumericPayload>(sub.PayloadJson, out var sNum) && !string.IsNullOrWhiteSpace(sNum?.ImagePath))
-                                assets.Add(sNum.ImagePath);
-                        }
+                        if (sub is not null && Quiz.TryParseQuestionType(sub.Type, out var subType) && subType != QuestionType.CaseGroup)
+                            CollectQuestionAssets(sub.RehydrateToDomainQuestion(subType, $"{q.Id}:sub-{sub.Index}", q.ContainerId), assets);
                     }
                 }
-            }
+                break;
         }
-        return assets;
     }
 
     private static SessionPackageDto MapSessionToDto(StudySession session, bool includeLayouts) =>

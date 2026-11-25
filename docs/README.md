@@ -1,4 +1,4 @@
-# Meloberry CLI (`mby` v2.0.0)
+# Meloberry CLI (`mby` v2.1.0)
 
 Stateless, AI-agent-first compiler for deterministic study helper WebApps. Agents supply content and organization via JSON, Markdown (`.md` + frontmatter), or modular directories; `mby` owns themes, layout bounds, validation, and rendering.
 

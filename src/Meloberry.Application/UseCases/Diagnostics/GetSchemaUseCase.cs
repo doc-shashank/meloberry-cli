@@ -84,6 +84,52 @@ public sealed class GetSchemaHandler
     public static readonly IReadOnlyList<string> SupportedGroups =
         ["@content", "@containers", "@blocks", "@questions", "@other", "@formats", "@workflows"];
 
+    private static readonly SchemaFieldSpec RefField =
+        new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern);
+
+    private static readonly SchemaFieldSpec ExplanationField =
+        new("explanation", "string", false, "Optional explanation Markdown/KaTeX.");
+
+    private static readonly SchemaFieldSpec McqLayoutOverridesField =
+        new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.");
+
+    private static SchemaFieldSpec TypeField(string typeName) =>
+        new("type", "string", true, $"Must be '{typeName}'.", [typeName]);
+
+    private static SchemaFieldSpec KindField(string kindName) =>
+        new("kind", "string", true, $"Must be '{kindName}'.", [kindName]);
+
+    private static readonly Dictionary<string, Func<SchemaTopicDefinition>> TopicSchemaBuilders = new(StringComparer.Ordinal)
+    {
+        ["session"] = BuildSessionSchema,
+        ["article"] = BuildArticleSchema,
+        ["quiz"] = BuildQuizSchema,
+        ["text"] = BuildTextBlockSchema,
+        ["image"] = BuildImageBlockSchema,
+        ["mcq"] = BuildMcqSchema,
+        ["flashcard"] = BuildFlashcardSchema,
+        ["callout"] = BuildCalloutSchema,
+        ["table"] = BuildTableBlockSchema,
+        ["diagram-explore"] = BuildDiagramExploreSchema,
+        ["reveal"] = BuildRevealSchema,
+        ["fill-blank"] = BuildFillBlankSchema,
+        ["assertion-reason"] = BuildAssertionReasonSchema,
+        ["spot-error"] = BuildSpotErrorSchema,
+        ["diff"] = BuildDiffSchema,
+        ["mechanism"] = BuildMechanismSchema,
+        ["relabel"] = BuildRelabelSchema,
+        ["case"] = BuildCaseSchema,
+        ["classify"] = BuildClassifySchema,
+        ["match"] = BuildMatchSchema,
+        ["numeric"] = BuildNumericSchema,
+        ["markdown"] = BuildMarkdownSchema,
+        ["analyze"] = BuildAnalyzeSchema,
+        ["pkg"] = BuildPkgSchema,
+        ["build"] = BuildBuildSchema,
+        ["batch"] = BuildBatchSchema,
+        ["patch"] = BuildPatchSchema
+    };
+
     public Task<Result<GetSchemaResponse>> HandleAsync(GetSchemaQuery query, CancellationToken cancellationToken = default)
     {
         var rawTokens = (query.Topics ?? [])
@@ -129,36 +175,8 @@ public sealed class GetSchemaHandler
 
         foreach (var t in activeTopics)
         {
-            switch (t)
-            {
-                case "session": schemas.Add(BuildSessionSchema()); break;
-                case "article": schemas.Add(BuildArticleSchema()); break;
-                case "quiz": schemas.Add(BuildQuizSchema()); break;
-                case "text": schemas.Add(BuildTextBlockSchema()); break;
-                case "image": schemas.Add(BuildImageBlockSchema()); break;
-                case "mcq": schemas.Add(BuildMcqSchema()); break;
-                case "flashcard": schemas.Add(BuildFlashcardSchema()); break;
-                case "callout": schemas.Add(BuildCalloutSchema()); break;
-                case "table": schemas.Add(BuildTableBlockSchema()); break;
-                case "diagram-explore": schemas.Add(BuildDiagramExploreSchema()); break;
-                case "reveal": schemas.Add(BuildRevealSchema()); break;
-                case "fill-blank": schemas.Add(BuildFillBlankSchema()); break;
-                case "assertion-reason": schemas.Add(BuildAssertionReasonSchema()); break;
-                case "spot-error": schemas.Add(BuildSpotErrorSchema()); break;
-                case "diff": schemas.Add(BuildDiffSchema()); break;
-                case "mechanism": schemas.Add(BuildMechanismSchema()); break;
-                case "relabel": schemas.Add(BuildRelabelSchema()); break;
-                case "case": schemas.Add(BuildCaseSchema()); break;
-                case "classify": schemas.Add(BuildClassifySchema()); break;
-                case "match": schemas.Add(BuildMatchSchema()); break;
-                case "numeric": schemas.Add(BuildNumericSchema()); break;
-                case "markdown": schemas.Add(BuildMarkdownSchema()); break;
-                case "analyze": schemas.Add(BuildAnalyzeSchema()); break;
-                case "pkg": schemas.Add(BuildPkgSchema()); break;
-                case "build": schemas.Add(BuildBuildSchema()); break;
-                case "batch": schemas.Add(BuildBatchSchema()); break;
-                case "patch": schemas.Add(BuildPatchSchema()); break;
-            }
+            if (TopicSchemaBuilders.TryGetValue(t, out var builder))
+                schemas.Add(builder());
         }
 
         var layoutProps = activeTopics.Contains("layouts", StringComparer.Ordinal) ? BuildLayoutSpecs() : null;
@@ -295,8 +313,8 @@ public sealed class GetSchemaHandler
             DisallowUnmappedProperties: true,
             Fields:
             [
-                new("kind", "string", true, "Must be 'text'.", ["text"]),
-                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                KindField("text"),
+                RefField,
                 new("text", "string", true, "Non-empty Markdown/KaTeX text.")
             ],
             Example: new { kind = "text", text = "# Heading\n\nBody text with $E = mc^2$." },
@@ -316,8 +334,8 @@ public sealed class GetSchemaHandler
             DisallowUnmappedProperties: true,
             Fields:
             [
-                new("kind", "string", true, "Must be 'image'.", ["image"]),
-                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                KindField("image"),
+                RefField,
                 new("imagePath", "string", true, "Relative path inside JSON/MD/workspace root (copied & stored as assets/<stem>_<hash8>.<ext>)."),
                 new("caption", "string", false, "Optional caption rendered atomically inside <figcaption> (supports Markdown/KaTeX)."),
                 new("alt", "string", false, "Optional accessibility alt text.")
@@ -339,15 +357,15 @@ public sealed class GetSchemaHandler
             DisallowUnmappedProperties: true,
             Fields:
             [
-                new("type", "string", true, "Must be 'mcq'.", ["mcq"]),
-                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                TypeField("mcq"),
+                RefField,
                 new("text", "string", true, "Prompt Markdown."),
                 new("imagePath", "string", false, "Optional prompt image."),
                 new("explanation", "string", false, "Optional explanation Markdown."),
                 new("isMultiCorrect", "boolean", false, "Multiple correct answers (default false)."),
                 new("maxOptions", "integer", false, "Option slot cap (2..26, default 4; auto-expands up to 26 when omitted and >4 options provided; Markdown auto-sizes).", null, null, null, 2, 26),
                 new("options", "array<mcqOption>", true, "2..26 options with text/imagePath + isCorrect (enforced by check/build/pkg; >=2 enforced on patch)."),
-                new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
+                McqLayoutOverridesField
             ],
             Example: new
             {
@@ -378,8 +396,8 @@ public sealed class GetSchemaHandler
             DisallowUnmappedProperties: true,
             Fields:
             [
-                new("type", "string", true, "Must be 'flashcard'.", ["flashcard"]),
-                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                TypeField("flashcard"),
+                RefField,
                 new("front", "flashcardSide", true, "Front face: text and/or imagePath + position."),
                 new("back", "flashcardSide", true, "Back face: text and/or imagePath + position."),
                 new("layoutOverrides", "object<string,string>", false, "Bounded flashcard layout overrides.")
@@ -406,11 +424,11 @@ public sealed class GetSchemaHandler
             DisallowUnmappedProperties: true,
             Fields:
             [
-                new("kind", "string", true, "Must be 'callout'.", ["callout"]),
+                KindField("callout"),
                 new("tone", "string", false, "Callout style tone (defaults to 'pearl' when omitted).", ["pearl", "clinical", "warning"]),
                 new("title", "string", false, "Optional callout header title."),
                 new("text", "string", true, "Non-empty Markdown/KaTeX body."),
-                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern)
+                RefField
             ],
             Example: new { kind = "callout", tone = "clinical", title = "Clinical Correlation", text = "Elevated serum troponin indicates cardiac myocyte necrosis." },
             Scope: "content",
@@ -620,8 +638,8 @@ public sealed class GetSchemaHandler
             DisallowUnmappedProperties: true,
             Fields:
             [
-                new("kind", "string", true, "Must be 'table'.", ["table"]),
-                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                KindField("table"),
+                RefField,
                 new("title", "string", false, "Optional table header toolbar title."),
                 new("caption", "string", false, "Optional Markdown/KaTeX table caption."),
                 new("stickyFirstCol", "boolean", false, "Stick first column during horizontal scroll (default false)."),
@@ -657,14 +675,14 @@ public sealed class GetSchemaHandler
             DisallowUnmappedProperties: true,
             Fields:
             [
-                new("type", "string", true, "Must be 'fill-blank'.", ["fill-blank"]),
-                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                TypeField("fill-blank"),
+                RefField,
                 new("text", "string", true, "Prompt containing >=1 '{{primary | alias}}' blank slot."),
                 new("fuzzy", "boolean", false, "Allow Levenshtein distance <= 1 for answers >= 6 chars (default true)."),
                 new("caseSensitive", "boolean", false, "Require exact letter case match (default false)."),
                 new("placeholder", "string", false, "Optional blank input placeholder text (empty by default)."),
-                new("explanation", "string", false, "Optional explanation Markdown/KaTeX."),
-                new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
+                ExplanationField,
+                McqLayoutOverridesField
             ],
             Example: new
             {
@@ -690,14 +708,14 @@ public sealed class GetSchemaHandler
             DisallowUnmappedProperties: true,
             Fields:
             [
-                new("type", "string", true, "Must be 'assertion-reason'.", ["assertion-reason"]),
-                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                TypeField("assertion-reason"),
+                RefField,
                 new("assertion", "string", true, "Assertion (A) statement Markdown/KaTeX."),
                 new("reason", "string", true, "Reason (R) statement Markdown/KaTeX."),
                 new("answer", "string", true, "Canonical answer enum.", ["both-explain", "both-no-explain", "a-true-r-false", "a-false-r-true", "both-false"]),
                 new("scheme", "string", false, "Option scheme (defaults to '5opt' when answer is 'both-false', else '4opt'; explicit '4opt' with 'both-false' fails lint).", ["4opt", "5opt"]),
-                new("explanation", "string", false, "Optional explanation Markdown/KaTeX."),
-                new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
+                ExplanationField,
+                McqLayoutOverridesField
             ],
             Example: new
             {
@@ -724,15 +742,15 @@ public sealed class GetSchemaHandler
             DisallowUnmappedProperties: true,
             Fields:
             [
-                new("type", "string", true, "Must be 'spot-error'.", ["spot-error"]),
-                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                TypeField("spot-error"),
+                RefField,
                 new("text", "string", true, "Statement with >=2 '[span]' segments; mark faulty spans as '[~~wrong~~ -> fix | alias]'."),
                 new("imagePath", "string", false, "Optional prompt diagram image path."),
                 new("requireFix", "boolean", false, "Require typing the correction for tapped error span(s) (default false)."),
                 new("allowNoError", "boolean", false, "Display a 'No error in statement' button (default false; defaults true when noError=true)."),
                 new("noError", "boolean", false, "Statement has zero error spans and 'No error' is the correct answer (default false)."),
-                new("explanation", "string", false, "Optional explanation Markdown/KaTeX."),
-                new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
+                ExplanationField,
+                McqLayoutOverridesField
             ],
             Example: new
             {
@@ -758,8 +776,8 @@ public sealed class GetSchemaHandler
             DisallowUnmappedProperties: true,
             Fields:
             [
-                new("type", "string", true, "Must be 'diff'.", ["diff"]),
-                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                TypeField("diff"),
+                RefField,
                 new("mode", "string", true, "Interaction mode.", ["fill", "spot-wrong", "rearrange"]),
                 new("title", "string", false, "Optional table prompt/header title (Markdown/KaTeX supported)."),
                 new("bank", "boolean", false, "Show clickable shuffled word bank in 'fill' mode (default false)."),
@@ -769,8 +787,8 @@ public sealed class GetSchemaHandler
                 new("headers", "array<string>", true, ">=2 column headers (>=3 for 'rearrange': col 0 feature + >=2 entities)."),
                 new("alignments", "array<string>", false, "Optional per-column alignment ('left' | 'center' | 'right'); length must match headers.length."),
                 new("rows", "array<array<string>>", true, ">=1 row; mark 'fill' blanks with '{{ans | alias}}' and 'spot-wrong' faults with '~~wrong~~ -> fix \\| alias' or '~~wrong~~ -> {{fix | alias}}'."),
-                new("explanation", "string", false, "Optional explanation Markdown/KaTeX."),
-                new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
+                ExplanationField,
+                McqLayoutOverridesField
             ],
             Example: new
             {
@@ -797,12 +815,12 @@ public sealed class GetSchemaHandler
             DisallowUnmappedProperties: true,
             Fields:
             [
-                new("type", "string", true, "Must be 'mechanism'.", ["mechanism"]),
-                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                TypeField("mechanism"),
+                RefField,
                 new("title", "string", false, "Optional mechanism prompt/title (Markdown/KaTeX supported)."),
                 new("steps", "array<mechanismStep>", true, ">=2 ordered steps (orderGroup >= 1; equal orderGroup = parallel/commutative) plus optional distractors (isDistractor=true)."),
-                new("explanation", "string", false, "Optional explanation Markdown/KaTeX."),
-                new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
+                ExplanationField,
+                McqLayoutOverridesField
             ],
             Example: new
             {
@@ -832,8 +850,8 @@ public sealed class GetSchemaHandler
             DisallowUnmappedProperties: true,
             Fields:
             [
-                new("type", "string", true, "Must be 'relabel'.", ["relabel"]),
-                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                TypeField("relabel"),
+                RefField,
                 new("imagePath", "string", true, "Relative path to the single unmasked diagram image (Markdown attr: image= or imagePath=)."),
                 new("prompt", "string", false, "Optional prompt/instruction Markdown/KaTeX."),
                 new("mode", "string", false, "Interaction mode (default 'bank').", ["reveal", "bank", "recall"]),
@@ -844,8 +862,8 @@ public sealed class GetSchemaHandler
                 new("distractors", "array<string>", false, "Optional decoy labels added to the shuffled bank in 'bank' mode."),
                 new("fuzzy", "boolean", false, "Allow Levenshtein distance <= 1 in 'recall' mode (default true)."),
                 new("caseSensitive", "boolean", false, "Require exact case match in 'recall' mode (default false)."),
-                new("explanation", "string", false, "Optional explanation Markdown/KaTeX."),
-                new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
+                ExplanationField,
+                McqLayoutOverridesField
             ],
             Example: new
             {
@@ -877,8 +895,8 @@ public sealed class GetSchemaHandler
             DisallowUnmappedProperties: true,
             Fields:
             [
-                new("kind", "string", true, "Must be 'diagram-explore'.", ["diagram-explore"]),
-                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                KindField("diagram-explore"),
+                RefField,
                 new("imagePath", "string", true, "Relative path to the unmasked diagram image."),
                 new("title", "string", false, "Optional explorer title."),
                 new("caption", "string", false, "Optional caption."),
@@ -912,8 +930,8 @@ public sealed class GetSchemaHandler
             DisallowUnmappedProperties: true,
             Fields:
             [
-                new("kind", "string", true, "Must be 'reveal'.", ["reveal"]),
-                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                KindField("reveal"),
+                RefField,
                 new("title", "string", false, "Optional header title."),
                 new("showFirst", "boolean", false, "Reveal the first step immediately on load (default false)."),
                 new("steps", "array<revealStep>", true, "Non-empty ordered list of {heading, body} steps.")
@@ -944,13 +962,13 @@ public sealed class GetSchemaHandler
             DisallowUnmappedProperties: true,
             Fields:
             [
-                new("type", "string", true, "Must be 'classify'.", ["classify"]),
-                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                TypeField("classify"),
+                RefField,
                 new("title", "string", false, "Optional prompt/heading."),
                 new("buckets", "array<string|bucket>", true, "2 to 4 bucket names or {bucketId, name} objects."),
                 new("items", "array<classifyItem>", true, "Items mapped via bucket name or bucketId."),
-                new("explanation", "string", false, "Optional explanation Markdown/KaTeX."),
-                new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
+                ExplanationField,
+                McqLayoutOverridesField
             ],
             Example: new
             {
@@ -979,13 +997,13 @@ public sealed class GetSchemaHandler
             DisallowUnmappedProperties: true,
             Fields:
             [
-                new("type", "string", true, "Must be 'match'.", ["match"]),
-                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                TypeField("match"),
+                RefField,
                 new("title", "string", false, "Optional prompt/heading."),
                 new("pairs", "array<matchPair>", true, "At least 2 {left, right} pairs."),
                 new("distractors", "array<string>", false, "Optional right-column decoy choices."),
-                new("explanation", "string", false, "Optional explanation Markdown/KaTeX."),
-                new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
+                ExplanationField,
+                McqLayoutOverridesField
             ],
             Example: new
             {
@@ -1014,8 +1032,8 @@ public sealed class GetSchemaHandler
             DisallowUnmappedProperties: true,
             Fields:
             [
-                new("type", "string", true, "Must be 'numeric'.", ["numeric"]),
-                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                TypeField("numeric"),
+                RefField,
                 new("prompt", "string", true, "Question prompt (or alias 'text')."),
                 new("answer", "number", true, "Exact finite numeric answer."),
                 new("tolerance", "number|string", false, "Non-negative tolerance (number or 'X%' percentage; default 0)."),
@@ -1023,8 +1041,8 @@ public sealed class GetSchemaHandler
                 new("unit", "string", false, "Optional displayed unit badge."),
                 new("placeholder", "string", false, "Optional input placeholder."),
                 new("imagePath", "string", false, "Optional diagram/figure image."),
-                new("explanation", "string", false, "Optional explanation Markdown/KaTeX."),
-                new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
+                ExplanationField,
+                McqLayoutOverridesField
             ],
             Example: new
             {
@@ -1050,15 +1068,15 @@ public sealed class GetSchemaHandler
             DisallowUnmappedProperties: true,
             Fields:
             [
-                new("type", "string", true, "Must be 'case'.", ["case"]),
-                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                TypeField("case"),
+                RefField,
                 new("title", "string", false, "Optional case heading."),
                 new("stem", "string", true, "Shared Markdown/KaTeX vignette stem."),
                 new("imagePath", "string", false, "Optional image attached to the shared stem."),
                 new("caption", "string", false, "Optional caption for the stem image."),
                 new("questions", "array<question>", true, "2 or more non-case sub-questions (inside Markdown use quad-colon fences ::::mcq ... ::::)."),
                 new("explanation", "string", false, "Optional overall case takeaway Markdown/KaTeX."),
-                new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
+                McqLayoutOverridesField
             ],
             Example: new
             {

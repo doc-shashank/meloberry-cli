@@ -6,6 +6,7 @@ using Meloberry.Application.Abstractions;
 using Meloberry.Application.UseCases.Layouts;
 using Meloberry.Cli.Abstractions;
 using Meloberry.Domain.Layouts;
+using Meloberry.Infrastructure.Web;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Meloberry.Cli.GuiEditor;
@@ -63,7 +64,7 @@ public sealed class LocalPreviewHost(
 
         if (noWait)
         {
-            var noWaitPrefix = $"http://127.0.0.1:{FindFreePort()}/";
+            var noWaitPrefix = $"http://127.0.0.1:{WebHostUtilities.FindFreeLoopbackPort()}/";
             if (jsonOutput)
             {
                 WriteJsonEnvelope(console, new
@@ -134,7 +135,7 @@ public sealed class LocalPreviewHost(
                     ctx.Response.AddHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox");
 
                 var bytes = await File.ReadAllBytesAsync(safePath, cancellationToken);
-                await TryWriteBytesAsync(ctx.Response, 200, GetMimeType(ext), bytes, cancellationToken);
+                await TryWriteBytesAsync(ctx.Response, 200, WebHostUtilities.GetMimeType(ext), bytes, cancellationToken);
                 return false;
             });
         }
@@ -241,7 +242,7 @@ public sealed class LocalPreviewHost(
 
         if (noWait)
         {
-            var noWaitPrefix = $"http://127.0.0.1:{FindFreePort()}/";
+            var noWaitPrefix = $"http://127.0.0.1:{WebHostUtilities.FindFreeLoopbackPort()}/";
             if (json)
                 WriteJsonEnvelope(console, new { target = initialComponent, profile = defaultProfile, url = noWaitPrefix });
             else if (!silent)
@@ -664,7 +665,7 @@ public sealed class LocalPreviewHost(
         HttpListenerException? lastEx = null;
         for (int attempt = 0; attempt < 5; attempt++)
         {
-            var prefix = $"http://127.0.0.1:{FindFreePort()}/";
+            var prefix = $"http://127.0.0.1:{WebHostUtilities.FindFreeLoopbackPort()}/";
             var listener = new HttpListener();
             listener.Prefixes.Add(prefix);
             try
@@ -854,30 +855,4 @@ public sealed class LocalPreviewHost(
                 return false;
         }
     }
-
-    private static int FindFreePort()
-    {
-        using var socket = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
-        socket.Start();
-        var port = ((IPEndPoint)socket.LocalEndpoint).Port;
-        socket.Stop();
-        return port;
-    }
-
-    private static string GetMimeType(string ext) => ext.ToLowerInvariant() switch
-    {
-        ".html" => "text/html; charset=utf-8",
-        ".css" => "text/css; charset=utf-8",
-        ".js" => "application/javascript; charset=utf-8",
-        ".png" => "image/png",
-        ".jpg" or ".jpeg" => "image/jpeg",
-        ".gif" => "image/gif",
-        ".webp" => "image/webp",
-        ".bmp" => "image/bmp",
-        ".svg" => "image/svg+xml",
-        ".woff2" => "font/woff2",
-        ".woff" => "font/woff",
-        ".ttf" => "font/ttf",
-        _ => "application/octet-stream"
-    };
 }

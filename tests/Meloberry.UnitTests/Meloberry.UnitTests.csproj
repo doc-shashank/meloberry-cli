@@ -18,6 +18,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Compile Include="..\TestSupport\*.cs" Link="TestSupport\%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\Meloberry.Domain\Meloberry.Domain.csproj" />
     <ProjectReference Include="..\..\src\Meloberry.Application\Meloberry.Application.csproj" />
     <ProjectReference Include="..\..\src\Meloberry.Infrastructure\Meloberry.Infrastructure.csproj" />

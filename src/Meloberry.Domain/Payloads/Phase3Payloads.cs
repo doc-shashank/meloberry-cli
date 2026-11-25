@@ -120,9 +120,6 @@ public static partial class Phase3PayloadRules
     public const int MaxMatchDistractors = 6;
     public const int MaxCaseQuestions = 10;
 
-    [GeneratedRegex(@"^(`{3,}|~{3,})")]
-    private static partial Regex CodeFenceOpenRegex();
-
     [GeneratedRegex(@"^\s*[-*]\s+(.+)$")]
     private static partial Regex BulletLineRegex();
 
@@ -130,14 +127,10 @@ public static partial class Phase3PayloadRules
     private static partial Regex DistractorLineRegex();
 
     public static bool HasValidHotspotBounds(DiagramHotspot h) =>
-        double.IsFinite(h.X) && double.IsFinite(h.Y) && double.IsFinite(h.W) && double.IsFinite(h.H)
-        && h.X >= 0 && h.Y >= 0 && h.W > 0 && h.H > 0
-        && h.X + h.W <= 1.0001 && h.Y + h.H <= 1.0001;
+        Phase2PayloadRules.HasValidNormalizedBox(h.X, h.Y, h.W, h.H);
 
     public static bool HasValidHotspotBounds(double x, double y, double w, double h) =>
-        double.IsFinite(x) && double.IsFinite(y) && double.IsFinite(w) && double.IsFinite(h)
-        && x >= 0 && y >= 0 && w > 0 && h > 0
-        && x + w <= 1.0001 && y + h <= 1.0001;
+        Phase2PayloadRules.HasValidNormalizedBox(x, y, w, h);
 
     public static Result<IReadOnlyList<DiagramHotspotAnnotation>> ParseDiagramHotspotAnnotations(string? rawBody)
     {
@@ -574,23 +567,8 @@ public static partial class Phase3PayloadRules
         }
     }
 
-    private static bool TryUpdateFenceState(string trimmedLine, ref string? activeFence)
-    {
-        var m = CodeFenceOpenRegex().Match(trimmedLine);
-        if (!m.Success) return false;
-        var fence = m.Groups[1].Value;
-        if (activeFence is null)
-        {
-            activeFence = fence;
-            return true;
-        }
-        if (fence[0] == activeFence[0] && fence.Length >= activeFence.Length && trimmedLine.Trim() == fence)
-        {
-            activeFence = null;
-            return true;
-        }
-        return false;
-    }
+    private static bool TryUpdateFenceState(string trimmedLine, ref string? activeFence) =>
+        MarkdownFenceHelper.TryUpdateFenceState(trimmedLine, ref activeFence);
 
     private static int FindFirstUnquotedColon(string text)
     {

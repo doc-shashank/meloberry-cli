@@ -7,6 +7,7 @@ using System.Text;
 using System.Text.Json;
 using Meloberry.Application.Abstractions;
 using Meloberry.Domain.Common;
+using Meloberry.Infrastructure.Web;
 
 namespace Meloberry.Infrastructure.Services;
 
@@ -16,24 +17,6 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
     {
         WriteIndented = true,
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
-    };
-
-    private static readonly Dictionary<string, string> MimeTypes = new(StringComparer.OrdinalIgnoreCase)
-    {
-        [".html"] = "text/html; charset=utf-8",
-        [".css"] = "text/css; charset=utf-8",
-        [".js"] = "application/javascript; charset=utf-8",
-        [".json"] = "application/json; charset=utf-8",
-        [".png"] = "image/png",
-        [".jpg"] = "image/jpeg",
-        [".jpeg"] = "image/jpeg",
-        [".gif"] = "image/gif",
-        [".webp"] = "image/webp",
-        [".svg"] = "image/svg+xml",
-        [".bmp"] = "image/bmp",
-        [".woff2"] = "font/woff2",
-        [".woff"] = "font/woff",
-        [".ttf"] = "font/ttf"
     };
 
     public async Task<Result<WebAppVerificationReport>> VerifyAsync(
@@ -98,7 +81,7 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
         timeoutCts.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(timeoutSeconds, 5, 180)));
         var ct = timeoutCts.Token;
 
-        var (staticPort, cdpPort) = FindFreePortPair();
+        var (staticPort, cdpPort) = WebHostUtilities.FindFreeLoopbackPortPair();
         var tempProfileDir = Path.Combine(Path.GetTempPath(), $"mby_cdp_{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempProfileDir);
 
@@ -965,7 +948,7 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
                 }
 
                 var ext = Path.GetExtension(filePath);
-                ctx.Response.ContentType = MimeTypes.TryGetValue(ext, out var mime) ? mime : "application/octet-stream";
+                ctx.Response.ContentType = WebHostUtilities.GetMimeType(ext);
                 var bytes = await File.ReadAllBytesAsync(filePath, ct);
                 ctx.Response.ContentLength64 = bytes.Length;
                 await ctx.Response.OutputStream.WriteAsync(bytes, ct);
@@ -976,15 +959,6 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
                 try { ctx.Response.Close(); } catch { }
             }
         }
-    }
-
-    private static (int Port1, int Port2) FindFreePortPair()
-    {
-        using var tcp1 = new TcpListener(IPAddress.Loopback, 0);
-        tcp1.Start();
-        using var tcp2 = new TcpListener(IPAddress.Loopback, 0);
-        tcp2.Start();
-        return (((IPEndPoint)tcp1.LocalEndpoint).Port, ((IPEndPoint)tcp2.LocalEndpoint).Port);
     }
 
     private static void TryDeleteDirectory(string path)

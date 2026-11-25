@@ -442,45 +442,28 @@ public sealed class ApplySpecHandler(
                 session.SetDescription(spec.Description);
         }
 
-        var workingAssetRoot = dryRun ? CreateDryRunStagingCopy(realStorageDir) : realStorageDir;
-        var existingAssets = dryRun ? null : CaptureExistingAssets(realStorageDir);
-        bool persisted = false;
-        try
-        {
-            var usedRefs = CollectSessionRefs(session);
-            var reservedExplicitRefs = CollectExplicitSpecRefs(compsToAdd);
-            foreach (var compSpec in compsToAdd)
+        return await ExecuteAppendWithRollbackAsync(
+            realStorageDir,
+            dryRun,
+            async workingAssetRoot =>
             {
-                var res = await AddComponentFromSpecAsync(session, workingAssetRoot, compSpec, jsonDir, cwd, usedRefs, reservedExplicitRefs, addedComponents, addedBlocks, addedQuestions, ct);
-                if (!res.IsSuccess) return res.Error!;
-            }
-
-            if (dryRun)
-            {
-                var report = await lintHandler.LintSessionInMemoryAsync(session, workingAssetRoot, ct);
-                return new ApplySpecResponse(
-                    session.Id, "session", realStorageDir, CreatedWorkspace: false, DryRun: true,
-                    Components: MapComponentSummaries(addedComponents),
-                    AddedBlockIds: CompactIds(addedBlocks, quiet, verbose),
-                    AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose),
-                    Lint: new ApplyLintSummary(report.IsClean, report.ErrorCount, report.WarningCount));
-            }
-
-            await repository.SaveSessionAsync(session, ct);
-            persisted = true;
-            var savedReport = await lintHandler.LintSessionInMemoryAsync(session, realStorageDir, ct);
-            return new ApplySpecResponse(
-                session.Id, "session", realStorageDir, CreatedWorkspace: false, DryRun: false,
+                var usedRefs = CollectSessionRefs(session);
+                var reservedExplicitRefs = CollectExplicitSpecRefs(compsToAdd);
+                foreach (var compSpec in compsToAdd)
+                {
+                    var res = await AddComponentFromSpecAsync(session, workingAssetRoot, compSpec, jsonDir, cwd, usedRefs, reservedExplicitRefs, addedComponents, addedBlocks, addedQuestions, ct);
+                    if (!res.IsSuccess) return res.Error!;
+                }
+                return Result.Success();
+            },
+            () => repository.SaveSessionAsync(session, ct),
+            assetRoot => lintHandler.LintSessionInMemoryAsync(session, assetRoot, ct),
+            report => new ApplySpecResponse(
+                session.Id, "session", realStorageDir, CreatedWorkspace: false, DryRun: dryRun,
                 Components: MapComponentSummaries(addedComponents),
                 AddedBlockIds: CompactIds(addedBlocks, quiet, verbose),
                 AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose),
-                Lint: new ApplyLintSummary(savedReport.IsClean, savedReport.ErrorCount, savedReport.WarningCount));
-        }
-        finally
-        {
-            if (dryRun) CleanupDirectory(workingAssetRoot);
-            else if (!persisted && existingAssets is not null) CleanupNewlyAddedAssets(realStorageDir, existingAssets);
-        }
+                Lint: new ApplyLintSummary(report.IsClean, report.ErrorCount, report.WarningCount)));
     }
 
     private async Task<Result<ApplySpecResponse>> AppendToComponentAsync(
@@ -528,55 +511,39 @@ public sealed class ApplySpecHandler(
             }
         }
 
-        var workingAssetRoot = dryRun ? CreateDryRunStagingCopy(realStorageDir) : realStorageDir;
-        var existingAssets = dryRun ? null : CaptureExistingAssets(realStorageDir);
-        bool persisted = false;
-        try
-        {
-            var usedRefs = CollectSessionRefs(session);
-            if (comp.Kind == ComponentKind.Article)
+        return await ExecuteAppendWithRollbackAsync(
+            realStorageDir,
+            dryRun,
+            async workingAssetRoot =>
             {
-                if (spec.Questions is { Count: > 0 })
-                    return new Error("Json.InvalidFieldForType", "Article component cannot accept 'questions[]'.", ErrorType.Validation);
+                var usedRefs = CollectSessionRefs(session);
+                if (comp.Kind == ComponentKind.Article)
+                {
+                    if (spec.Questions is { Count: > 0 })
+                        return new Error("Json.InvalidFieldForType", "Article component cannot accept 'questions[]'.", ErrorType.Validation);
 
-                var blockRes = await AddBlocksFromSpecsAsync(comp, workingAssetRoot, spec.Blocks ?? [], jsonDir, jsonDir, cwd, usedRefs, addedBlocks, ct);
-                if (!blockRes.IsSuccess) return blockRes.Error!;
-                var linksRes = await AddLinkCardsFromSpecsAsync(comp, workingAssetRoot, spec.Links ?? [], jsonDir, jsonDir, cwd, ct);
-                if (!linksRes.IsSuccess) return linksRes.Error!;
-            }
-            else if (comp.Quiz is not null)
-            {
-                if (spec.Blocks is { Count: > 0 } || spec.Links is { Count: > 0 })
-                    return new Error("Json.InvalidFieldForType", "Quiz component cannot accept article 'blocks[]' or 'links[]'.", ErrorType.Validation);
+                    var blockRes = await AddBlocksFromSpecsAsync(comp, workingAssetRoot, spec.Blocks ?? [], jsonDir, jsonDir, cwd, usedRefs, addedBlocks, ct);
+                    if (!blockRes.IsSuccess) return blockRes.Error!;
+                    var linksRes = await AddLinkCardsFromSpecsAsync(comp, workingAssetRoot, spec.Links ?? [], jsonDir, jsonDir, cwd, ct);
+                    if (!linksRes.IsSuccess) return linksRes.Error!;
+                }
+                else if (comp.Quiz is not null)
+                {
+                    if (spec.Blocks is { Count: > 0 } || spec.Links is { Count: > 0 })
+                        return new Error("Json.InvalidFieldForType", "Quiz component cannot accept article 'blocks[]' or 'links[]'.", ErrorType.Validation);
 
-                var qRes = await AddQuestionsFromSpecsAsync(comp.Quiz, workingAssetRoot, spec.Questions ?? [], jsonDir, jsonDir, cwd, usedRefs, addedQuestions, ct);
-                if (!qRes.IsSuccess) return qRes.Error!;
-            }
-
-            if (dryRun)
-            {
-                var report = await lintHandler.LintSessionInMemoryAsync(session, workingAssetRoot, ct);
-                return new ApplySpecResponse(
-                    comp.Id, "component", realStorageDir, CreatedWorkspace: false, DryRun: true,
-                    AddedBlockIds: CompactIds(addedBlocks, quiet, verbose),
-                    AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose),
-                    Lint: new ApplyLintSummary(report.IsClean, report.ErrorCount, report.WarningCount));
-            }
-
-            await repository.SaveSessionAsync(session, ct);
-            persisted = true;
-            var savedReport = await lintHandler.LintSessionInMemoryAsync(session, realStorageDir, ct);
-            return new ApplySpecResponse(
-                comp.Id, "component", realStorageDir, CreatedWorkspace: false, DryRun: false,
+                    var qRes = await AddQuestionsFromSpecsAsync(comp.Quiz, workingAssetRoot, spec.Questions ?? [], jsonDir, jsonDir, cwd, usedRefs, addedQuestions, ct);
+                    if (!qRes.IsSuccess) return qRes.Error!;
+                }
+                return Result.Success();
+            },
+            () => repository.SaveSessionAsync(session, ct),
+            assetRoot => lintHandler.LintSessionInMemoryAsync(session, assetRoot, ct),
+            report => new ApplySpecResponse(
+                comp.Id, "component", realStorageDir, CreatedWorkspace: false, DryRun: dryRun,
                 AddedBlockIds: CompactIds(addedBlocks, quiet, verbose),
                 AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose),
-                Lint: new ApplyLintSummary(savedReport.IsClean, savedReport.ErrorCount, savedReport.WarningCount));
-        }
-        finally
-        {
-            if (dryRun) CleanupDirectory(workingAssetRoot);
-            else if (!persisted && existingAssets is not null) CleanupNewlyAddedAssets(realStorageDir, existingAssets);
-        }
+                Lint: new ApplyLintSummary(report.IsClean, report.ErrorCount, report.WarningCount)));
     }
 
     private async Task<Result<ApplySpecResponse>> AppendToQuizAsync(
@@ -608,31 +575,44 @@ public sealed class ApplySpecHandler(
         if (spec.Description is not null)
             quiz.SetDescription(spec.Description);
 
+        return await ExecuteAppendWithRollbackAsync(
+            realStorageDir,
+            dryRun,
+            workingAssetRoot =>
+            {
+                var usedRefs = quiz.Questions.Where(q => q.RefKey is not null).Select(q => q.RefKey!).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                return AddQuestionsFromSpecsAsync(quiz, workingAssetRoot, spec.Questions ?? [], jsonDir, jsonDir, cwd, usedRefs, addedQuestions, ct);
+            },
+            () => repository.SaveQuizAsync(quiz, ct),
+            assetRoot => lintHandler.LintQuizInMemoryAsync(quiz, assetRoot, ct),
+            report => new ApplySpecResponse(
+                quiz.Id, "quiz", realStorageDir, CreatedWorkspace: false, DryRun: dryRun,
+                AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose),
+                Lint: new ApplyLintSummary(report.IsClean, report.ErrorCount, report.WarningCount)));
+    }
+
+    private async Task<Result<ApplySpecResponse>> ExecuteAppendWithRollbackAsync<TLintReport>(
+        string realStorageDir,
+        bool dryRun,
+        Func<string, Task<Result>> applyMutationsAsync,
+        Func<Task> persistAsync,
+        Func<string, Task<TLintReport>> lintAsync,
+        Func<TLintReport, ApplySpecResponse> buildResponse)
+    {
         var workingAssetRoot = dryRun ? CreateDryRunStagingCopy(realStorageDir) : realStorageDir;
         var existingAssets = dryRun ? null : CaptureExistingAssets(realStorageDir);
         bool persisted = false;
         try
         {
-            var usedRefs = quiz.Questions.Where(q => q.RefKey is not null).Select(q => q.RefKey!).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            var qRes = await AddQuestionsFromSpecsAsync(quiz, workingAssetRoot, spec.Questions ?? [], jsonDir, jsonDir, cwd, usedRefs, addedQuestions, ct);
-            if (!qRes.IsSuccess) return qRes.Error!;
+            var res = await applyMutationsAsync(workingAssetRoot);
+            if (!res.IsSuccess) return res.Error!;
 
             if (dryRun)
-            {
-                var report = await lintHandler.LintQuizInMemoryAsync(quiz, workingAssetRoot, ct);
-                return new ApplySpecResponse(
-                    quiz.Id, "quiz", realStorageDir, CreatedWorkspace: false, DryRun: true,
-                    AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose),
-                    Lint: new ApplyLintSummary(report.IsClean, report.ErrorCount, report.WarningCount));
-            }
+                return buildResponse(await lintAsync(workingAssetRoot));
 
-            await repository.SaveQuizAsync(quiz, ct);
+            await persistAsync();
             persisted = true;
-            var savedReport = await lintHandler.LintQuizInMemoryAsync(quiz, realStorageDir, ct);
-            return new ApplySpecResponse(
-                quiz.Id, "quiz", realStorageDir, CreatedWorkspace: false, DryRun: false,
-                AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose),
-                Lint: new ApplyLintSummary(savedReport.IsClean, savedReport.ErrorCount, savedReport.WarningCount));
+            return buildResponse(await lintAsync(realStorageDir));
         }
         finally
         {

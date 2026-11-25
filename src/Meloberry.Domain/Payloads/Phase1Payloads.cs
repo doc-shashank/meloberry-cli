@@ -759,19 +759,10 @@ public static partial class ArticleLinkRules
         foreach (var line in lines)
         {
             var trimmed = line.TrimStart();
+            if (MarkdownFenceHelper.TryUpdateFenceState(trimmed, ref activeFence))
+                continue;
             if (activeFence is null)
-            {
-                if (TryGetFenceToken(trimmed, out var token))
-                {
-                    activeFence = token;
-                    continue;
-                }
                 proseSb.AppendLine(line);
-            }
-            else if (trimmed.StartsWith(activeFence, StringComparison.Ordinal) && trimmed[activeFence.Length..].Trim().Length == 0)
-            {
-                activeFence = null;
-            }
         }
 
         var text = proseSb.ToString();
@@ -869,19 +860,6 @@ public static partial class ArticleLinkRules
         return compact.StartsWith("javascript:", StringComparison.OrdinalIgnoreCase) ||
                compact.StartsWith("vbscript:", StringComparison.OrdinalIgnoreCase) ||
                compact.StartsWith("data:", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool TryGetFenceToken(string trimmedStart, out string token)
-    {
-        token = string.Empty;
-        if (trimmedStart.Length < 3) return false;
-        char ch = trimmedStart[0];
-        if (ch is not ('`' or '~')) return false;
-        int len = 0;
-        while (len < trimmedStart.Length && trimmedStart[len] == ch) len++;
-        if (len < 3) return false;
-        token = new string(ch, len);
-        return true;
     }
 
     private static int FindClosingBracket(string text, int start)
