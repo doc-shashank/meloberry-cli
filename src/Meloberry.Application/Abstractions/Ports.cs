@@ -26,7 +26,8 @@ public sealed record JsonQuestionSpec(
     string? ImagePath = null,
     string? Explanation = null,
     string? Ref = null,
-    string? PayloadJson = null);
+    string? PayloadJson = null,
+    IReadOnlyList<JsonQuestionSpec>? SubQuestions = null);
 
 public sealed record DeclarativeArticleBlockSpec(
     string Kind,
@@ -39,6 +40,12 @@ public sealed record DeclarativeArticleBlockSpec(
     string? Title = null,
     string? PayloadJson = null);
 
+public sealed record DeclarativeLinkCardSpec(
+    string Id,
+    string? Title,
+    string? Text,
+    string? ImagePath = null);
+
 public sealed record DeclarativeComponentSpec(
     string Kind,
     string? Title,
@@ -47,7 +54,8 @@ public sealed record DeclarativeComponentSpec(
     IReadOnlyList<JsonQuestionSpec>? Questions,
     Dictionary<string, string>? LayoutOverrides,
     string? Ref = null,
-    string? SourceDirectory = null);
+    string? SourceDirectory = null,
+    IReadOnlyList<DeclarativeLinkCardSpec>? Links = null);
 
 public sealed record DeclarativeApplySpec(
     string? Kind,
@@ -61,7 +69,8 @@ public sealed record DeclarativeApplySpec(
     Dictionary<string, string>? LayoutOverrides,
     string? AssetBaseDirectory = null,
     string? Ref = null,
-    IReadOnlyList<string>? Order = null);
+    IReadOnlyList<string>? Order = null,
+    IReadOnlyList<DeclarativeLinkCardSpec>? Links = null);
 
 public interface IDeclarativeSpecLoader
 {
@@ -152,6 +161,7 @@ public interface ILayoutRepository
     Task<LayoutProfile> GetProfileAsync(string targetType, CancellationToken cancellationToken = default);
     Task<IReadOnlyDictionary<string, LayoutProfile>> GetAllProfilesAsync(CancellationToken cancellationToken = default);
     Task SaveProfileAsync(LayoutProfile profile, CancellationToken cancellationToken = default);
+    Task SaveProfilesAsync(IReadOnlyCollection<LayoutProfile> profiles, CancellationToken cancellationToken = default);
 }
 
 public interface IPackageExporter
@@ -208,10 +218,16 @@ public interface IAnalysisReportStore
     Task<Result<SavedAnalysisFiles>> SaveReportToWebAppDirectoryAsync(string webAppDirectory, string rawReportJson, string? rawMarkdown = null, CancellationToken cancellationToken = default);
 }
 
-public sealed record CliToolMetadata(string ProductName, string ExecutableName, string Version, string Runtime);
+public sealed record CliToolMetadata(
+    string ProductName,
+    string ExecutableName,
+    string Version,
+    string Runtime,
+    string AppName = "Meloberry",
+    string RepositoryUrl = "https://github.com/doc-shashank/meloberry-cli/");
 
 public interface ICliToolMetadataProvider { CliToolMetadata GetMetadata(); }
-public interface ILayoutEditorPageBuilder { string BuildHtml(string initialComponent, CliToolMetadata toolMetadata); }
+public interface ILayoutEditorPageBuilder { string BuildHtml(string initialComponent, CliToolMetadata toolMetadata, string? csrfToken = null); }
 
 public interface IChainTransactionScope : IDisposable
 {

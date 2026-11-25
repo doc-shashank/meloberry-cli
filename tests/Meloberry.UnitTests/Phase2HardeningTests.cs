@@ -1017,12 +1017,12 @@ public sealed class Phase2HardeningTests : IDisposable
         // S-01: Two-tier Style A spec classifier (@content vs @other + group selectors)
         var contentSchemas = await schema.HandleAsync(new GetSchemaQuery(["@content"]));
         Assert.True(contentSchemas.IsSuccess);
-        Assert.Equal(15, contentSchemas.Value.Schemas.Count);
+        Assert.Equal(21, contentSchemas.Value.Schemas.Count);
         Assert.All(contentSchemas.Value.Schemas, s => Assert.Equal("content", s.Scope));
 
         var questionSchemas = await schema.HandleAsync(new GetSchemaQuery(["@questions"]));
         Assert.True(questionSchemas.IsSuccess);
-        Assert.Equal(["mcq", "flashcard", "fill-blank", "assertion-reason", "spot-error", "diff", "mechanism", "relabel"], questionSchemas.Value.Schemas.Select(s => s.Topic));
+        Assert.Equal(["mcq", "flashcard", "fill-blank", "assertion-reason", "spot-error", "diff", "mechanism", "relabel", "case", "classify", "match", "numeric"], questionSchemas.Value.Schemas.Select(s => s.Topic));
         Assert.All(questionSchemas.Value.Schemas, s => Assert.Equal("question", s.Category));
 
         var otherSchemas = await schema.HandleAsync(new GetSchemaQuery(["@other"]));

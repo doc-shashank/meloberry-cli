@@ -25,6 +25,7 @@ public sealed class SqliteLayoutRepository(MeloberryStorageOptions options) : IL
 
         await using var conn = OpenAppConnection();
         await conn.OpenAsync(cancellationToken);
+        await ConfigureBusyTimeoutAsync(conn, cancellationToken);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = "SELECT TargetType, PropertiesJson FROM LayoutProfiles;";
 
@@ -39,21 +40,41 @@ public sealed class SqliteLayoutRepository(MeloberryStorageOptions options) : IL
         return profiles;
     }
 
-    public async Task SaveProfileAsync(LayoutProfile profile, CancellationToken cancellationToken = default)
+    public Task SaveProfileAsync(LayoutProfile profile, CancellationToken cancellationToken = default) =>
+        SaveProfilesAsync([profile], cancellationToken);
+
+    public async Task SaveProfilesAsync(IReadOnlyCollection<LayoutProfile> profiles, CancellationToken cancellationToken = default)
     {
+        if (profiles.Count == 0) return;
+
         await EnsureInitializedAsync(cancellationToken);
         await using var conn = OpenAppConnection();
         await conn.OpenAsync(cancellationToken);
+        await ConfigureBusyTimeoutAsync(conn, cancellationToken);
+
+        await using var tx = await conn.BeginTransactionAsync(cancellationToken);
         await using var cmd = conn.CreateCommand();
+        cmd.Transaction = (SqliteTransaction)tx;
         cmd.CommandText = """
             INSERT INTO LayoutProfiles (TargetType, PropertiesJson, UpdatedAtUtc)
             VALUES ($targetType, $json, $updatedAt)
             ON CONFLICT(TargetType) DO UPDATE SET PropertiesJson = excluded.PropertiesJson, UpdatedAtUtc = excluded.UpdatedAtUtc;
             """;
-        cmd.Parameters.AddWithValue("$targetType", profile.TargetType);
-        cmd.Parameters.AddWithValue("$json", JsonSerializer.Serialize(profile.Values));
-        cmd.Parameters.AddWithValue("$updatedAt", DateTimeOffset.UtcNow.ToString("O"));
-        await cmd.ExecuteNonQueryAsync(cancellationToken);
+
+        var targetParam = cmd.Parameters.Add("$targetType", SqliteType.Text);
+        var jsonParam = cmd.Parameters.Add("$json", SqliteType.Text);
+        var updatedParam = cmd.Parameters.Add("$updatedAt", SqliteType.Text);
+        var now = DateTimeOffset.UtcNow.ToString("O");
+
+        foreach (var profile in profiles)
+        {
+            targetParam.Value = profile.TargetType;
+            jsonParam.Value = JsonSerializer.Serialize(profile.Values);
+            updatedParam.Value = now;
+            await cmd.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        await tx.CommitAsync(cancellationToken);
     }
 
     internal async Task EnsureInitializedAsync(CancellationToken cancellationToken = default)
@@ -65,6 +86,7 @@ public sealed class SqliteLayoutRepository(MeloberryStorageOptions options) : IL
             Directory.CreateDirectory(options.AppDataDirectory);
             await using var conn = OpenAppConnection();
             await conn.OpenAsync(cancellationToken);
+            await ConfigureBusyTimeoutAsync(conn, cancellationToken);
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = """
                 CREATE TABLE IF NOT EXISTS LayoutProfiles (TargetType TEXT PRIMARY KEY, PropertiesJson TEXT NOT NULL, UpdatedAtUtc TEXT NOT NULL);
@@ -75,6 +97,13 @@ public sealed class SqliteLayoutRepository(MeloberryStorageOptions options) : IL
             _initialized = true;
         }
         finally { _initLock.Release(); }
+    }
+
+    private static async Task ConfigureBusyTimeoutAsync(SqliteConnection conn, CancellationToken ct)
+    {
+        await using var pragma = conn.CreateCommand();
+        pragma.CommandText = "PRAGMA busy_timeout = 5000;";
+        await pragma.ExecuteNonQueryAsync(ct);
     }
 
     internal SqliteConnection OpenAppConnection() => new($"Data Source={options.AppSettingsDbPath};Pooling=False");

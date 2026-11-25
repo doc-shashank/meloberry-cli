@@ -55,6 +55,8 @@ public sealed class GetSchemaHandler
         new("image", "content", "block"),
         new("callout", "content", "block"),
         new("table", "content", "block"),
+        new("diagram-explore", "content", "block"),
+        new("reveal", "content", "block"),
         new("mcq", "content", "question"),
         new("flashcard", "content", "question"),
         new("fill-blank", "content", "question"),
@@ -63,6 +65,10 @@ public sealed class GetSchemaHandler
         new("diff", "content", "question"),
         new("mechanism", "content", "question"),
         new("relabel", "content", "question"),
+        new("case", "content", "question"),
+        new("classify", "content", "question"),
+        new("match", "content", "question"),
+        new("numeric", "content", "question"),
         new("markdown", "other", "format"),
         new("layouts", "other", "format"),
         new("patch", "other", "workflow"),
@@ -73,7 +79,7 @@ public sealed class GetSchemaHandler
     ];
 
     public static readonly IReadOnlyList<string> SupportedTopics =
-        ["session", "article", "quiz", "text", "image", "mcq", "flashcard", "layouts", "callout", "markdown", "analyze", "pkg", "build", "batch", "patch", "table", "fill-blank", "assertion-reason", "spot-error", "diff", "mechanism", "relabel"];
+        ["session", "article", "quiz", "text", "image", "mcq", "flashcard", "layouts", "callout", "markdown", "analyze", "pkg", "build", "batch", "patch", "table", "fill-blank", "assertion-reason", "spot-error", "diff", "mechanism", "relabel", "diagram-explore", "reveal", "case", "classify", "match", "numeric"];
 
     public static readonly IReadOnlyList<string> SupportedGroups =
         ["@content", "@containers", "@blocks", "@questions", "@other", "@formats", "@workflows"];
@@ -134,12 +140,18 @@ public sealed class GetSchemaHandler
                 case "flashcard": schemas.Add(BuildFlashcardSchema()); break;
                 case "callout": schemas.Add(BuildCalloutSchema()); break;
                 case "table": schemas.Add(BuildTableBlockSchema()); break;
+                case "diagram-explore": schemas.Add(BuildDiagramExploreSchema()); break;
+                case "reveal": schemas.Add(BuildRevealSchema()); break;
                 case "fill-blank": schemas.Add(BuildFillBlankSchema()); break;
                 case "assertion-reason": schemas.Add(BuildAssertionReasonSchema()); break;
                 case "spot-error": schemas.Add(BuildSpotErrorSchema()); break;
                 case "diff": schemas.Add(BuildDiffSchema()); break;
                 case "mechanism": schemas.Add(BuildMechanismSchema()); break;
                 case "relabel": schemas.Add(BuildRelabelSchema()); break;
+                case "case": schemas.Add(BuildCaseSchema()); break;
+                case "classify": schemas.Add(BuildClassifySchema()); break;
+                case "match": schemas.Add(BuildMatchSchema()); break;
+                case "numeric": schemas.Add(BuildNumericSchema()); break;
                 case "markdown": schemas.Add(BuildMarkdownSchema()); break;
                 case "analyze": schemas.Add(BuildAnalyzeSchema()); break;
                 case "pkg": schemas.Add(BuildPkgSchema()); break;
@@ -205,11 +217,11 @@ public sealed class GetSchemaHandler
             Topic: "article",
             CompactSignature: """
                 // Article component (ref auto-slugified from title if omitted; max 32, ^[a-z0-9][a-z0-9_-]{0,31}$)
-                { kind:"article", ref?:string, title?:string, layoutOverrides?:Record<string,string>, blocks:[TextBlock|ImageBlock|CalloutBlock|TableBlock] }
+                { kind:"article", ref?:string, title?:string, layoutOverrides?:Record<string,string>, blocks:[TextBlock|ImageBlock|CalloutBlock|TableBlock|DiagramExploreBlock|RevealBlock], links?:[{id:string,title?:string,text?:string,imagePath?:string}] }
                 // Ex: {"kind":"article","ref":"core-laws","title":"Basics","blocks":[{"kind":"text","text":"## Law\n$$F=ma$$"}]}
                 """,
             Command: "mby apply <sessionID|componentID> <spec.json|md|->",
-            Summary: "Article component with ordered text/image/callout/table blocks.",
+            Summary: "Article component with ordered text/image/callout/table/diagram-explore/reveal blocks and optional hover link cards.",
             DisallowUnmappedProperties: true,
             Fields:
             [
@@ -217,7 +229,8 @@ public sealed class GetSchemaHandler
                 new("ref", "string", false, "Optional workspace-unique slug (auto-generated from title if omitted).", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
                 new("title", "string", false, "Section title."),
                 new("layoutOverrides", "object<string,string>", false, "Bounded article layout overrides."),
-                new("blocks", "array<block>", true, "Ordered text, image, callout, or table blocks.")
+                new("blocks", "array<block>", true, "Ordered text, image, callout, table, diagram-explore, or reveal blocks."),
+                new("links", "array<linkCard>", false, "Optional hover link cards referenced via [text](mby://card/<id>).")
             ],
             Example: new
             {
@@ -239,7 +252,7 @@ public sealed class GetSchemaHandler
             Topic: "quiz",
             CompactSignature: """
                 // Standalone Quiz (Set_*) or Embedded Quiz Component (ref max 32, auto if omitted on component)
-                { kind:"quiz", ref?:string /* max 32, ^[a-z0-9][a-z0-9_-]{0,31}$ */, quizType?:"mcq"|"flashcard"|"mixed", name?:string, description?:string, title?:string, layoutOverrides?:Record<string,string>, questions:[Mcq|Flashcard|FillBlank|AssertionReason|SpotError|Differentiation|Mechanism|RelabelImage] }
+                { kind:"quiz", ref?:string /* max 32, ^[a-z0-9][a-z0-9_-]{0,31}$ */, quizType?:"mcq"|"flashcard"|"mixed", name?:string, description?:string, title?:string, layoutOverrides?:Record<string,string>, questions:[Mcq|Flashcard|FillBlank|AssertionReason|SpotError|Differentiation|Mechanism|RelabelImage|CaseGroup|Classify|Match|Numeric] }
                 // Ex: {"kind":"quiz","quizType":"mixed","name":"Alg Quiz","questions":[{"type":"flashcard","front":{"text":"O(log n)?"},"back":{"text":"Binary search"}}]}
                 """,
             Command: "mby apply [<setID|componentID>] <spec.json|md|-> [-o dir]",
@@ -254,7 +267,7 @@ public sealed class GetSchemaHandler
                 new("description", "string", false, "Description for standalone Set_*."),
                 new("title", "string", false, "Section title when embedded Component_*."),
                 new("layoutOverrides", "object<string,string>", false, "Bounded layout overrides (component only)."),
-                new("questions", "array<question>", true, "Ordered mcq, flashcard, fill-blank, assertion-reason, spot-error, diff, mechanism, or relabel objects.")
+                new("questions", "array<question>", true, "Ordered mcq, flashcard, fill-blank, assertion-reason, spot-error, diff, mechanism, relabel, case, classify, match, or numeric objects.")
             ],
             Example: new
             {
@@ -305,7 +318,7 @@ public sealed class GetSchemaHandler
             [
                 new("kind", "string", true, "Must be 'image'.", ["image"]),
                 new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
-                new("imagePath", "string", true, "Relative path inside JSON/MD/workspace root."),
+                new("imagePath", "string", true, "Relative path inside JSON/MD/workspace root (copied & stored as assets/<stem>_<hash8>.<ext>)."),
                 new("caption", "string", false, "Optional caption rendered atomically inside <figcaption> (supports Markdown/KaTeX)."),
                 new("alt", "string", false, "Optional accessibility alt text.")
             ],
@@ -332,8 +345,8 @@ public sealed class GetSchemaHandler
                 new("imagePath", "string", false, "Optional prompt image."),
                 new("explanation", "string", false, "Optional explanation Markdown."),
                 new("isMultiCorrect", "boolean", false, "Multiple correct answers (default false)."),
-                new("maxOptions", "integer", false, "Option slot cap (2..26, default 4).", null, null, null, 2, 26),
-                new("options", "array<mcqOption>", true, "2..26 options with text/imagePath + isCorrect."),
+                new("maxOptions", "integer", false, "Option slot cap (2..26, default 4; auto-expands up to 26 when omitted and >4 options provided; Markdown auto-sizes).", null, null, null, 2, 26),
+                new("options", "array<mcqOption>", true, "2..26 options with text/imagePath + isCorrect (enforced by check/build/pkg; >=2 enforced on patch)."),
                 new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
             ],
             Example: new
@@ -409,19 +422,26 @@ public sealed class GetSchemaHandler
             CompactSignature: """
                 // Markdown article, quiz, or modular directory input (replaces verbose JSON escaping)
                 // Article frontmatter: ---\nkind: article\ntitle: "Cell Injury"\nref: cell-injury\n---
-                //   Standalone image: ![alt](assets/fig_2.1.png "Caption") -> ImageBlock
+                //   Standalone image: ![alt](assets/fig_2.1.png "Caption") -> ImageBlock (stored as assets/<stem>_<hash8>.<ext>)
                 //   Callout fence:    :::callout{ref?="slug" tone="clinical" title="Clinical Note"}\n...\n:::  (or :::pearl / :::clinical / :::warning with optional ref/title)
-                //   Table fence:      :::table{title="..." stickyFirstCol=true hideableCols="2,3"}\n| A | B |\n| --- | --- |\n| 1 | 2 |\n:::footnote\n...\n:::
+                //   Table fence:      :::table{title="..." stickyFirstCol=true hideableCols="2,3" /* 1-based */}\n| A | B |\n| --- | --- |\n| 1 | 2 |\n:::footnote\n...\n:::
+                //   Native links:     :::link{id="slug" title?="..." image?="assets/fig.png"}\nCard Markdown\n:::  with [text](mby://card/slug), [art](mby://article/ref), or [ext](mby://session/Session_Id/ref)
                 // Quiz frontmatter: ---\nkind: quiz\nquizType: mixed\ntitle: "Chapter Review"\n---
-                //   MCQ fence:              :::mcq{ref?="slug" multi?=false maxOptions?=4 image?="path"}\nPrompt\n- [x] Right\n- [ ] Wrong\n:::explanation\n...\n:::
+                //   MCQ fence:              :::mcq{ref?="slug" multi?=false maxOptions?=auto image?="path"}\nPrompt\n- [x] Right\n- [ ] Wrong\n:::explanation\n...\n:::
                 //   Flashcard fence:        :::flashcard{ref?="slug" frontPosition?="belowImage"}\n:::front\n...\n:::back\n...\n:::
-                //   Fill-blank fence:       :::fill-blank{fuzzy?=true caseSensitive?=false}\nText with {{primary | alias}}.\n:::explanation\n...\n:::
-                //   Assertion-Reason fence: :::assertion-reason{answer="both-explain" scheme?="4opt"}\nA: ...\nR: ...\n:::explanation\n...\n:::
-                //   Spot-error fence:       :::spot-error{requireFix?=false allowNoError?=true noError?=false}\nIn [span], x is [~~wrong~~ -> right].\n:::explanation\n...\n:::
+                //   Fill-blank fence:       :::fill-blank{fuzzy?=true caseSensitive?=false placeholder?="..."}\nText with {{primary | alias}}.\n:::explanation\n...\n:::
+                //   Assertion-Reason fence: :::assertion-reason{answer="both-explain" scheme?="4opt"|"5opt" /* def: 5opt for both-false, else 4opt */}\nA: ...\nR: ...\n:::explanation\n...\n:::
+                //   Spot-error fence:       :::spot-error{image?="assets/fig.png" requireFix?=false allowNoError?=false noError?=false}\nIn [span], x is [~~wrong~~ -> right].\n:::explanation\n...\n:::
                 //   Diff fence:             :::diff{mode="fill"|"spot-wrong"|"rearrange" title?="..." bank?=false fuzzy?=true allowNoError?=false}\n| Feature | A | B |\n|---|---|---|\n| Row | {{ans | alias}} | ~~bad~~ -> fix \| alt |\n:::explanation\n...\n:::
                 //   Mechanism fence:        :::mechanism{title?="..."}\n1. Step one\n2a. Parallel A\n2b. Parallel B\n! Decoy step\n:::explanation\n...\n:::
                 //   Relabel fence:          :::relabel{image="assets/fig.png" masks?="assets/fig.masks.json" mode?="reveal"|"bank"|"recall" style?="solid"|"blur"|"pixelate"|"whiteout"}\nprompt: ...\nboxes:\n  - label: "A"\n    rect: [0.1, 0.2, 0.2, 0.1]\n:::explanation\n...\n:::
-                // Directory mode: mby apply ./articles/  or  mby build ./articles/ -o ./web (reads _session.md|session.json + sorted *.md/*.json)
+                //   Diagram-Explore fence:  :::diagram-explore{image="assets/fig.png" masks?="assets/fig.masks.json" title?="..." caption?="..."}\n- LabelA: Annotation Markdown\n:::  (or inline YAML boxes: [{label,rect,note}])
+                //   Reveal fence:           :::reveal{title?="..." showFirst?=false}\n> Step 1 Heading\nStep 1 body\n:::
+                //   Classify fence:         :::classify{title?="..."}\n[Bucket A]\n- Item 1\n[Bucket B]\n- Item 2\n:::explanation\n...\n:::
+                //   Match fence:            :::match{title?="..."}\n- Term :: Match\n! Distractor\n:::explanation\n...\n:::
+                //   Numeric fence:          :::numeric{answer=120 tolerance?="5%" unit?="mmHg" placeholder?="..." image?="..."}\nQuestion prompt\n:::explanation\n...\n:::
+                //   Case fence:             :::case{title?="..." caption?="..."}\nShared vignette stem + optional ![img](assets/fig.png)\n::::mcq{explanation?="..."}\n...\n::::\n::::numeric{answer=5}\n...\n::::\n:::
+                // Directory mode: mby apply ./articles/  or  mby build ./articles/ -o ./web (reads frontmatter-only _session.md or session.json + sorted *.md/*.json)
                 """,
             Command: "mby apply <file.md|dir|->  |  mby build <dir|file.md> -o <webDir>",
             Summary: "Author articles and quizzes in clean Markdown + frontmatter or modular directories.",
@@ -481,7 +501,7 @@ public sealed class GetSchemaHandler
             [
                 new("targetPlatform", "string", true, "Target package consumer.", ["desktop", "android"]),
                 new("--include-layout", "boolean", false, "Bundle non-default global/entity layout overrides."),
-                new("outputPath", "string", false, "Optional .mbypkg destination path or directory (defaults to <projectRoot>/<wsId>.mbypkg for .meloberry/workspaces, else <workspaceParent>/<wsId>.mbypkg)."),
+                new("outputPath", "string", false, "Optional .mbypkg file path, existing directory, or directory path ending with '/' or '\\' (non-existent paths without a trailing separator are treated as a file stem and receive '.mbypkg'; omitted defaults to <projectRoot>/<wsId>.mbypkg for .meloberry/workspaces, else <workspaceParent>/<wsId>.mbypkg)."),
                 new("destDir", "string", false, "Optional import destination directory (defaults to CWD).")
             ],
             Example: new { exportCmd = "mby pkg export Session_123 android ./chapter2.mbypkg --json" },
@@ -553,18 +573,22 @@ public sealed class GetSchemaHandler
         new(
             Topic: "patch",
             CompactSignature: """
-                // Surgical partial update / reorder by ID, #path, or #ref (strict per-entity keys; null clears nullable fields/overrides)
+                // Surgical partial update / reorder by ID, #path, or #ref (strict per-entity keys; --set k=null clears nullable fields/overrides and rejects non-nullable fields; empty {} fails with Patch.Empty)
                 // session|quiz: { name?, description? } | component: { title?, ref?, layoutOverrides? }
                 // block(text): { text?, ref? } | block(image): { imagePath?, caption?, alt?, ref? } | block(callout): { tone?, title?, text?, ref? }
                 // block(table): { title?, caption?, stickyFirstCol?, hideableCols?, headers?, alignments?, rows?, footnote?, ref? }
+                // block(diagram-explore): { title?, caption?, alt?, imagePath?, hotspots?, ref? } | block(reveal): { title?, showFirst?, steps?, ref? }
                 // mcq: { text?, imagePath?, explanation?, isMultiCorrect?, maxOptions?, options?, ref?, layoutOverrides? }
                 // flashcard: { front?:{text?,imagePath?,position?}, back?:{text?,imagePath?,position?}, ref?, layoutOverrides? }
-                // fill-blank: { text?, fuzzy?, caseSensitive?, explanation?, ref?, layoutOverrides? }
+                // fill-blank: { text?, fuzzy?, caseSensitive?, placeholder?, explanation?, ref?, layoutOverrides? }
                 // assertion-reason: { assertion?, reason?, answer?, scheme?, explanation?, ref?, layoutOverrides? }
-                // spot-error: { text?, requireFix?, allowNoError?, noError?, explanation?, ref?, layoutOverrides? }
+                // spot-error: { text?, imagePath?, requireFix?, allowNoError?, noError?, explanation?, ref?, layoutOverrides? }
                 // diff: { mode?, title?, bank?, fuzzy?, caseSensitive?, allowNoError?, headers?, alignments?, rows?, explanation?, ref?, layoutOverrides? }
                 // mechanism: { title?, steps?, explanation?, ref?, layoutOverrides? }
                 // relabel: { imagePath?, prompt?, mode?, style?, boxes?, distractors?, fuzzy?, caseSensitive?, explanation?, ref?, layoutOverrides? }
+                // case: { title?, stem?, imagePath?, caption?, questions?, explanation?, ref?, layoutOverrides? }
+                // classify: { title?, buckets?, items?, explanation?, ref?, layoutOverrides? } | match: { title?, pairs?, distractors?, explanation?, ref?, layoutOverrides? }
+                // numeric: { text?, prompt?, answer?, tolerance?, toleranceMode?, unit?, placeholder?, imagePath?, explanation?, ref?, layoutOverrides? }
                 """,
             Command: "mby patch <addr> [file|-] [--set k=v] [--move idx:shift|exchange]",
             Summary: "Updates allowed fields of an existing entity via JSON object and/or repeatable --set k=v, or reorders with --move.",
@@ -588,7 +612,7 @@ public sealed class GetSchemaHandler
             Topic: "table",
             CompactSignature: """
                 // Article block: table (interactive study table with hideable columns & sticky first column)
-                { kind:"table", ref?:string, title?:string, caption?:string, stickyFirstCol?:bool, hideableCols?:int[], headers:string[], alignments?:("left"|"center"|"right")[], rows:string[][], footnote?:string }
+                { kind:"table", ref?:string, title?:string, caption?:string, stickyFirstCol?:bool, hideableCols?:int[] /* 1-based (1..headers.length) */, headers:string[], alignments?:("left"|"center"|"right")[] /* len==headers.length */, rows:string[][], footnote?:string }
                 // Markdown: :::table{title="..." stickyFirstCol=true hideableCols="2,3"}\n| Col1 | Col2 |\n|---|---|\n| A | B |\n:::footnote\n...\n:::
                 """,
             Command: "Inside article.blocks[] or :::table{...} in Markdown",
@@ -603,7 +627,7 @@ public sealed class GetSchemaHandler
                 new("stickyFirstCol", "boolean", false, "Stick first column during horizontal scroll (default false)."),
                 new("hideableCols", "array<integer>", false, "1-based column indices that can be blurred/masked for active recall."),
                 new("headers", "array<string>", true, "Non-empty column header labels (Markdown/KaTeX supported)."),
-                new("alignments", "array<string>", false, "Optional per-column alignment ('left' | 'center' | 'right')."),
+                new("alignments", "array<string>", false, "Optional per-column alignment ('left' | 'center' | 'right'); length must match headers.length."),
                 new("rows", "array<array<string>>", true, "At least 1 row; each row must match headers.length."),
                 new("footnote", "string", false, "Optional Markdown/KaTeX table footnote.")
             ],
@@ -625,8 +649,8 @@ public sealed class GetSchemaHandler
             Topic: "fill-blank",
             CompactSignature: """
                 // Question: fill-blank (free recall with {{primary | alias}} slots, fuzzy/Greek matching & self-grade override)
-                { type:"fill-blank", ref?:string, text:string, fuzzy?:bool, caseSensitive?:bool, explanation?:string, layoutOverrides?:Record<string,string> }
-                // Markdown: :::fill-blank{fuzzy=true caseSensitive=false}\nEnzyme is {{phosphofructokinase-1 | PFK-1}}.\n:::explanation\n...\n:::
+                { type:"fill-blank", ref?:string, text:string, fuzzy?:bool, caseSensitive?:bool, placeholder?:string, explanation?:string, layoutOverrides?:Record<string,string> }
+                // Markdown: :::fill-blank{fuzzy=true caseSensitive=false placeholder?="..."}\nEnzyme is {{phosphofructokinase-1 | PFK-1}}.\n:::explanation\n...\n:::
                 """,
             Command: "Inside quiz.questions[] or :::fill-blank{...} in Markdown",
             Summary: "Free-recall fill-in-the-blank question with aliases, Greek/fuzzy tolerance, and self-grade override.",
@@ -638,6 +662,7 @@ public sealed class GetSchemaHandler
                 new("text", "string", true, "Prompt containing >=1 '{{primary | alias}}' blank slot."),
                 new("fuzzy", "boolean", false, "Allow Levenshtein distance <= 1 for answers >= 6 chars (default true)."),
                 new("caseSensitive", "boolean", false, "Require exact letter case match (default false)."),
+                new("placeholder", "string", false, "Optional blank input placeholder text (empty by default)."),
                 new("explanation", "string", false, "Optional explanation Markdown/KaTeX."),
                 new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
             ],
@@ -657,8 +682,8 @@ public sealed class GetSchemaHandler
             Topic: "assertion-reason",
             CompactSignature: """
                 // Question: assertion-reason (auto-generates standard 4- or 5-option choices from canonical answer enum)
-                { type:"assertion-reason", ref?:string, assertion:string, reason:string, answer:"both-explain"|"both-no-explain"|"a-true-r-false"|"a-false-r-true"|"both-false", scheme?:"4opt"|"5opt", explanation?:string, layoutOverrides?:Record<string,string> }
-                // Markdown: :::assertion-reason{answer="both-no-explain" scheme="4opt"}\nA: ...\nR: ...\n:::explanation\n...\n:::
+                { type:"assertion-reason", ref?:string, assertion:string, reason:string, answer:"both-explain"|"both-no-explain"|"a-true-r-false"|"a-false-r-true"|"both-false", scheme?:"4opt"|"5opt" /* def: 5opt for both-false, else 4opt; both-false forbids 4opt */, explanation?:string, layoutOverrides?:Record<string,string> }
+                // Markdown: :::assertion-reason{answer="both-no-explain" scheme?="4opt"|"5opt"}\nA: ...\nR: ...\n:::explanation\n...\n:::
                 """,
             Command: "Inside quiz.questions[] or :::assertion-reason{...} in Markdown",
             Summary: "Standardized Assertion (A) & Reason (R) question without repetitive option boilerplate.",
@@ -670,7 +695,7 @@ public sealed class GetSchemaHandler
                 new("assertion", "string", true, "Assertion (A) statement Markdown/KaTeX."),
                 new("reason", "string", true, "Reason (R) statement Markdown/KaTeX."),
                 new("answer", "string", true, "Canonical answer enum.", ["both-explain", "both-no-explain", "a-true-r-false", "a-false-r-true", "both-false"]),
-                new("scheme", "string", false, "Option scheme (auto-selects '5opt' if answer is 'both-false', else '4opt').", ["4opt", "5opt"]),
+                new("scheme", "string", false, "Option scheme (defaults to '5opt' when answer is 'both-false', else '4opt'; explicit '4opt' with 'both-false' fails lint).", ["4opt", "5opt"]),
                 new("explanation", "string", false, "Optional explanation Markdown/KaTeX."),
                 new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
             ],
@@ -691,19 +716,20 @@ public sealed class GetSchemaHandler
             Topic: "spot-error",
             CompactSignature: """
                 // Question: spot-error (tappable [span] chips with [~~wrong~~ -> correction | alias] error spans)
-                { type:"spot-error", ref?:string, text:string, requireFix?:bool, allowNoError?:bool, noError?:bool, explanation?:string, layoutOverrides?:Record<string,string> }
-                // Markdown: :::spot-error{requireFix=false allowNoError=true}\nIn [condition], calcium is [high] and phosphate is [~~high~~ -> low].\n:::explanation\n...\n:::
+                { type:"spot-error", ref?:string, text:string, imagePath?:string, requireFix?:bool, allowNoError?:bool, noError?:bool, explanation?:string, layoutOverrides?:Record<string,string> }
+                // Markdown: :::spot-error{image?="assets/fig.png" requireFix=false allowNoError=true}\nIn [condition], calcium is [high] and phosphate is [~~high~~ -> low].\n:::explanation\n...\n:::
                 """,
             Command: "Inside quiz.questions[] or :::spot-error{...} in Markdown",
-            Summary: "Identify incorrect segment(s) in a statement, with optional correction input and 'No error' trap.",
+            Summary: "Identify incorrect segment(s) in a statement, with optional image, correction input, and 'No error' trap.",
             DisallowUnmappedProperties: true,
             Fields:
             [
                 new("type", "string", true, "Must be 'spot-error'.", ["spot-error"]),
                 new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
                 new("text", "string", true, "Statement with >=2 '[span]' segments; mark faulty spans as '[~~wrong~~ -> fix | alias]'."),
+                new("imagePath", "string", false, "Optional prompt diagram image path."),
                 new("requireFix", "boolean", false, "Require typing the correction for tapped error span(s) (default false)."),
-                new("allowNoError", "boolean", false, "Display a 'No error in statement' button (defaults true when noError=true)."),
+                new("allowNoError", "boolean", false, "Display a 'No error in statement' button (default false; defaults true when noError=true)."),
                 new("noError", "boolean", false, "Statement has zero error spans and 'No error' is the correct answer (default false)."),
                 new("explanation", "string", false, "Optional explanation Markdown/KaTeX."),
                 new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
@@ -741,7 +767,7 @@ public sealed class GetSchemaHandler
                 new("caseSensitive", "boolean", false, "Require exact case match in 'fill' mode (default false)."),
                 new("allowNoError", "boolean", false, "Display 'No error in table' option in 'spot-wrong' mode (default false)."),
                 new("headers", "array<string>", true, ">=2 column headers (>=3 for 'rearrange': col 0 feature + >=2 entities)."),
-                new("alignments", "array<string>", false, "Optional per-column alignment ('left' | 'center' | 'right')."),
+                new("alignments", "array<string>", false, "Optional per-column alignment ('left' | 'center' | 'right'); length must match headers.length."),
                 new("rows", "array<array<string>>", true, ">=1 row; mark 'fill' blanks with '{{ans | alias}}' and 'spot-wrong' faults with '~~wrong~~ -> fix \\| alias' or '~~wrong~~ -> {{fix | alias}}'."),
                 new("explanation", "string", false, "Optional explanation Markdown/KaTeX."),
                 new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
@@ -833,6 +859,216 @@ public sealed class GetSchemaHandler
                 {
                     new { label = "Proximal convoluted tubule", aliases = new[] { "PCT" }, rect = new[] { 0.12, 0.24, 0.18, 0.06 } },
                     new { label = "Glomerulus", rect = new[] { 0.45, 0.15, 0.14, 0.05 } }
+                }
+            },
+            Scope: "content",
+            Category: "question");
+
+    private static SchemaTopicDefinition BuildDiagramExploreSchema() =>
+        new(
+            Topic: "diagram-explore",
+            CompactSignature: """
+                // Article block: diagram-explore (interactive hotspot explorer over one unmasked image + .masks.json / melomg .meta.json or inline boxes)
+                { kind:"diagram-explore", ref?:string, imagePath:string, title?:string, caption?:string, alt?:string, masksPath?:string, hotspots:[{label:string,note:string,rect?:[x,y,w,h],x?:number,y?:number,w?:number,h?:number}] }
+                // Markdown: :::diagram-explore{image="assets/fig.png" masks?="assets/fig.masks.json" title?="..."}\n- Label: Annotation Markdown\n:::
+                """,
+            Command: "Inside article.blocks[] or :::diagram-explore{...} in Markdown",
+            Summary: "Interactive anatomical/conceptual diagram with clickable normalized hotspots revealing Markdown/KaTeX annotation cards.",
+            DisallowUnmappedProperties: true,
+            Fields:
+            [
+                new("kind", "string", true, "Must be 'diagram-explore'.", ["diagram-explore"]),
+                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                new("imagePath", "string", true, "Relative path to the unmasked diagram image."),
+                new("title", "string", false, "Optional explorer title."),
+                new("caption", "string", false, "Optional caption."),
+                new("alt", "string", false, "Optional alt text."),
+                new("masksPath", "string", false, "Optional .masks.json or melomg .meta.json sidecar (hotspots specify {label, note} matched case-insensitively)."),
+                new("hotspots", "array<diagramHotspot>", true, "Non-empty list of hotspot annotations ({label, note, rect:[x,y,w,h] or x/y/w/h if no masksPath}).")
+            ],
+            Example: new
+            {
+                kind = "diagram-explore",
+                imagePath = "assets/nephron.png",
+                title = "Nephron Explorer",
+                hotspots = new[]
+                {
+                    new { label = "Glomerulus", note = "Filters plasma.", rect = new[] { 0.15, 0.2, 0.2, 0.12 } }
+                }
+            },
+            Scope: "content",
+            Category: "block");
+
+    private static SchemaTopicDefinition BuildRevealSchema() =>
+        new(
+            Topic: "reveal",
+            CompactSignature: """
+                // Article block: reveal (progressive step-through / Socratic active-recall cards inside an article)
+                { kind:"reveal", ref?:string, title?:string, showFirst?:bool, steps:[{heading:string,body:string}] }
+                // Markdown: :::reveal{title?="..." showFirst?=false}\n> Step 1 Title\nStep 1 body\n> Step 2 Title\nStep 2 body\n:::
+                """,
+            Command: "Inside article.blocks[] or :::reveal{...} in Markdown",
+            Summary: "Sequential progressive disclosure cards inside articles for active-recall pacing.",
+            DisallowUnmappedProperties: true,
+            Fields:
+            [
+                new("kind", "string", true, "Must be 'reveal'.", ["reveal"]),
+                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                new("title", "string", false, "Optional header title."),
+                new("showFirst", "boolean", false, "Reveal the first step immediately on load (default false)."),
+                new("steps", "array<revealStep>", true, "Non-empty ordered list of {heading, body} steps.")
+            ],
+            Example: new
+            {
+                kind = "reveal",
+                title = "Derive Ohm's Law",
+                showFirst = false,
+                steps = new[]
+                {
+                    new { heading = "Cue 1", body = "Current density is proportional to electric field." }
+                }
+            },
+            Scope: "content",
+            Category: "block");
+
+    private static SchemaTopicDefinition BuildClassifySchema() =>
+        new(
+            Topic: "classify",
+            CompactSignature: """
+                // Question: classify (sort shuffled chips into 2-4 named category buckets)
+                { type:"classify", ref?:string, title?:string, buckets:string[]|[{bucketId:int,name:string}], items:[{bucket:string|bucketId:int,text:string}], explanation?:string, layoutOverrides?:Record<string,string> }
+                // Markdown: :::classify{title?="..."}\n[Bucket A]\n- Item 1\n[Bucket B]\n- Item 2\n:::explanation\n...\n:::
+                """,
+            Command: "Inside quiz.questions[] or :::classify{...} in Markdown",
+            Summary: "Interactive multi-bucket classification / grouping drill with click-to-sort and drag-and-drop.",
+            DisallowUnmappedProperties: true,
+            Fields:
+            [
+                new("type", "string", true, "Must be 'classify'.", ["classify"]),
+                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                new("title", "string", false, "Optional prompt/heading."),
+                new("buckets", "array<string|bucket>", true, "2 to 4 bucket names or {bucketId, name} objects."),
+                new("items", "array<classifyItem>", true, "Items mapped via bucket name or bucketId."),
+                new("explanation", "string", false, "Optional explanation Markdown/KaTeX."),
+                new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
+            ],
+            Example: new
+            {
+                type = "classify",
+                title = "Sort Diuretics",
+                buckets = new[] { "Loop", "Thiazide" },
+                items = new object[]
+                {
+                    new { bucket = "Loop", text = "Furosemide" },
+                    new { bucket = "Thiazide", text = "Hydrochlorothiazide" }
+                }
+            },
+            Scope: "content",
+            Category: "question");
+
+    private static SchemaTopicDefinition BuildMatchSchema() =>
+        new(
+            Topic: "match",
+            CompactSignature: """
+                // Question: match (two-column pairing with optional distractor decoys)
+                { type:"match", ref?:string, title?:string, pairs:[{left:string,right:string}], distractors?:string[], explanation?:string, layoutOverrides?:Record<string,string> }
+                // Markdown: :::match{title?="..."}\n- Left :: Right\n! Distractor\n:::explanation\n...\n:::
+                """,
+            Command: "Inside quiz.questions[] or :::match{...} in Markdown",
+            Summary: "Two-column matching question with optional unmatched distractors.",
+            DisallowUnmappedProperties: true,
+            Fields:
+            [
+                new("type", "string", true, "Must be 'match'.", ["match"]),
+                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                new("title", "string", false, "Optional prompt/heading."),
+                new("pairs", "array<matchPair>", true, "At least 2 {left, right} pairs."),
+                new("distractors", "array<string>", false, "Optional right-column decoy choices."),
+                new("explanation", "string", false, "Optional explanation Markdown/KaTeX."),
+                new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
+            ],
+            Example: new
+            {
+                type = "match",
+                title = "Match Receptors",
+                pairs = new object[]
+                {
+                    new { left = "Alpha-1", right = "$G_q$" },
+                    new { left = "Beta-2", right = "$G_s$" }
+                },
+                distractors = new[] { "$G_i$" }
+            },
+            Scope: "content",
+            Category: "question");
+
+    private static SchemaTopicDefinition BuildNumericSchema() =>
+        new(
+            Topic: "numeric",
+            CompactSignature: """
+                // Question: numeric (quantitative free-recall with absolute or percentage tolerance)
+                { type:"numeric", ref?:string, text?:string, prompt?:string, answer:number, tolerance?:number|string /* e.g. 5 or "5%" */, toleranceMode?:"absolute"|"percent", unit?:string, placeholder?:string, imagePath?:string, explanation?:string, layoutOverrides?:Record<string,string> }
+                // Markdown: :::numeric{answer=125 tolerance="5%" unit="mL/min" placeholder?="..." image?="..."}\nPrompt...\n:::explanation\n...\n:::
+                """,
+            Command: "Inside quiz.questions[] or :::numeric{...} in Markdown",
+            Summary: "Quantitative calculation question graded against an absolute or percentage tolerance range.",
+            DisallowUnmappedProperties: true,
+            Fields:
+            [
+                new("type", "string", true, "Must be 'numeric'.", ["numeric"]),
+                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                new("prompt", "string", true, "Question prompt (or alias 'text')."),
+                new("answer", "number", true, "Exact finite numeric answer."),
+                new("tolerance", "number|string", false, "Non-negative tolerance (number or 'X%' percentage; default 0)."),
+                new("toleranceMode", "string", false, "Tolerance interpretation (default 'absolute').", ["absolute", "percent"]),
+                new("unit", "string", false, "Optional displayed unit badge."),
+                new("placeholder", "string", false, "Optional input placeholder."),
+                new("imagePath", "string", false, "Optional diagram/figure image."),
+                new("explanation", "string", false, "Optional explanation Markdown/KaTeX."),
+                new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
+            ],
+            Example: new
+            {
+                type = "numeric",
+                text = "Calculate MAP for BP 120/80 mmHg.",
+                answer = 93.3,
+                tolerance = "5%",
+                unit = "mmHg"
+            },
+            Scope: "content",
+            Category: "question");
+
+    private static SchemaTopicDefinition BuildCaseSchema() =>
+        new(
+            Topic: "case",
+            CompactSignature: """
+                // Question: case (shared clinical/case vignette stem + 2+ nested sub-questions; no nested 'case')
+                { type:"case", ref?:string, title?:string, stem:string, imagePath?:string, caption?:string, questions:[Mcq|Flashcard|FillBlank|AssertionReason|SpotError|Diff|Mechanism|Relabel|Classify|Match|Numeric], explanation?:string, layoutOverrides?:Record<string,string> }
+                // Markdown: :::case{title?="..." caption?="..."}\nStem Markdown + optional ![alt](img.png)\n::::mcq{explanation?="..."}\n...\n::::\n::::numeric{answer=5}\n...\n::::\n:::
+                """,
+            Command: "Inside quiz.questions[] or :::case{...} in Markdown",
+            Summary: "Pinned shared vignette/case stem driving multiple linked interactive sub-questions with rolled-up telemetry.",
+            DisallowUnmappedProperties: true,
+            Fields:
+            [
+                new("type", "string", true, "Must be 'case'.", ["case"]),
+                new("ref", "string", false, "Optional slug.", null, RefKeyValidator.MaxLength, RefKeyValidator.Pattern),
+                new("title", "string", false, "Optional case heading."),
+                new("stem", "string", true, "Shared Markdown/KaTeX vignette stem."),
+                new("imagePath", "string", false, "Optional image attached to the shared stem."),
+                new("caption", "string", false, "Optional caption for the stem image."),
+                new("questions", "array<question>", true, "2 or more non-case sub-questions (inside Markdown use quad-colon fences ::::mcq ... ::::)."),
+                new("explanation", "string", false, "Optional overall case takeaway Markdown/KaTeX."),
+                new("layoutOverrides", "object<string,string>", false, "Bounded mcq layout overrides.")
+            ],
+            Example: new
+            {
+                type = "case",
+                title = "Renal Vignette",
+                stem = "A patient presents with hypertension and hypokalemia.",
+                questions = new object[]
+                {
+                    new { type = "mcq", text = "Likely hormone elevated?", options = new object[] { new { text = "Aldosterone", isCorrect = true }, new { text = "ADH", isCorrect = false } } },
+                    new { type = "numeric", text = "Normal serum K+ lower bound:", answer = 3.5, tolerance = 0.2, unit = "mEq/L" }
                 }
             },
             Scope: "content",

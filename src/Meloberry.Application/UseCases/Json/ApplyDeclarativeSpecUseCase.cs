@@ -224,11 +224,12 @@ public sealed class ApplySpecHandler(
                 Name = spec.Name ?? spec.Title ?? "Study Session",
                 Components =
                 [
-                    new DeclarativeComponentSpec("article", spec.Title ?? spec.Name, null, spec.Blocks, null, spec.LayoutOverrides, spec.Ref, jsonDir)
+                    new DeclarativeComponentSpec("article", spec.Title ?? spec.Name, null, spec.Blocks, null, spec.LayoutOverrides, spec.Ref, jsonDir, spec.Links)
                 ],
                 Blocks = null,
                 LayoutOverrides = null,
-                Ref = null
+                Ref = null,
+                Links = null
             };
             kind = "session";
         }
@@ -295,11 +296,13 @@ public sealed class ApplySpecHandler(
                 }
 
                 await repository.CreateSessionAsync(session, ct);
+                var createdReport = await lintHandler.LintSessionInMemoryAsync(session, storageDir, ct);
                 return new ApplySpecResponse(
                     session.Id, "session", storageDir, CreatedWorkspace: true, DryRun: false,
                     Components: MapComponentSummaries(addedComponents),
                     AddedBlockIds: CompactIds(addedBlocks, quiet, verbose),
-                    AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose));
+                    AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose),
+                    Lint: new ApplyLintSummary(createdReport.IsClean, createdReport.ErrorCount, createdReport.WarningCount));
             }
             catch
             {
@@ -363,9 +366,11 @@ public sealed class ApplySpecHandler(
                 }
 
                 await repository.CreateQuizAsync(quiz, ct);
+                var createdReport = await lintHandler.LintQuizInMemoryAsync(quiz, storageDir, ct);
                 return new ApplySpecResponse(
                     quiz.Id, "quiz", storageDir, CreatedWorkspace: true, DryRun: false,
-                    AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose));
+                    AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose),
+                    Lint: new ApplyLintSummary(createdReport.IsClean, createdReport.ErrorCount, createdReport.WarningCount));
             }
             catch
             {
@@ -416,7 +421,7 @@ public sealed class ApplySpecHandler(
             isSingleComponentSpec = true;
             var singleKind = spec.Kind ?? (spec.Blocks is { Count: > 0 } ? "article" : "quiz");
             compsToAdd.Add(new DeclarativeComponentSpec(
-                singleKind, spec.Title ?? spec.Name, spec.QuizType, spec.Blocks, spec.Questions, spec.LayoutOverrides, spec.Ref, jsonDir));
+                singleKind, spec.Title ?? spec.Name, spec.QuizType, spec.Blocks, spec.Questions, spec.LayoutOverrides, spec.Ref, jsonDir, Links: spec.Links));
         }
         else
         {
@@ -463,11 +468,13 @@ public sealed class ApplySpecHandler(
 
             await repository.SaveSessionAsync(session, ct);
             persisted = true;
+            var savedReport = await lintHandler.LintSessionInMemoryAsync(session, realStorageDir, ct);
             return new ApplySpecResponse(
                 session.Id, "session", realStorageDir, CreatedWorkspace: false, DryRun: false,
                 Components: MapComponentSummaries(addedComponents),
                 AddedBlockIds: CompactIds(addedBlocks, quiet, verbose),
-                AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose));
+                AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose),
+                Lint: new ApplyLintSummary(savedReport.IsClean, savedReport.ErrorCount, savedReport.WarningCount));
         }
         finally
         {
@@ -534,11 +541,13 @@ public sealed class ApplySpecHandler(
 
                 var blockRes = await AddBlocksFromSpecsAsync(comp, workingAssetRoot, spec.Blocks ?? [], jsonDir, jsonDir, cwd, usedRefs, addedBlocks, ct);
                 if (!blockRes.IsSuccess) return blockRes.Error!;
+                var linksRes = await AddLinkCardsFromSpecsAsync(comp, workingAssetRoot, spec.Links ?? [], jsonDir, jsonDir, cwd, ct);
+                if (!linksRes.IsSuccess) return linksRes.Error!;
             }
             else if (comp.Quiz is not null)
             {
-                if (spec.Blocks is { Count: > 0 })
-                    return new Error("Json.InvalidFieldForType", "Quiz component cannot accept article 'blocks[]'.", ErrorType.Validation);
+                if (spec.Blocks is { Count: > 0 } || spec.Links is { Count: > 0 })
+                    return new Error("Json.InvalidFieldForType", "Quiz component cannot accept article 'blocks[]' or 'links[]'.", ErrorType.Validation);
 
                 var qRes = await AddQuestionsFromSpecsAsync(comp.Quiz, workingAssetRoot, spec.Questions ?? [], jsonDir, jsonDir, cwd, usedRefs, addedQuestions, ct);
                 if (!qRes.IsSuccess) return qRes.Error!;
@@ -556,10 +565,12 @@ public sealed class ApplySpecHandler(
 
             await repository.SaveSessionAsync(session, ct);
             persisted = true;
+            var savedReport = await lintHandler.LintSessionInMemoryAsync(session, realStorageDir, ct);
             return new ApplySpecResponse(
                 comp.Id, "component", realStorageDir, CreatedWorkspace: false, DryRun: false,
                 AddedBlockIds: CompactIds(addedBlocks, quiet, verbose),
-                AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose));
+                AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose),
+                Lint: new ApplyLintSummary(savedReport.IsClean, savedReport.ErrorCount, savedReport.WarningCount));
         }
         finally
         {
@@ -617,9 +628,11 @@ public sealed class ApplySpecHandler(
 
             await repository.SaveQuizAsync(quiz, ct);
             persisted = true;
+            var savedReport = await lintHandler.LintQuizInMemoryAsync(quiz, realStorageDir, ct);
             return new ApplySpecResponse(
                 quiz.Id, "quiz", realStorageDir, CreatedWorkspace: false, DryRun: false,
-                AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose));
+                AddedQuestionIds: CompactIds(addedQuestions, quiet, verbose),
+                Lint: new ApplyLintSummary(savedReport.IsClean, savedReport.ErrorCount, savedReport.WarningCount));
         }
         finally
         {
@@ -691,13 +704,40 @@ public sealed class ApplySpecHandler(
             if (compSpec.Questions is { Count: > 0 })
                 return new Error("Json.InvalidFieldForType", "Article component cannot specify 'questions[]'.", ErrorType.Validation);
 
-            return await AddBlocksFromSpecsAsync(comp, storageDir, compSpec.Blocks ?? [], compAssetDir, specRootDir, cwd, usedRefs, addedBlocks, ct);
+            var blocksRes = await AddBlocksFromSpecsAsync(comp, storageDir, compSpec.Blocks ?? [], compAssetDir, specRootDir, cwd, usedRefs, addedBlocks, ct);
+            if (!blocksRes.IsSuccess) return blocksRes.Error!;
+            return await AddLinkCardsFromSpecsAsync(comp, storageDir, compSpec.Links ?? [], compAssetDir, specRootDir, cwd, ct);
         }
 
-        if (compSpec.Blocks is { Count: > 0 })
-            return new Error("Json.InvalidFieldForType", "Quiz component cannot specify article 'blocks[]'.", ErrorType.Validation);
+        if (compSpec.Blocks is { Count: > 0 } || compSpec.Links is { Count: > 0 })
+            return new Error("Json.InvalidFieldForType", "Quiz component cannot specify article 'blocks[]' or 'links[]'.", ErrorType.Validation);
 
         return await AddQuestionsFromSpecsAsync(comp.Quiz!, storageDir, compSpec.Questions ?? [], compAssetDir, specRootDir, cwd, usedRefs, addedQuestions, ct);
+    }
+
+    private async Task<Result> AddLinkCardsFromSpecsAsync(
+        SessionComponent comp,
+        string storageDir,
+        IReadOnlyList<DeclarativeLinkCardSpec> links,
+        string compAssetDir,
+        string specRootDir,
+        string cwd,
+        CancellationToken ct)
+    {
+        foreach (var l in links)
+        {
+            string? storedImg = null;
+            if (!string.IsNullOrWhiteSpace(l.ImagePath))
+            {
+                var imgRes = await JsonQuestionMaterializer.CopyConfinedImageAsync(
+                    l.ImagePath, compAssetDir, storageDir, contentInspector, ct, specRootDir, cwd);
+                if (!imgRes.IsSuccess) return imgRes.Error!;
+                storedImg = imgRes.Value;
+            }
+            var addRes = comp.AddOrReplaceLinkCard(new ArticleLinkCard(l.Id, l.Title, l.Text, storedImg));
+            if (!addRes.IsSuccess) return addRes.Error!;
+        }
+        return Result.Success();
     }
 
     private async Task<Result> AddBlocksFromSpecsAsync(
@@ -775,9 +815,92 @@ public sealed class ApplySpecHandler(
                 if (!res.IsSuccess) return res.Error!;
                 created = res.Value;
             }
+            else if (bKind is "diagram-explore" or "diagramexplore")
+            {
+                if (!string.IsNullOrWhiteSpace(b.Text) || !string.IsNullOrWhiteSpace(b.Tone))
+                    return new Error("Json.InvalidFieldForType", "Article diagram-explore block cannot specify 'text' or 'tone'.", ErrorType.Validation);
+
+                if (!Phase1PayloadCodec.TryDeserialize<DiagramExplorePayload>(b.PayloadJson, out var parsedDiag) || parsedDiag is null)
+                    return ArticleErrors.InvalidDiagramExplorePayload("Diagram Explorer block requires valid payload data.");
+
+                var rawImgPath = !string.IsNullOrWhiteSpace(parsedDiag.ImagePath) ? parsedDiag.ImagePath : b.ImagePath;
+                if (string.IsNullOrWhiteSpace(rawImgPath))
+                    return new Error("Json.InvalidSpec", "Article diagram-explore block requires 'imagePath'.", ErrorType.Validation);
+
+                var imgRes = await JsonQuestionMaterializer.CopyConfinedImageAsync(
+                    rawImgPath, compAssetDir, storageDir, contentInspector, ct, specRootDir, cwd);
+                if (!imgRes.IsSuccess) return imgRes.Error!;
+                if (string.IsNullOrWhiteSpace(imgRes.Value))
+                    return new Error("Json.InvalidSpec", "Article diagram-explore block requires a valid 'imagePath'.", ErrorType.Validation);
+
+                IReadOnlyList<DiagramHotspot> hotspots = parsedDiag.Hotspots ?? [];
+                if (!string.IsNullOrWhiteSpace(parsedDiag.SourceMasksPath))
+                {
+                    var sidecarRes = JsonQuestionMaterializer.ResolveConfinedSidecarFile(parsedDiag.SourceMasksPath, compAssetDir, specRootDir, cwd);
+                    if (!sidecarRes.IsSuccess) return sidecarRes.Error!;
+
+                    var rawSidecar = await File.ReadAllTextAsync(sidecarRes.Value, ct);
+                    var boxesRes = Phase2PayloadRules.ParseMaskSidecarJson(rawSidecar);
+                    if (!boxesRes.IsSuccess) return boxesRes.Error!;
+
+                    var annotations = hotspots
+                        .Where(h => h is not null)
+                        .Select(h => new DiagramHotspotAnnotation(h.Label ?? string.Empty, h.Note ?? string.Empty))
+                        .ToList();
+                    var resolvedHotspots = Phase3PayloadRules.ResolveHotspotsFromSidecar(boxesRes.Value, annotations);
+                    if (!resolvedHotspots.IsSuccess) return resolvedHotspots.Error!;
+                    hotspots = resolvedHotspots.Value;
+                }
+                else
+                {
+                    hotspots = hotspots
+                        .Where(h => h is not null)
+                        .Select((h, idx) => new DiagramHotspot(idx, h.Label?.Trim() ?? string.Empty, h.Note?.Trim() ?? string.Empty, h.X, h.Y, h.W, h.H))
+                        .ToList();
+                }
+
+                var diagTitle = parsedDiag.Title ?? b.Title;
+                var diagCaption = parsedDiag.Caption ?? b.Caption;
+                var canonicalDiag = Phase1PayloadCodec.Serialize(new DiagramExplorePayload(
+                    imgRes.Value,
+                    string.IsNullOrWhiteSpace(diagTitle) ? null : diagTitle.Trim(),
+                    string.IsNullOrWhiteSpace(diagCaption) ? null : diagCaption.Trim(),
+                    hotspots,
+                    SourceMasksPath: null));
+
+                var res = comp.AddDiagramExploreBlock(blockId, imgRes.Value, canonicalDiag, diagTitle, diagCaption, b.Alt);
+                if (!res.IsSuccess) return res.Error!;
+                created = res.Value;
+            }
+            else if (bKind == "reveal")
+            {
+                if (!string.IsNullOrWhiteSpace(b.Text) || !string.IsNullOrWhiteSpace(b.ImagePath) ||
+                    !string.IsNullOrWhiteSpace(b.Caption) || !string.IsNullOrWhiteSpace(b.Alt) ||
+                    !string.IsNullOrWhiteSpace(b.Tone))
+                {
+                    return new Error("Json.InvalidFieldForType", "Article reveal block cannot specify 'text', 'imagePath', 'caption', 'alt', or 'tone'.", ErrorType.Validation);
+                }
+
+                if (!Phase1PayloadCodec.TryDeserialize<RevealBlockPayload>(b.PayloadJson, out var parsedRev) || parsedRev is null)
+                    return ArticleErrors.InvalidRevealPayload("Reveal block requires valid steps payload data.");
+
+                var revTitle = parsedRev.Title ?? b.Title;
+                var revSteps = (parsedRev.Steps ?? [])
+                    .Where(s => s is not null)
+                    .Select((s, idx) => new RevealStep(idx, s.Heading?.Trim() ?? string.Empty, s.Body?.Trim() ?? string.Empty))
+                    .ToList();
+                var canonicalRev = Phase1PayloadCodec.Serialize(new RevealBlockPayload(
+                    string.IsNullOrWhiteSpace(revTitle) ? null : revTitle.Trim(),
+                    parsedRev.ShowFirst,
+                    revSteps));
+
+                var res = comp.AddRevealBlock(blockId, canonicalRev, revTitle);
+                if (!res.IsSuccess) return res.Error!;
+                created = res.Value;
+            }
             else
             {
-                return new Error("Json.InvalidSpec", $"Unsupported article block kind '{b.Kind}'. Use 'text', 'image', 'callout', or 'table'.", ErrorType.Validation);
+                return new Error("Json.InvalidSpec", $"Unsupported article block kind '{b.Kind}'. Use 'text', 'image', 'callout', 'table', 'diagram-explore', or 'reveal'.", ErrorType.Validation);
             }
 
             if (!string.IsNullOrWhiteSpace(b.Ref))

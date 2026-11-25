@@ -252,7 +252,7 @@ public sealed partial class BatchOperationsHandler(
             {
                 var target = GetString(obj, "target") ?? string.Empty;
                 var prop = GetString(obj, "property") ?? string.Empty;
-                var val = GetString(obj, "value") ?? string.Empty;
+                var val = GetScalarAsString(obj, "value") ?? string.Empty;
                 var res = await setLayoutHandler.HandleAsync(new SetLayoutPropertyCommand(target, prop, val), ct);
                 return res.IsSuccess
                     ? (true, res.Value, null, null)
@@ -276,6 +276,18 @@ public sealed partial class BatchOperationsHandler(
     {
         var node = GetNode(obj, name);
         return node is not null && node.GetValueKind() == JsonValueKind.String ? node.GetValue<string>() : null;
+    }
+
+    private static string? GetScalarAsString(JsonObject obj, string name)
+    {
+        var node = GetNode(obj, name);
+        if (node is null) return null;
+        return node.GetValueKind() switch
+        {
+            JsonValueKind.String => node.GetValue<string>(),
+            JsonValueKind.Number => node.ToJsonString(),
+            _ => null
+        };
     }
 
     private static bool GetBool(JsonObject obj, string name)

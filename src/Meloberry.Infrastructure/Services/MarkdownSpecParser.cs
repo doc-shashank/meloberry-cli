@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
 using Meloberry.Application.Abstractions;
@@ -20,7 +20,8 @@ internal sealed record ParsedMarkdownDocument(
     IReadOnlyList<string>? Order,
     IReadOnlyList<DeclarativeArticleBlockSpec> Blocks,
     IReadOnlyList<JsonQuestionSpec> Questions,
-    string? ExtractedHeading = null);
+    string? ExtractedHeading = null,
+    IReadOnlyList<DeclarativeLinkCardSpec>? Links = null);
 
 internal static partial class MarkdownSpecParser
 {
@@ -50,7 +51,7 @@ internal static partial class MarkdownSpecParser
 
     private static readonly HashSet<string> AllowedMcqAttrs = new(StringComparer.OrdinalIgnoreCase)
     {
-        "ref", "multi", "isMultiCorrect", "maxOptions", "image", "imagePath"
+        "ref", "multi", "isMultiCorrect", "maxOptions", "image", "imagePath", "explanation"
     };
 
     private static readonly HashSet<string> AllowedFlashcardAttrs = new(StringComparer.OrdinalIgnoreCase)
@@ -65,32 +66,67 @@ internal static partial class MarkdownSpecParser
 
     private static readonly HashSet<string> AllowedFillBlankAttrs = new(StringComparer.OrdinalIgnoreCase)
     {
-        "ref", "fuzzy", "caseSensitive"
+        "ref", "fuzzy", "caseSensitive", "placeholder", "explanation"
     };
 
     private static readonly HashSet<string> AllowedAssertionReasonAttrs = new(StringComparer.OrdinalIgnoreCase)
     {
-        "ref", "answer", "scheme"
+        "ref", "answer", "scheme", "explanation"
     };
 
     private static readonly HashSet<string> AllowedSpotErrorAttrs = new(StringComparer.OrdinalIgnoreCase)
     {
-        "ref", "requireFix", "allowNoError", "noError"
+        "ref", "requireFix", "allowNoError", "noError", "image", "imagePath", "explanation"
+    };
+
+    private static readonly HashSet<string> AllowedLinkAttrs = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "id", "title", "image", "imagePath"
     };
 
     private static readonly HashSet<string> AllowedDiffAttrs = new(StringComparer.OrdinalIgnoreCase)
     {
-        "ref", "mode", "title", "bank", "fuzzy", "caseSensitive", "allowNoError"
+        "ref", "mode", "title", "bank", "fuzzy", "caseSensitive", "allowNoError", "explanation"
     };
 
     private static readonly HashSet<string> AllowedMechanismAttrs = new(StringComparer.OrdinalIgnoreCase)
     {
-        "ref", "title"
+        "ref", "title", "explanation"
     };
 
     private static readonly HashSet<string> AllowedRelabelAttrs = new(StringComparer.OrdinalIgnoreCase)
     {
-        "ref", "image", "imagePath", "masks", "masksPath", "mode", "style", "fuzzy", "caseSensitive"
+        "ref", "image", "imagePath", "masks", "masksPath", "mode", "style", "fuzzy", "caseSensitive", "explanation"
+    };
+
+    private static readonly HashSet<string> AllowedDiagramExploreAttrs = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "ref", "image", "imagePath", "masks", "masksPath", "title", "caption", "alt"
+    };
+
+    private static readonly HashSet<string> AllowedRevealAttrs = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "ref", "title", "showFirst"
+    };
+
+    private static readonly HashSet<string> AllowedClassifyAttrs = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "ref", "title", "explanation"
+    };
+
+    private static readonly HashSet<string> AllowedMatchAttrs = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "ref", "title", "explanation"
+    };
+
+    private static readonly HashSet<string> AllowedNumericAttrs = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "ref", "answer", "tolerance", "toleranceMode", "unit", "placeholder", "image", "imagePath", "explanation"
+    };
+
+    private static readonly HashSet<string> AllowedCaseAttrs = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "ref", "title", "image", "imagePath", "caption", "explanation"
     };
 
     private static readonly HashSet<string> EmptySubSections = new(StringComparer.OrdinalIgnoreCase);
@@ -120,6 +156,12 @@ internal static partial class MarkdownSpecParser
 
     [GeneratedRegex(@"^:::\s*(?<section>[a-zA-Z_][a-zA-Z0-9_-]*)\s*$", RegexOptions.Compiled)]
     private static partial Regex DirectiveSubSectionRegex();
+
+    [GeneratedRegex(@"^::::\s*(?<name>[a-zA-Z_][a-zA-Z0-9_-]*)(?<rest>.*)$", RegexOptions.Compiled)]
+    private static partial Regex QuadDirectiveOpenRegex();
+
+    [GeneratedRegex(@"^::::\s*(?<section>[a-zA-Z_][a-zA-Z0-9_-]*)\s*$", RegexOptions.Compiled)]
+    private static partial Regex QuadSubSectionRegex();
 
     [GeneratedRegex(@"^-\s*\[(?<mark>[ xX])\]\s*(?<text>.*)$", RegexOptions.Compiled)]
     private static partial Regex McqOptionLineRegex();
@@ -172,7 +214,7 @@ internal static partial class MarkdownSpecParser
 
             if (hasArticleBody)
             {
-                comps.Add(new DeclarativeComponentSpec("article", title, null, doc.Blocks, null, doc.LayoutOverrides, doc.Ref, assetBaseDir));
+                comps.Add(new DeclarativeComponentSpec("article", title, null, doc.Blocks, null, doc.LayoutOverrides, doc.Ref, assetBaseDir, doc.Links));
             }
             else if (hasQuizBody)
             {
@@ -241,7 +283,8 @@ internal static partial class MarkdownSpecParser
             LayoutOverrides: doc.LayoutOverrides,
             AssetBaseDirectory: assetBaseDir,
             Ref: doc.Ref,
-            Order: doc.Order);
+            Order: doc.Order,
+            Links: doc.Links);
     }
 
     public static Result<DeclarativeComponentSpec> ParseComponent(string rawMarkdown, string filePath)
@@ -288,7 +331,8 @@ internal static partial class MarkdownSpecParser
             Questions: null,
             LayoutOverrides: doc.LayoutOverrides,
             Ref: doc.Ref,
-            SourceDirectory: sourceDir);
+            SourceDirectory: sourceDir,
+            Links: doc.Links);
     }
 
     public static Result<ParsedMarkdownDocument> ParseDocument(string rawMarkdown, string sourceLabel, bool isSessionManifest)
@@ -347,7 +391,7 @@ internal static partial class MarkdownSpecParser
 
         return new ParsedMarkdownDocument(
             kind, name, description, title, refKey, quizType, layoutOverrides, order,
-            bodyRes.Value.Blocks, bodyRes.Value.Questions, bodyRes.Value.ExtractedHeading);
+            bodyRes.Value.Blocks, bodyRes.Value.Questions, bodyRes.Value.ExtractedHeading, bodyRes.Value.Links);
     }
 
     private static Result ParseFrontmatter(
@@ -488,7 +532,7 @@ internal static partial class MarkdownSpecParser
         return Result.Success();
     }
 
-    private static Result<(IReadOnlyList<DeclarativeArticleBlockSpec> Blocks, IReadOnlyList<JsonQuestionSpec> Questions, string? ExtractedHeading)> ParseBody(
+    private static Result<(IReadOnlyList<DeclarativeArticleBlockSpec> Blocks, IReadOnlyList<JsonQuestionSpec> Questions, string? ExtractedHeading, IReadOnlyList<DeclarativeLinkCardSpec>? Links)> ParseBody(
         string[] lines,
         int startLineIdx,
         string sourceLabel,
@@ -499,6 +543,8 @@ internal static partial class MarkdownSpecParser
 
         var blocks = new List<DeclarativeArticleBlockSpec>();
         var questions = new List<JsonQuestionSpec>();
+        var links = new List<DeclarativeLinkCardSpec>();
+        var seenLinkIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var textBuffer = new StringBuilder();
         string? activeCodeFence = null;
         string? extractedHeading = null;
@@ -789,12 +835,162 @@ internal static partial class MarkdownSpecParser
                     continue;
                 }
 
+                if (dirLower is "diagram-explore" or "diagramexplore")
+                {
+                    if (expectQuiz)
+                        return new Error("Markdown.InvalidDirectiveForKind", $"Article directive ':::{dirName}' at line {openLine} cannot be used inside a quiz Markdown file.", ErrorType.Validation, Path: $"markdown:{openLine}");
+                    if (!string.IsNullOrWhiteSpace(posArg))
+                        return new Error("Markdown.InvalidDirectiveAttr", $"Directive ':::diagram-explore' at line {openLine} does not accept positional arguments.", ErrorType.Validation, Path: $"markdown:{openLine}");
+
+                    var attrCheck = ValidateDirectiveAttributes(attrs, AllowedDiagramExploreAttrs, "diagram-explore", openLine, sourceLabel);
+                    if (!attrCheck.IsSuccess) return attrCheck.Error!;
+
+                    var bodyRes = ReadDirectiveBody(lines, ref i, openLine, sourceLabel, "diagram-explore", EmptySubSections);
+                    if (!bodyRes.IsSuccess) return bodyRes.Error!;
+
+                    var diagRes = ParseDiagramExploreDirective(openLine, sourceLabel, attrs, bodyRes.Value);
+                    if (!diagRes.IsSuccess) return diagRes.Error!;
+
+                    FlushText();
+                    blocks.Add(diagRes.Value);
+                    continue;
+                }
+
+                if (dirLower == "reveal")
+                {
+                    if (expectQuiz)
+                        return new Error("Markdown.InvalidDirectiveForKind", $"Article directive ':::reveal' at line {openLine} cannot be used inside a quiz Markdown file.", ErrorType.Validation, Path: $"markdown:{openLine}");
+                    if (!string.IsNullOrWhiteSpace(posArg))
+                        return new Error("Markdown.InvalidDirectiveAttr", $"Directive ':::reveal' at line {openLine} does not accept positional arguments.", ErrorType.Validation, Path: $"markdown:{openLine}");
+
+                    var attrCheck = ValidateDirectiveAttributes(attrs, AllowedRevealAttrs, "reveal", openLine, sourceLabel);
+                    if (!attrCheck.IsSuccess) return attrCheck.Error!;
+
+                    var bodyRes = ReadDirectiveBody(lines, ref i, openLine, sourceLabel, "reveal", EmptySubSections);
+                    if (!bodyRes.IsSuccess) return bodyRes.Error!;
+
+                    var revRes = ParseRevealDirective(openLine, sourceLabel, attrs, bodyRes.Value);
+                    if (!revRes.IsSuccess) return revRes.Error!;
+
+                    FlushText();
+                    blocks.Add(revRes.Value);
+                    continue;
+                }
+
+                if (dirLower is "classify" or "bucket-sort")
+                {
+                    if (expectArticle)
+                        return new Error("Markdown.InvalidDirectiveForKind", $"Quiz directive ':::{dirName}' at line {openLine} cannot be used inside an article Markdown file.", ErrorType.Validation, Path: $"markdown:{openLine}");
+                    if (!string.IsNullOrWhiteSpace(posArg))
+                        return new Error("Markdown.InvalidDirectiveAttr", $"Directive ':::classify' at line {openLine} does not accept positional arguments.", ErrorType.Validation, Path: $"markdown:{openLine}");
+
+                    var attrCheck = ValidateDirectiveAttributes(attrs, AllowedClassifyAttrs, "classify", openLine, sourceLabel);
+                    if (!attrCheck.IsSuccess) return attrCheck.Error!;
+
+                    var bodyRes = ReadDirectiveBody(lines, ref i, openLine, sourceLabel, "classify", AllowedExplanationLayoutSubSections);
+                    if (!bodyRes.IsSuccess) return bodyRes.Error!;
+
+                    var clsRes = ParseClassifyDirective(openLine, sourceLabel, attrs, bodyRes.Value);
+                    if (!clsRes.IsSuccess) return clsRes.Error!;
+
+                    FlushText();
+                    questions.Add(clsRes.Value);
+                    continue;
+                }
+
+                if (dirLower is "match" or "match-following")
+                {
+                    if (expectArticle)
+                        return new Error("Markdown.InvalidDirectiveForKind", $"Quiz directive ':::{dirName}' at line {openLine} cannot be used inside an article Markdown file.", ErrorType.Validation, Path: $"markdown:{openLine}");
+                    if (!string.IsNullOrWhiteSpace(posArg))
+                        return new Error("Markdown.InvalidDirectiveAttr", $"Directive ':::match' at line {openLine} does not accept positional arguments.", ErrorType.Validation, Path: $"markdown:{openLine}");
+
+                    var attrCheck = ValidateDirectiveAttributes(attrs, AllowedMatchAttrs, "match", openLine, sourceLabel);
+                    if (!attrCheck.IsSuccess) return attrCheck.Error!;
+
+                    var bodyRes = ReadDirectiveBody(lines, ref i, openLine, sourceLabel, "match", AllowedExplanationLayoutSubSections);
+                    if (!bodyRes.IsSuccess) return bodyRes.Error!;
+
+                    var mthRes = ParseMatchDirective(openLine, sourceLabel, attrs, bodyRes.Value);
+                    if (!mthRes.IsSuccess) return mthRes.Error!;
+
+                    FlushText();
+                    questions.Add(mthRes.Value);
+                    continue;
+                }
+
+                if (dirLower is "numeric" or "numeric-tolerance")
+                {
+                    if (expectArticle)
+                        return new Error("Markdown.InvalidDirectiveForKind", $"Quiz directive ':::{dirName}' at line {openLine} cannot be used inside an article Markdown file.", ErrorType.Validation, Path: $"markdown:{openLine}");
+                    if (!string.IsNullOrWhiteSpace(posArg))
+                        return new Error("Markdown.InvalidDirectiveAttr", $"Directive ':::numeric' at line {openLine} does not accept positional arguments.", ErrorType.Validation, Path: $"markdown:{openLine}");
+
+                    var attrCheck = ValidateDirectiveAttributes(attrs, AllowedNumericAttrs, "numeric", openLine, sourceLabel);
+                    if (!attrCheck.IsSuccess) return attrCheck.Error!;
+
+                    var bodyRes = ReadDirectiveBody(lines, ref i, openLine, sourceLabel, "numeric", AllowedExplanationLayoutSubSections);
+                    if (!bodyRes.IsSuccess) return bodyRes.Error!;
+
+                    var numRes = ParseNumericDirective(openLine, sourceLabel, attrs, bodyRes.Value);
+                    if (!numRes.IsSuccess) return numRes.Error!;
+
+                    FlushText();
+                    questions.Add(numRes.Value);
+                    continue;
+                }
+
+                if (dirLower is "case" or "case-group" or "casegroup")
+                {
+                    if (expectArticle)
+                        return new Error("Markdown.InvalidDirectiveForKind", $"Quiz directive ':::{dirName}' at line {openLine} cannot be used inside an article Markdown file.", ErrorType.Validation, Path: $"markdown:{openLine}");
+                    if (!string.IsNullOrWhiteSpace(posArg))
+                        return new Error("Markdown.InvalidDirectiveAttr", $"Directive ':::case' at line {openLine} does not accept positional arguments.", ErrorType.Validation, Path: $"markdown:{openLine}");
+
+                    var attrCheck = ValidateDirectiveAttributes(attrs, AllowedCaseAttrs, "case", openLine, sourceLabel);
+                    if (!attrCheck.IsSuccess) return attrCheck.Error!;
+
+                    var caseBodyRes = ReadCaseDirectiveBody(lines, ref i, openLine, sourceLabel);
+                    if (!caseBodyRes.IsSuccess) return caseBodyRes.Error!;
+
+                    var caseRes = ParseCaseDirective(openLine, sourceLabel, attrs, caseBodyRes.Value);
+                    if (!caseRes.IsSuccess) return caseRes.Error!;
+
+                    FlushText();
+                    questions.Add(caseRes.Value);
+                    continue;
+                }
+
+                if (dirLower is "link" or "link-card")
+                {
+                    if (expectQuiz)
+                        return new Error("Markdown.InvalidDirectiveForKind", $"Article directive ':::{dirName}' at line {openLine} cannot be used inside a quiz Markdown file.", ErrorType.Validation, Path: $"markdown:{openLine}");
+                    if (!string.IsNullOrWhiteSpace(posArg))
+                        return new Error("Markdown.InvalidDirectiveAttr", $"Directive ':::link' at line {openLine} does not accept positional arguments. Use ':::link{{id=\"...\" title=\"...\" image=\"...\"}}'.", ErrorType.Validation, Path: $"markdown:{openLine}");
+
+                    var attrCheck = ValidateDirectiveAttributes(attrs, AllowedLinkAttrs, "link", openLine, sourceLabel);
+                    if (!attrCheck.IsSuccess) return attrCheck.Error!;
+
+                    var bodyRes = ReadDirectiveBody(lines, ref i, openLine, sourceLabel, dirName, EmptySubSections);
+                    if (!bodyRes.IsSuccess) return bodyRes.Error!;
+
+                    var linkRes = ParseLinkDirective(openLine, sourceLabel, attrs, bodyRes.Value);
+                    if (!linkRes.IsSuccess) return linkRes.Error!;
+
+                    if (!seenLinkIds.Add(linkRes.Value.Id))
+                        return new Error("Markdown.DuplicateLinkId", $"Duplicate link card id '{linkRes.Value.Id}' at line {openLine} of '{sourceLabel}'.", ErrorType.Conflict, Path: $"markdown:{openLine}");
+
+                    FlushText();
+                    links.Add(linkRes.Value);
+                    continue;
+                }
+
                 return new Error(
                     "Markdown.UnknownFence",
-                    $"Unsupported fenced directive ':::{dirName}' at line {openLine} of '{sourceLabel}'. Supported fences: ':::callout', ':::pearl', ':::clinical', ':::warning', ':::table', ':::mcq', ':::flashcard', ':::fill-blank', ':::assertion-reason', ':::spot-error', ':::diff', ':::mechanism', ':::relabel'.",
+                    $"Unsupported fenced directive ':::{dirName}' at line {openLine} of '{sourceLabel}'. Supported fences: ':::callout', ':::pearl', ':::clinical', ':::warning', ':::table', ':::diagram-explore', ':::reveal', ':::link', ':::mcq', ':::flashcard', ':::fill-blank', ':::assertion-reason', ':::spot-error', ':::diff', ':::mechanism', ':::relabel', ':::case', ':::classify', ':::match', ':::numeric'.",
                     ErrorType.Validation,
                     Path: $"markdown:{openLine}",
-                    Hint: "Use ':::callout', ':::pearl', ':::clinical', ':::warning', ':::table', ':::mcq', ':::flashcard', ':::fill-blank', ':::assertion-reason', ':::spot-error', ':::diff', ':::mechanism', or ':::relabel'.");
+                    Hint: "Use ':::callout', ':::table', ':::diagram-explore', ':::reveal', ':::link', ':::mcq', ':::flashcard', ':::fill-blank', ':::assertion-reason', ':::spot-error', ':::diff', ':::mechanism', ':::relabel', ':::case', ':::classify', ':::match', or ':::numeric'.");
             }
 
             if (expectQuiz)
@@ -814,7 +1010,7 @@ internal static partial class MarkdownSpecParser
 
                 return new Error(
                     "Markdown.UnexpectedContentInQuiz",
-                    $"Unexpected text outside a question directive at line {i + 1} of '{sourceLabel}'. Wrap quiz items in ':::mcq', ':::flashcard', ':::fill-blank', ':::assertion-reason', ':::spot-error', ':::diff', ':::mechanism', or ':::relabel'.",
+                    $"Unexpected text outside a question directive at line {i + 1} of '{sourceLabel}'. Wrap quiz items in ':::mcq', ':::flashcard', ':::fill-blank', ':::assertion-reason', ':::spot-error', ':::diff', ':::mechanism', ':::relabel', ':::case', ':::classify', ':::match', or ':::numeric'.",
                     ErrorType.Validation,
                     Path: $"markdown:{i + 1}");
             }
@@ -854,12 +1050,12 @@ internal static partial class MarkdownSpecParser
             {
                 return new Error(
                     "Markdown.MixedContentNotAllowed",
-                    $"Markdown file '{sourceLabel}' mixes article content with quiz directives (':::mcq' / ':::flashcard' / ':::fill-blank' / ':::assertion-reason' / ':::spot-error' / ':::diff' / ':::mechanism'). Split articles and quizzes into separate files.",
+                    $"Markdown file '{sourceLabel}' mixes article content with quiz directives (':::mcq' / ':::flashcard' / ':::fill-blank' / ':::assertion-reason' / ':::spot-error' / ':::diff' / ':::mechanism' / ':::relabel' / ':::case' / ':::classify' / ':::match' / ':::numeric'). Split articles and quizzes into separate files.",
                     ErrorType.Validation);
             }
         }
 
-        return (blocks, questions, extractedHeading);
+        return (blocks, questions, extractedHeading, links.Count > 0 ? links : null);
     }
 
     private static Result<(string Name, Dictionary<string, string> Attrs, string? PositionalArg)> ParseDirectiveHeader(
@@ -1280,9 +1476,9 @@ internal static partial class MarkdownSpecParser
                 isCorrect));
         }
 
-        string? explanation = body.SubSections.TryGetValue("explanation", out var rawExp) && !string.IsNullOrWhiteSpace(rawExp)
-            ? rawExp
-            : null;
+        var expRes = ResolveExplanation(attrs, body, openLine, sourceLabel);
+        if (!expRes.IsSuccess) return expRes.Error!;
+        string? explanation = expRes.Value;
 
         Dictionary<string, string>? layoutOverrides = null;
         if (body.SubSections.TryGetValue("layout", out var rawLayout))
@@ -1495,14 +1691,17 @@ internal static partial class MarkdownSpecParser
                 return new Error("Markdown.InvalidDirectiveAttr", $"Invalid boolean '{rawCs}' for 'caseSensitive' on ':::fill-blank' at line {openLine} of '{sourceLabel}'. Use 'true' or 'false'.", ErrorType.Validation, Path: $"markdown:{openLine}");
         }
 
+        attrs.TryGetValue("placeholder", out var rawPlaceholder);
+        var placeholder = string.IsNullOrWhiteSpace(rawPlaceholder) ? null : rawPlaceholder.Trim();
+
         var template = body.MainBody.Trim();
         var slotsRes = Phase1PayloadRules.ParseFillBlankTemplate(template);
         if (!slotsRes.IsSuccess)
             return new Error("Markdown.InvalidFillBlank", $"Invalid ':::fill-blank' at line {openLine} of '{sourceLabel}': {slotsRes.Error!.Description}", ErrorType.Validation, Path: $"markdown:{openLine}");
 
-        string? explanation = body.SubSections.TryGetValue("explanation", out var rawExp) && !string.IsNullOrWhiteSpace(rawExp)
-            ? rawExp
-            : null;
+        var expRes = ResolveExplanation(attrs, body, openLine, sourceLabel);
+        if (!expRes.IsSuccess) return expRes.Error!;
+        string? explanation = expRes.Value;
 
         Dictionary<string, string>? layoutOverrides = null;
         if (body.SubSections.TryGetValue("layout", out var rawLayout))
@@ -1512,7 +1711,7 @@ internal static partial class MarkdownSpecParser
             layoutOverrides = layoutRes.Value;
         }
 
-        var payload = new FillBlankPayload(template, slotsRes.Value, fuzzy, caseSensitive, explanation);
+        var payload = new FillBlankPayload(template, slotsRes.Value, fuzzy, caseSensitive, explanation, placeholder);
         return new JsonQuestionSpec(
             Type: "fill-blank",
             Text: null,
@@ -1596,9 +1795,9 @@ internal static partial class MarkdownSpecParser
         if (string.IsNullOrWhiteSpace(assertion) || string.IsNullOrWhiteSpace(reason))
             return new Error("Markdown.InvalidAssertionReason", $"':::assertion-reason' at line {openLine} of '{sourceLabel}' requires both non-empty 'A:' and 'R:' statements.", ErrorType.Validation, Path: $"markdown:{openLine}");
 
-        string? explanation = body.SubSections.TryGetValue("explanation", out var rawExp) && !string.IsNullOrWhiteSpace(rawExp)
-            ? rawExp
-            : null;
+        var expRes = ResolveExplanation(attrs, body, openLine, sourceLabel);
+        if (!expRes.IsSuccess) return expRes.Error!;
+        string? explanation = expRes.Value;
 
         Dictionary<string, string>? layoutOverrides = null;
         if (body.SubSections.TryGetValue("layout", out var rawLayout))
@@ -1656,7 +1855,45 @@ internal static partial class MarkdownSpecParser
         if (noError && !allowNoError)
             return new Error("Markdown.InvalidSpotError", $"':::spot-error' at line {openLine} of '{sourceLabel}' cannot set 'noError=true' with 'allowNoError=false'.", ErrorType.Validation, Path: $"markdown:{openLine}");
 
-        var template = body.MainBody.Trim();
+        bool hasImageAttr = attrs.TryGetValue("image", out var attrImg);
+        bool hasImagePathAttr = attrs.TryGetValue("imagePath", out var attrImgPath);
+        if (hasImageAttr && hasImagePathAttr)
+            return new Error("Markdown.InvalidDirectiveAttr", $"Specify either 'image' or 'imagePath' on ':::spot-error' at line {openLine} of '{sourceLabel}', not both.", ErrorType.Validation, Path: $"markdown:{openLine}");
+
+        string? imagePath = hasImageAttr ? attrImg : attrImgPath;
+        if (string.IsNullOrWhiteSpace(imagePath)) imagePath = null;
+
+        var templateLines = new List<string>();
+        string? codeFence = null;
+        foreach (var rawLine in body.MainBody.Split('\n'))
+        {
+            var trimmedLine = rawLine.Trim();
+            if (codeFence is null && TryOpenCodeFence(trimmedLine, out var token))
+            {
+                codeFence = token;
+                templateLines.Add(rawLine);
+                continue;
+            }
+            if (codeFence is not null)
+            {
+                templateLines.Add(rawLine);
+                if (IsCloseCodeFence(trimmedLine, codeFence))
+                    codeFence = null;
+                continue;
+            }
+            if (TryParseStandaloneImage(trimmedLine, out _, out var imgPath, out _))
+            {
+                if (imagePath is not null)
+                    return new Error("Markdown.InvalidSpotError", $"':::spot-error' at line {openLine} of '{sourceLabel}' specifies multiple images. Keep only one image (attribute or standalone image line).", ErrorType.Validation, Path: $"markdown:{openLine}");
+                imagePath = imgPath;
+            }
+            else
+            {
+                templateLines.Add(rawLine);
+            }
+        }
+
+        var template = string.Join('\n', templateLines).Trim();
         var segsRes = Phase1PayloadRules.ParseSpotErrorTemplate(template);
         if (!segsRes.IsSuccess)
             return new Error("Markdown.InvalidSpotError", $"Invalid ':::spot-error' at line {openLine} of '{sourceLabel}': {segsRes.Error!.Description}", ErrorType.Validation, Path: $"markdown:{openLine}");
@@ -1670,9 +1907,9 @@ internal static partial class MarkdownSpecParser
         if (!noError && errorCount == 0)
             return new Error("Markdown.InvalidSpotError", $"':::spot-error' at line {openLine} of '{sourceLabel}' must mark at least one error span '[~~wrong~~ -> right]' or set 'noError=true'.", ErrorType.Validation, Path: $"markdown:{openLine}");
 
-        string? explanation = body.SubSections.TryGetValue("explanation", out var rawExp) && !string.IsNullOrWhiteSpace(rawExp)
-            ? rawExp
-            : null;
+        var expRes = ResolveExplanation(attrs, body, openLine, sourceLabel);
+        if (!expRes.IsSuccess) return expRes.Error!;
+        string? explanation = expRes.Value;
 
         Dictionary<string, string>? layoutOverrides = null;
         if (body.SubSections.TryGetValue("layout", out var rawLayout))
@@ -1682,7 +1919,7 @@ internal static partial class MarkdownSpecParser
             layoutOverrides = layoutRes.Value;
         }
 
-        var payload = new SpotErrorPayload(template, segsRes.Value, requireFix, allowNoError, noError, explanation);
+        var payload = new SpotErrorPayload(template, segsRes.Value, requireFix, allowNoError, noError, explanation, imagePath);
         return new JsonQuestionSpec(
             Type: "spot-error",
             Text: null,
@@ -1692,10 +1929,73 @@ internal static partial class MarkdownSpecParser
             Front: null,
             Back: null,
             LayoutOverrides: layoutOverrides,
-            ImagePath: null,
+            ImagePath: imagePath,
             Explanation: explanation,
             Ref: string.IsNullOrWhiteSpace(refKey) ? null : refKey,
             PayloadJson: Phase1PayloadCodec.Serialize(payload));
+    }
+
+    private static Result<DeclarativeLinkCardSpec> ParseLinkDirective(
+        int openLine,
+        string sourceLabel,
+        Dictionary<string, string> attrs,
+        ParsedDirectiveBody body)
+    {
+        if (!attrs.TryGetValue("id", out var rawId) || string.IsNullOrWhiteSpace(rawId))
+            return new Error("Markdown.InvalidDirectiveAttr", $"':::link' at line {openLine} of '{sourceLabel}' requires a non-empty 'id' attribute.", ErrorType.Validation, Path: $"markdown:{openLine}");
+
+        var idRes = ArticleLinkRules.ValidateAndNormalizeCardId(rawId);
+        if (!idRes.IsSuccess || string.IsNullOrWhiteSpace(idRes.Value))
+            return idRes.Error ?? new Error("Markdown.InvalidDirectiveAttr", $"Invalid link card id '{rawId}' at line {openLine} of '{sourceLabel}'.", ErrorType.Validation, Path: $"markdown:{openLine}");
+
+        attrs.TryGetValue("title", out var rawTitle);
+        bool hasImageAttr = attrs.TryGetValue("image", out var attrImg);
+        bool hasImagePathAttr = attrs.TryGetValue("imagePath", out var attrImgPath);
+        if (hasImageAttr && hasImagePathAttr)
+            return new Error("Markdown.InvalidDirectiveAttr", $"Specify either 'image' or 'imagePath' on ':::link' at line {openLine} of '{sourceLabel}', not both.", ErrorType.Validation, Path: $"markdown:{openLine}");
+
+        string? imagePath = hasImageAttr ? attrImg : attrImgPath;
+        if (string.IsNullOrWhiteSpace(imagePath)) imagePath = null;
+
+        var textLines = new List<string>();
+        string? codeFence = null;
+        foreach (var rawLine in body.MainBody.Split('\n'))
+        {
+            var trimmedLine = rawLine.Trim();
+            if (codeFence is null && TryOpenCodeFence(trimmedLine, out var token))
+            {
+                codeFence = token;
+                textLines.Add(rawLine);
+                continue;
+            }
+            if (codeFence is not null)
+            {
+                textLines.Add(rawLine);
+                if (IsCloseCodeFence(trimmedLine, codeFence))
+                    codeFence = null;
+                continue;
+            }
+            if (TryParseStandaloneImage(trimmedLine, out _, out var imgPath, out _))
+            {
+                if (imagePath is not null)
+                    return new Error("Markdown.InvalidLink", $"':::link' at line {openLine} of '{sourceLabel}' specifies multiple images; at most one image is supported.", ErrorType.Validation, Path: $"markdown:{openLine}");
+                imagePath = imgPath;
+            }
+            else
+            {
+                textLines.Add(rawLine);
+            }
+        }
+
+        var text = string.Join('\n', textLines).Trim();
+        if (string.IsNullOrWhiteSpace(text) && string.IsNullOrWhiteSpace(imagePath))
+            return new Error("Markdown.InvalidLink", $"':::link' '{idRes.Value}' at line {openLine} of '{sourceLabel}' must contain text, an image, or both.", ErrorType.Validation, Path: $"markdown:{openLine}");
+
+        return new DeclarativeLinkCardSpec(
+            idRes.Value,
+            string.IsNullOrWhiteSpace(rawTitle) ? null : rawTitle.Trim(),
+            string.IsNullOrWhiteSpace(text) ? null : text,
+            imagePath);
     }
 
     private static Result<JsonQuestionSpec> ParseDiffDirective(
@@ -1747,9 +2047,9 @@ internal static partial class MarkdownSpecParser
         if (mode == "spot-wrong" && !allowNoError && specialRes.Value.Count(c => c.IsError) == 0)
             return new Error("Markdown.InvalidDiff", $"':::diff{{mode=\"spot-wrong\"}}' at line {openLine} of '{sourceLabel}' must mark at least one '~~wrong~~ -> correction' cell or set 'allowNoError=true'.", ErrorType.Validation, Path: $"markdown:{openLine}");
 
-        string? explanation = body.SubSections.TryGetValue("explanation", out var rawExp) && !string.IsNullOrWhiteSpace(rawExp)
-            ? rawExp
-            : null;
+        var expRes = ResolveExplanation(attrs, body, openLine, sourceLabel);
+        if (!expRes.IsSuccess) return expRes.Error!;
+        string? explanation = expRes.Value;
 
         Dictionary<string, string>? layoutOverrides = null;
         if (body.SubSections.TryGetValue("layout", out var rawLayout))
@@ -1811,9 +2111,9 @@ internal static partial class MarkdownSpecParser
                 return new Error("Markdown.InvalidMechanism", $"':::mechanism' at line {openLine} of '{sourceLabel}' contains duplicate step text '{step.Text.Trim()}'.", ErrorType.Validation, Path: $"markdown:{openLine}");
         }
 
-        string? explanation = body.SubSections.TryGetValue("explanation", out var rawExp) && !string.IsNullOrWhiteSpace(rawExp)
-            ? rawExp
-            : null;
+        var expRes = ResolveExplanation(attrs, body, openLine, sourceLabel);
+        if (!expRes.IsSuccess) return expRes.Error!;
+        string? explanation = expRes.Value;
 
         Dictionary<string, string>? layoutOverrides = null;
         if (body.SubSections.TryGetValue("layout", out var rawLayout))
@@ -2093,9 +2393,9 @@ internal static partial class MarkdownSpecParser
         if (include is { Count: > 0 } && masksPath is null)
             return new Error("Markdown.InvalidRelabel", $"':::relabel' at line {openLine} of '{sourceLabel}' can only use 'include:' with a 'masks'/'masksPath' sidecar.", ErrorType.Validation, Path: $"markdown:{openLine}");
 
-        string? explanation = body.SubSections.TryGetValue("explanation", out var rawExp) && !string.IsNullOrWhiteSpace(rawExp)
-            ? rawExp
-            : null;
+        var expRes = ResolveExplanation(attrs, body, openLine, sourceLabel);
+        if (!expRes.IsSuccess) return expRes.Error!;
+        string? explanation = expRes.Value;
 
         Dictionary<string, string>? layoutOverrides = null;
         if (body.SubSections.TryGetValue("layout", out var rawLayout))
@@ -2131,6 +2431,630 @@ internal static partial class MarkdownSpecParser
             Explanation: explanation,
             Ref: string.IsNullOrWhiteSpace(refKey) ? null : refKey,
             PayloadJson: Phase1PayloadCodec.Serialize(payload));
+    }
+
+    private static Result<string?> ResolveExplanation(
+        Dictionary<string, string> attrs,
+        ParsedDirectiveBody body,
+        int openLine,
+        string sourceLabel)
+    {
+        bool hasAttr = attrs.TryGetValue("explanation", out var rawAttr) && !string.IsNullOrWhiteSpace(rawAttr);
+        bool hasSection = body.SubSections.TryGetValue("explanation", out var rawSec) && !string.IsNullOrWhiteSpace(rawSec);
+        if (hasAttr && hasSection)
+        {
+            return new Error(
+                "Markdown.DuplicateSubSection",
+                $"Directive at line {openLine} of '{sourceLabel}' specifies both explanation=\"...\" attribute and ':::explanation' sub-section. Use only one.",
+                ErrorType.Validation,
+                Path: $"markdown:{openLine}");
+        }
+        return hasSection ? rawSec!.Trim() : (hasAttr ? rawAttr!.Trim() : (string?)null);
+    }
+
+    private static Result<DeclarativeArticleBlockSpec> ParseDiagramExploreDirective(
+        int openLine,
+        string sourceLabel,
+        Dictionary<string, string> attrs,
+        ParsedDirectiveBody body)
+    {
+        attrs.TryGetValue("ref", out var refKey);
+        attrs.TryGetValue("title", out var title);
+        attrs.TryGetValue("caption", out var caption);
+        attrs.TryGetValue("alt", out var alt);
+
+        bool hasImage = attrs.TryGetValue("image", out var rawImage) && !string.IsNullOrWhiteSpace(rawImage);
+        bool hasImagePath = attrs.TryGetValue("imagePath", out var rawImagePath) && !string.IsNullOrWhiteSpace(rawImagePath);
+        if (hasImage && hasImagePath)
+            return new Error("Markdown.InvalidDirectiveAttr", $"':::diagram-explore' at line {openLine} of '{sourceLabel}' cannot specify both 'image' and 'imagePath'.", ErrorType.Validation, Path: $"markdown:{openLine}");
+        if (!hasImage && !hasImagePath)
+            return new Error("Markdown.InvalidDirectiveAttr", $"':::diagram-explore' at line {openLine} of '{sourceLabel}' requires an 'image' (or 'imagePath') attribute.", ErrorType.Validation, Path: $"markdown:{openLine}");
+        var imagePath = (hasImage ? rawImage! : rawImagePath!).Trim();
+
+        bool hasMasks = attrs.TryGetValue("masks", out var rawMasks) && !string.IsNullOrWhiteSpace(rawMasks);
+        bool hasMasksPath = attrs.TryGetValue("masksPath", out var rawMasksPath) && !string.IsNullOrWhiteSpace(rawMasksPath);
+        if (hasMasks && hasMasksPath)
+            return new Error("Markdown.InvalidDirectiveAttr", $"':::diagram-explore' at line {openLine} of '{sourceLabel}' cannot specify both 'masks' and 'masksPath'.", ErrorType.Validation, Path: $"markdown:{openLine}");
+        string? masksPath = hasMasks ? rawMasks!.Trim() : (hasMasksPath ? rawMasksPath!.Trim() : null);
+
+        List<DiagramHotspot> hotspots;
+        if (masksPath is not null)
+        {
+            if (body.MainBody.Replace("\r\n", "\n").Split('\n').Any(l => l.TrimStart().StartsWith("boxes:", StringComparison.OrdinalIgnoreCase)))
+                return new Error("Markdown.InvalidDiagramExplore", $"':::diagram-explore' at line {openLine} of '{sourceLabel}' cannot combine 'masks' sidecar with inline 'boxes:'. Use '- Label: Annotation Markdown' bullets instead.", ErrorType.Validation, Path: $"markdown:{openLine}");
+
+            var annRes = Phase3PayloadRules.ParseDiagramHotspotAnnotations(body.MainBody);
+            if (!annRes.IsSuccess)
+                return new Error("Markdown.InvalidDiagramExplore", $"Invalid ':::diagram-explore' at line {openLine} of '{sourceLabel}': {annRes.Error!.Description}", ErrorType.Validation, Path: $"markdown:{openLine}");
+
+            hotspots = annRes.Value.Select((a, idx) => new DiagramHotspot(idx, a.Label, a.Note, 0, 0, 0, 0)).ToList();
+        }
+        else
+        {
+            var inlineRes = ParseInlineDiagramHotspotsYaml(body.MainBody, openLine, sourceLabel);
+            if (!inlineRes.IsSuccess) return inlineRes.Error!;
+            hotspots = inlineRes.Value;
+        }
+
+        var payload = new DiagramExplorePayload(
+            imagePath,
+            string.IsNullOrWhiteSpace(title) ? null : title.Trim(),
+            string.IsNullOrWhiteSpace(caption) ? null : caption.Trim(),
+            hotspots,
+            masksPath);
+
+        return new DeclarativeArticleBlockSpec(
+            "diagram-explore",
+            null,
+            imagePath,
+            Ref: string.IsNullOrWhiteSpace(refKey) ? null : refKey,
+            Caption: string.IsNullOrWhiteSpace(caption) ? null : caption.Trim(),
+            Alt: string.IsNullOrWhiteSpace(alt) ? null : alt.Trim(),
+            Title: string.IsNullOrWhiteSpace(title) ? null : title.Trim(),
+            PayloadJson: Phase1PayloadCodec.Serialize(payload));
+    }
+
+    private static Result<List<DiagramHotspot>> ParseInlineDiagramHotspotsYaml(string rawBody, int openLine, string sourceLabel)
+    {
+        var lines = rawBody.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+        bool inBoxes = false;
+        var hotspots = new List<DiagramHotspot>();
+        bool hasCur = false;
+        string? curLabel = null, curNote = null;
+        double? curX = null, curY = null, curW = null, curH = null;
+
+        Result FlushCur()
+        {
+            if (!hasCur) return Result.Success();
+            if (string.IsNullOrWhiteSpace(curLabel))
+                return new Error("Markdown.InvalidDiagramExplore", $"':::diagram-explore' at line {openLine} of '{sourceLabel}' has a box missing 'label'.", ErrorType.Validation, Path: $"markdown:{openLine}");
+            if (string.IsNullOrWhiteSpace(curNote))
+                return new Error("Markdown.InvalidDiagramExplore", $"':::diagram-explore' at line {openLine} of '{sourceLabel}' box '{curLabel}' is missing 'note'.", ErrorType.Validation, Path: $"markdown:{openLine}");
+            if (!curX.HasValue || !curY.HasValue || !curW.HasValue || !curH.HasValue)
+                return new Error("Markdown.InvalidDiagramExplore", $"':::diagram-explore' at line {openLine} of '{sourceLabel}' box '{curLabel}' is missing 'rect: [x,y,w,h]' or x/y/w/h.", ErrorType.Validation, Path: $"markdown:{openLine}");
+            if (!Phase3PayloadRules.HasValidHotspotBounds(curX.Value, curY.Value, curW.Value, curH.Value))
+                return new Error("Markdown.InvalidDiagramExplore", $"':::diagram-explore' at line {openLine} of '{sourceLabel}' box '{curLabel}' has out-of-bounds coordinates.", ErrorType.Validation, Path: $"markdown:{openLine}");
+            hotspots.Add(new DiagramHotspot(hotspots.Count, curLabel.Trim(), curNote.Trim(), curX.Value, curY.Value, curW.Value, curH.Value));
+            hasCur = false; curLabel = null; curNote = null; curX = curY = curW = curH = null;
+            return Result.Success();
+        }
+
+        foreach (var rawLine in lines)
+        {
+            var trimmed = rawLine.Trim();
+            if (string.IsNullOrWhiteSpace(trimmed) || trimmed.StartsWith('#')) continue;
+
+            if (!inBoxes)
+            {
+                var col = trimmed.IndexOf(':');
+                if (col <= 0)
+                    return new Error("Markdown.InvalidDiagramExplore", $"':::diagram-explore' without 'masks=' requires YAML 'boxes:' at line {openLine} of '{sourceLabel}'.", ErrorType.Validation, Path: $"markdown:{openLine}");
+                var k = trimmed[..col].Trim().ToLowerInvariant();
+                if (k != "boxes")
+                    return new Error("Markdown.InvalidDiagramExplore", $"Unknown YAML key '{k}' in ':::diagram-explore' at line {openLine}. Use 'boxes:' when 'masks' is omitted.", ErrorType.Validation, Path: $"markdown:{openLine}");
+                inBoxes = true;
+                continue;
+            }
+
+            if (trimmed.StartsWith("- ", StringComparison.Ordinal))
+            {
+                var fl = FlushCur();
+                if (!fl.IsSuccess) return fl.Error!;
+                hasCur = true;
+                trimmed = trimmed[2..].Trim();
+                if (string.IsNullOrWhiteSpace(trimmed)) continue;
+            }
+            else if (!hasCur)
+            {
+                return new Error("Markdown.InvalidDiagramExplore", $"Expected '- label: ...' under 'boxes:' in ':::diagram-explore' at line {openLine} of '{sourceLabel}'.", ErrorType.Validation, Path: $"markdown:{openLine}");
+            }
+
+            var cIdx = trimmed.IndexOf(':');
+            if (cIdx <= 0)
+                return new Error("Markdown.InvalidDiagramExplore", $"Invalid box entry line '{trimmed}' in ':::diagram-explore' at line {openLine}.", ErrorType.Validation, Path: $"markdown:{openLine}");
+
+            var bKey = trimmed[..cIdx].Trim().ToLowerInvariant();
+            var bVal = trimmed[(cIdx + 1)..].Trim();
+            switch (bKey)
+            {
+                case "label":
+                    curLabel = UnquoteYamlScalar(bVal);
+                    break;
+                case "note":
+                    curNote = UnquoteYamlScalar(bVal);
+                    break;
+                case "rect":
+                    var inner = bVal.Trim();
+                    if (!inner.StartsWith('[') || !inner.EndsWith(']'))
+                        return new Error("Markdown.InvalidDiagramExplore", $"Invalid 'rect' syntax '{bVal}' in ':::diagram-explore' at line {openLine}.", ErrorType.Validation, Path: $"markdown:{openLine}");
+                    var parts = SplitRespectingQuotes(inner[1..^1], ',');
+                    if (parts.Count != 4 ||
+                        !double.TryParse(parts[0].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var rx) ||
+                        !double.TryParse(parts[1].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var ry) ||
+                        !double.TryParse(parts[2].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var rw) ||
+                        !double.TryParse(parts[3].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var rh))
+                        return new Error("Markdown.InvalidDiagramExplore", $"Invalid 'rect' numbers '{bVal}' in ':::diagram-explore' at line {openLine}.", ErrorType.Validation, Path: $"markdown:{openLine}");
+                    curX = rx; curY = ry; curW = rw; curH = rh;
+                    break;
+                case "x":
+                    if (!double.TryParse(bVal, NumberStyles.Float, CultureInfo.InvariantCulture, out var vx))
+                        return new Error("Markdown.InvalidDiagramExplore", $"Invalid 'x' '{bVal}' in ':::diagram-explore' at line {openLine}.", ErrorType.Validation);
+                    curX = vx;
+                    break;
+                case "y":
+                    if (!double.TryParse(bVal, NumberStyles.Float, CultureInfo.InvariantCulture, out var vy))
+                        return new Error("Markdown.InvalidDiagramExplore", $"Invalid 'y' '{bVal}' in ':::diagram-explore' at line {openLine}.", ErrorType.Validation);
+                    curY = vy;
+                    break;
+                case "w":
+                    if (!double.TryParse(bVal, NumberStyles.Float, CultureInfo.InvariantCulture, out var vw))
+                        return new Error("Markdown.InvalidDiagramExplore", $"Invalid 'w' '{bVal}' in ':::diagram-explore' at line {openLine}.", ErrorType.Validation);
+                    curW = vw;
+                    break;
+                case "h":
+                    if (!double.TryParse(bVal, NumberStyles.Float, CultureInfo.InvariantCulture, out var vh))
+                        return new Error("Markdown.InvalidDiagramExplore", $"Invalid 'h' '{bVal}' in ':::diagram-explore' at line {openLine}.", ErrorType.Validation);
+                    curH = vh;
+                    break;
+                default:
+                    return new Error("Markdown.InvalidDiagramExplore", $"Unknown box key '{bKey}' in ':::diagram-explore' at line {openLine}. Allowed: label, note, rect, x, y, w, h.", ErrorType.Validation, Path: $"markdown:{openLine}");
+            }
+        }
+
+        var endFlush = FlushCur();
+        if (!endFlush.IsSuccess) return endFlush.Error!;
+        if (hotspots.Count == 0)
+            return new Error("Markdown.InvalidDiagramExplore", $"':::diagram-explore' at line {openLine} of '{sourceLabel}' must define at least 1 hotspot.", ErrorType.Validation, Path: $"markdown:{openLine}");
+        return hotspots;
+    }
+
+    private static Result<DeclarativeArticleBlockSpec> ParseRevealDirective(
+        int openLine,
+        string sourceLabel,
+        Dictionary<string, string> attrs,
+        ParsedDirectiveBody body)
+    {
+        attrs.TryGetValue("ref", out var refKey);
+        attrs.TryGetValue("title", out var title);
+        bool showFirst = false;
+        if (attrs.TryGetValue("showFirst", out var rawShowFirst) && !string.IsNullOrWhiteSpace(rawShowFirst) && !bool.TryParse(rawShowFirst, out showFirst))
+            return new Error("Markdown.InvalidDirectiveAttr", $"Invalid boolean '{rawShowFirst}' for 'showFirst' on ':::reveal' at line {openLine} of '{sourceLabel}'.", ErrorType.Validation, Path: $"markdown:{openLine}");
+
+        var stepsRes = Phase3PayloadRules.ParseRevealSteps(body.MainBody);
+        if (!stepsRes.IsSuccess)
+            return new Error("Markdown.InvalidReveal", $"Invalid ':::reveal' at line {openLine} of '{sourceLabel}': {stepsRes.Error!.Description}", ErrorType.Validation, Path: $"markdown:{openLine}");
+
+        var payload = new RevealBlockPayload(
+            string.IsNullOrWhiteSpace(title) ? null : title.Trim(),
+            showFirst,
+            stepsRes.Value);
+
+        return new DeclarativeArticleBlockSpec(
+            "reveal",
+            null,
+            null,
+            Ref: string.IsNullOrWhiteSpace(refKey) ? null : refKey,
+            Title: string.IsNullOrWhiteSpace(title) ? null : title.Trim(),
+            PayloadJson: Phase1PayloadCodec.Serialize(payload));
+    }
+
+    private static Result<JsonQuestionSpec> ParseClassifyDirective(
+        int openLine,
+        string sourceLabel,
+        Dictionary<string, string> attrs,
+        ParsedDirectiveBody body)
+    {
+        attrs.TryGetValue("ref", out var refKey);
+        attrs.TryGetValue("title", out var title);
+
+        var expRes = ResolveExplanation(attrs, body, openLine, sourceLabel);
+        if (!expRes.IsSuccess) return expRes.Error!;
+
+        var parsed = Phase3PayloadRules.ParseClassifyLines(body.MainBody, title, expRes.Value);
+        if (!parsed.IsSuccess)
+            return new Error("Markdown.InvalidClassify", $"Invalid ':::classify' at line {openLine} of '{sourceLabel}': {parsed.Error!.Description}", ErrorType.Validation, Path: $"markdown:{openLine}");
+
+        Dictionary<string, string>? layoutOverrides = null;
+        if (body.SubSections.TryGetValue("layout", out var rawLayout))
+        {
+            var layoutRes = ParseLayoutSubSection(rawLayout, openLine, sourceLabel);
+            if (!layoutRes.IsSuccess) return layoutRes.Error!;
+            layoutOverrides = layoutRes.Value;
+        }
+
+        return new JsonQuestionSpec(
+            Type: "classify",
+            Text: null,
+            MaxOptions: null,
+            IsMultiCorrect: false,
+            Options: [],
+            Front: null,
+            Back: null,
+            LayoutOverrides: layoutOverrides,
+            ImagePath: null,
+            Explanation: expRes.Value,
+            Ref: string.IsNullOrWhiteSpace(refKey) ? null : refKey,
+            PayloadJson: Phase1PayloadCodec.Serialize(parsed.Value));
+    }
+
+    private static Result<JsonQuestionSpec> ParseMatchDirective(
+        int openLine,
+        string sourceLabel,
+        Dictionary<string, string> attrs,
+        ParsedDirectiveBody body)
+    {
+        attrs.TryGetValue("ref", out var refKey);
+        attrs.TryGetValue("title", out var title);
+
+        var expRes = ResolveExplanation(attrs, body, openLine, sourceLabel);
+        if (!expRes.IsSuccess) return expRes.Error!;
+
+        var parsed = Phase3PayloadRules.ParseMatchLines(body.MainBody, title, expRes.Value);
+        if (!parsed.IsSuccess)
+            return new Error("Markdown.InvalidMatch", $"Invalid ':::match' at line {openLine} of '{sourceLabel}': {parsed.Error!.Description}", ErrorType.Validation, Path: $"markdown:{openLine}");
+
+        Dictionary<string, string>? layoutOverrides = null;
+        if (body.SubSections.TryGetValue("layout", out var rawLayout))
+        {
+            var layoutRes = ParseLayoutSubSection(rawLayout, openLine, sourceLabel);
+            if (!layoutRes.IsSuccess) return layoutRes.Error!;
+            layoutOverrides = layoutRes.Value;
+        }
+
+        return new JsonQuestionSpec(
+            Type: "match",
+            Text: null,
+            MaxOptions: null,
+            IsMultiCorrect: false,
+            Options: [],
+            Front: null,
+            Back: null,
+            LayoutOverrides: layoutOverrides,
+            ImagePath: null,
+            Explanation: expRes.Value,
+            Ref: string.IsNullOrWhiteSpace(refKey) ? null : refKey,
+            PayloadJson: Phase1PayloadCodec.Serialize(parsed.Value));
+    }
+
+    private static Result<JsonQuestionSpec> ParseNumericDirective(
+        int openLine,
+        string sourceLabel,
+        Dictionary<string, string> attrs,
+        ParsedDirectiveBody body)
+    {
+        attrs.TryGetValue("ref", out var refKey);
+        attrs.TryGetValue("unit", out var unit);
+        attrs.TryGetValue("placeholder", out var placeholder);
+        attrs.TryGetValue("toleranceMode", out var tolModeAttr);
+
+        if (!attrs.TryGetValue("answer", out var rawAns) || string.IsNullOrWhiteSpace(rawAns))
+            return new Error("Markdown.InvalidDirectiveAttr", $"':::numeric' at line {openLine} of '{sourceLabel}' requires an 'answer' attribute.", ErrorType.Validation, Path: $"markdown:{openLine}");
+        if (!double.TryParse(rawAns.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var ansVal) || !double.IsFinite(ansVal))
+            return new Error("Markdown.InvalidDirectiveAttr", $"Invalid numeric 'answer' '{rawAns}' on ':::numeric' at line {openLine} of '{sourceLabel}'.", ErrorType.Validation, Path: $"markdown:{openLine}");
+
+        attrs.TryGetValue("tolerance", out var rawTol);
+        if (!Phase3PayloadRules.TryParseToleranceSpec(rawTol, tolModeAttr, out var tolVal, out var tolMode))
+            return new Error("Markdown.InvalidDirectiveAttr", $"Invalid 'tolerance'/'toleranceMode' on ':::numeric' at line {openLine} of '{sourceLabel}'.", ErrorType.Validation, Path: $"markdown:{openLine}");
+
+        bool hasImageAttr = attrs.TryGetValue("image", out var attrImg) && !string.IsNullOrWhiteSpace(attrImg);
+        bool hasImagePathAttr = attrs.TryGetValue("imagePath", out var attrImgPath) && !string.IsNullOrWhiteSpace(attrImgPath);
+        if (hasImageAttr && hasImagePathAttr)
+            return new Error("Markdown.InvalidDirectiveAttr", $"':::numeric' at line {openLine} cannot specify both 'image' and 'imagePath'.", ErrorType.Validation, Path: $"markdown:{openLine}");
+        string? imagePath = hasImageAttr ? attrImg!.Trim() : (hasImagePathAttr ? attrImgPath!.Trim() : null);
+
+        var promptLines = new List<string>();
+        string? codeFence = null;
+        foreach (var rawLine in body.MainBody.Replace("\r\n", "\n").Split('\n'))
+        {
+            var trimmed = rawLine.Trim();
+            if (codeFence is null && TryOpenCodeFence(trimmed, out var token))
+            {
+                codeFence = token;
+                promptLines.Add(rawLine);
+                continue;
+            }
+            if (codeFence is not null)
+            {
+                promptLines.Add(rawLine);
+                if (IsCloseCodeFence(trimmed, codeFence)) codeFence = null;
+                continue;
+            }
+
+            if (TryParseStandaloneImage(trimmed, out _, out var imgLinePath, out _))
+            {
+                if (imagePath is not null)
+                    return new Error("Markdown.InvalidNumeric", $"':::numeric' at line {openLine} of '{sourceLabel}' specifies multiple images.", ErrorType.Validation, Path: $"markdown:{openLine}");
+                imagePath = imgLinePath;
+            }
+            else
+            {
+                promptLines.Add(rawLine);
+            }
+        }
+
+        var prompt = string.Join('\n', promptLines).Trim();
+        var expRes = ResolveExplanation(attrs, body, openLine, sourceLabel);
+        if (!expRes.IsSuccess) return expRes.Error!;
+
+        Dictionary<string, string>? layoutOverrides = null;
+        if (body.SubSections.TryGetValue("layout", out var rawLayout))
+        {
+            var layoutRes = ParseLayoutSubSection(rawLayout, openLine, sourceLabel);
+            if (!layoutRes.IsSuccess) return layoutRes.Error!;
+            layoutOverrides = layoutRes.Value;
+        }
+
+        var payload = new NumericPayload(
+            prompt,
+            ansVal,
+            tolVal,
+            tolMode,
+            string.IsNullOrWhiteSpace(unit) ? null : unit.Trim(),
+            string.IsNullOrWhiteSpace(placeholder) ? null : placeholder.Trim(),
+            expRes.Value,
+            imagePath);
+
+        return new JsonQuestionSpec(
+            Type: "numeric",
+            Text: null,
+            MaxOptions: null,
+            IsMultiCorrect: false,
+            Options: [],
+            Front: null,
+            Back: null,
+            LayoutOverrides: layoutOverrides,
+            ImagePath: null,
+            Explanation: expRes.Value,
+            Ref: string.IsNullOrWhiteSpace(refKey) ? null : refKey,
+            PayloadJson: Phase1PayloadCodec.Serialize(payload));
+    }
+
+    private sealed record ParsedCaseBody(
+        string StemRaw,
+        List<string> ChildDirectiveDocs,
+        Dictionary<string, string> SubSections);
+
+    private static Result<ParsedCaseBody> ReadCaseDirectiveBody(
+        string[] lines,
+        ref int lineIdx,
+        int openLine,
+        string sourceLabel)
+    {
+        var stemBuffer = new StringBuilder();
+        var subSections = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var childDocs = new List<string>();
+        var currentSectionBuffer = stemBuffer;
+        string? activeSection = null;
+        StringBuilder? activeChildBuffer = null;
+        string? innerCodeFence = null;
+        bool closed = false;
+
+        for (lineIdx = lineIdx + 1; lineIdx < lines.Length; lineIdx++)
+        {
+            var innerLine = lines[lineIdx];
+            var innerTrim = innerLine.Trim();
+
+            if (innerCodeFence is null && TryOpenCodeFence(innerTrim, out var innerToken))
+            {
+                innerCodeFence = innerToken;
+                (activeChildBuffer ?? currentSectionBuffer).AppendLine(innerLine);
+                continue;
+            }
+            if (innerCodeFence is not null)
+            {
+                (activeChildBuffer ?? currentSectionBuffer).AppendLine(innerLine);
+                if (IsCloseCodeFence(innerTrim, innerCodeFence))
+                    innerCodeFence = null;
+                continue;
+            }
+
+            if (activeChildBuffer is not null)
+            {
+                if (innerTrim == "::::")
+                {
+                    activeChildBuffer.AppendLine(":::");
+                    childDocs.Add(activeChildBuffer.ToString());
+                    activeChildBuffer = null;
+                    continue;
+                }
+                if (innerTrim.StartsWith("::::", StringComparison.Ordinal))
+                {
+                    var subM = QuadSubSectionRegex().Match(innerTrim);
+                    if (subM.Success)
+                    {
+                        activeChildBuffer.AppendLine(":::" + subM.Groups["section"].Value);
+                        continue;
+                    }
+                    return new Error("Markdown.UnclosedDirective", $"Nested '::::' fence inside ':::case' sub-question at line {lineIdx + 1} of '{sourceLabel}' is not supported.", ErrorType.Validation, Path: $"markdown:{lineIdx + 1}");
+                }
+                if (innerTrim == ":::")
+                {
+                    return new Error("Markdown.UnclosedDirective", $"Unclosed child '::::' block inside ':::case' starting at line {openLine} before closing ':::' at line {lineIdx + 1}.", ErrorType.Validation, Path: $"markdown:{openLine}");
+                }
+                activeChildBuffer.AppendLine(innerLine);
+                continue;
+            }
+
+            if (innerTrim == ":::")
+            {
+                closed = true;
+                break;
+            }
+
+            if (innerTrim.StartsWith("::::", StringComparison.Ordinal))
+            {
+                if (activeSection is not null)
+                    return new Error("Markdown.InvalidCase", $"Child directive '{innerTrim}' at line {lineIdx + 1} cannot appear inside ':::{activeSection}' of ':::case'. Put all child directives before ':::explanation' or ':::layout'.", ErrorType.Validation, Path: $"markdown:{lineIdx + 1}");
+
+                var quadOpen = QuadDirectiveOpenRegex().Match(innerTrim);
+                if (!quadOpen.Success)
+                    return new Error("Markdown.InvalidDirectiveAttr", $"Malformed quad-colon directive '{innerTrim}' inside ':::case' at line {lineIdx + 1} of '{sourceLabel}'.", ErrorType.Validation, Path: $"markdown:{lineIdx + 1}");
+
+                activeChildBuffer = new StringBuilder();
+                activeChildBuffer.AppendLine(":::" + quadOpen.Groups["name"].Value + quadOpen.Groups["rest"].Value);
+                continue;
+            }
+
+            if (innerTrim.StartsWith(":::", StringComparison.Ordinal))
+            {
+                var subMatch = DirectiveSubSectionRegex().Match(innerTrim);
+                if (subMatch.Success)
+                {
+                    var sectionName = subMatch.Groups["section"].Value.Trim().ToLowerInvariant();
+                    if (!AllowedExplanationLayoutSubSections.Contains(sectionName))
+                    {
+                        return new Error(
+                            "Markdown.UnknownSubSection",
+                            $"Unknown sub-section ':::{sectionName}' inside ':::case' at line {lineIdx + 1} of '{sourceLabel}'. Allowed sub-sections: ':::explanation', ':::layout'.",
+                            ErrorType.Validation,
+                            Path: $"markdown:{lineIdx + 1}");
+                    }
+                    if (string.Equals(activeSection, sectionName, StringComparison.OrdinalIgnoreCase) || subSections.ContainsKey(sectionName))
+                    {
+                        return new Error("Markdown.DuplicateSubSection", $"Duplicate sub-section ':::{sectionName}' inside ':::case' at line {lineIdx + 1} of '{sourceLabel}'.", ErrorType.Validation, Path: $"markdown:{lineIdx + 1}");
+                    }
+                    if (activeSection is not null)
+                        subSections[activeSection] = currentSectionBuffer.ToString().Trim();
+                    activeSection = sectionName;
+                    currentSectionBuffer = new StringBuilder();
+                    continue;
+                }
+
+                return new Error("Markdown.UnclosedDirective", $"Unclosed ':::case' starting at line {openLine} before new fence '{innerTrim}' at line {lineIdx + 1}. Use quad-colon '::::<type>' for nested sub-questions.", ErrorType.Validation, Path: $"markdown:{openLine}");
+            }
+
+            currentSectionBuffer.AppendLine(innerLine);
+        }
+
+        if (!closed)
+            return new Error("Markdown.UnclosedDirective", $"Unclosed ':::case' starting at line {openLine} of '{sourceLabel}'. Add a closing ':::' line.", ErrorType.Validation, Path: $"markdown:{openLine}");
+        if (activeSection is not null)
+            subSections[activeSection] = currentSectionBuffer.ToString().Trim();
+
+        return new ParsedCaseBody(stemBuffer.ToString(), childDocs, subSections);
+    }
+
+    private static Result<JsonQuestionSpec> ParseCaseDirective(
+        int openLine,
+        string sourceLabel,
+        Dictionary<string, string> attrs,
+        ParsedCaseBody body)
+    {
+        attrs.TryGetValue("ref", out var refKey);
+        attrs.TryGetValue("title", out var title);
+        attrs.TryGetValue("caption", out var captionAttr);
+
+        bool hasImageAttr = attrs.TryGetValue("image", out var attrImg) && !string.IsNullOrWhiteSpace(attrImg);
+        bool hasImagePathAttr = attrs.TryGetValue("imagePath", out var attrImgPath) && !string.IsNullOrWhiteSpace(attrImgPath);
+        if (hasImageAttr && hasImagePathAttr)
+            return new Error("Markdown.InvalidDirectiveAttr", $"':::case' at line {openLine} cannot specify both 'image' and 'imagePath'.", ErrorType.Validation, Path: $"markdown:{openLine}");
+        string? stemImagePath = hasImageAttr ? attrImg!.Trim() : (hasImagePathAttr ? attrImgPath!.Trim() : null);
+        string? stemCaption = string.IsNullOrWhiteSpace(captionAttr) ? null : captionAttr.Trim();
+
+        var stemLines = new List<string>();
+        string? codeFence = null;
+        foreach (var rawLine in body.StemRaw.Replace("\r\n", "\n").Split('\n'))
+        {
+            var trimmed = rawLine.Trim();
+            if (codeFence is null && TryOpenCodeFence(trimmed, out var token))
+            {
+                codeFence = token;
+                stemLines.Add(rawLine);
+                continue;
+            }
+            if (codeFence is not null)
+            {
+                stemLines.Add(rawLine);
+                if (IsCloseCodeFence(trimmed, codeFence)) codeFence = null;
+                continue;
+            }
+
+            if (TryParseStandaloneImage(trimmed, out _, out var imgLinePath, out var imgCaption))
+            {
+                if (stemImagePath is not null)
+                    return new Error("Markdown.InvalidCase", $"':::case' at line {openLine} of '{sourceLabel}' specifies multiple stem images.", ErrorType.Validation, Path: $"markdown:{openLine}");
+                stemImagePath = imgLinePath;
+                stemCaption ??= string.IsNullOrWhiteSpace(imgCaption) ? null : imgCaption.Trim();
+            }
+            else
+            {
+                stemLines.Add(rawLine);
+            }
+        }
+
+        var stem = string.Join('\n', stemLines).Trim();
+        var subQuestionSpecs = new List<JsonQuestionSpec>();
+        for (int idx = 0; idx < body.ChildDirectiveDocs.Count; idx++)
+        {
+            var childDoc = body.ChildDirectiveDocs[idx];
+            var childLines = childDoc.Replace("\r\n", "\n").Split('\n');
+            var childRes = ParseBody(childLines, 0, $"{sourceLabel}:case:{idx + 1}", "quiz");
+            if (!childRes.IsSuccess) return childRes.Error!;
+            foreach (var childQ in childRes.Value.Questions)
+            {
+                if (string.Equals(childQ.Type?.Trim(), "case", StringComparison.OrdinalIgnoreCase))
+                    return new Error("Case.NestedCaseNotAllowed", $"Nested '::::case' inside ':::case' at line {openLine} of '{sourceLabel}' is not allowed.", ErrorType.Validation, Path: $"markdown:{openLine}");
+                subQuestionSpecs.Add(childQ);
+            }
+        }
+
+        if (subQuestionSpecs.Count == 0)
+            return new Error("Markdown.InvalidCase", $"':::case' at line {openLine} of '{sourceLabel}' must contain at least one '::::<type>' sub-question.", ErrorType.Validation, Path: $"markdown:{openLine}");
+
+        var expBody = new ParsedDirectiveBody(string.Empty, body.SubSections);
+        var expRes = ResolveExplanation(attrs, expBody, openLine, sourceLabel);
+        if (!expRes.IsSuccess) return expRes.Error!;
+
+        Dictionary<string, string>? layoutOverrides = null;
+        if (body.SubSections.TryGetValue("layout", out var rawLayout))
+        {
+            var layoutRes = ParseLayoutSubSection(rawLayout, openLine, sourceLabel);
+            if (!layoutRes.IsSuccess) return layoutRes.Error!;
+            layoutOverrides = layoutRes.Value;
+        }
+
+        var payload = new CaseGroupPayload(
+            string.IsNullOrWhiteSpace(title) ? null : title.Trim(),
+            stem,
+            stemImagePath,
+            stemCaption,
+            [],
+            expRes.Value);
+
+        return new JsonQuestionSpec(
+            Type: "case",
+            Text: null,
+            MaxOptions: null,
+            IsMultiCorrect: false,
+            Options: [],
+            Front: null,
+            Back: null,
+            LayoutOverrides: layoutOverrides,
+            ImagePath: null,
+            Explanation: expRes.Value,
+            Ref: string.IsNullOrWhiteSpace(refKey) ? null : refKey,
+            PayloadJson: Phase1PayloadCodec.Serialize(payload),
+            SubQuestions: subQuestionSpecs);
     }
 
     private static string ResolveQuizType(string? frontmatterKind, string? frontmatterQuizType)

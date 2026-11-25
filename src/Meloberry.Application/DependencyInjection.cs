@@ -26,7 +26,7 @@ public static class DependencyInjection
         typeof(VerifyWebAppHandler),
         typeof(GetLayoutBoundsHandler),
         typeof(SetLayoutPropertyHandler),
-        typeof(SetEntityLayoutHandler),
+        typeof(SaveLayoutProfilesHandler),
         typeof(ResetLayoutProfileHandler),
         typeof(ExportPackageHandler),
         typeof(ImportPackageHandler),

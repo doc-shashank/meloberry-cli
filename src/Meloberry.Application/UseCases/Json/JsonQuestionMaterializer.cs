@@ -48,23 +48,38 @@ internal static class JsonQuestionMaterializer
             {
                 mcq.SetExplanation(spec.Explanation);
             }
-            if (spec.MaxOptions.HasValue)
-            {
-                var maxRes = mcq.SetMaxOptions(spec.MaxOptions.Value);
-                if (!maxRes.IsSuccess) return maxRes.Error!;
-            }
-            if (spec.IsMultiCorrect) mcq.ConvertToMultiple();
-
             var seenIndices = new HashSet<int>();
             int correctCount = 0;
             foreach (var opt in spec.Options)
             {
+                if (opt.Index < 1)
+                    return IndexErrors.OutOfIndexBounds(opt.Index, 1, 26);
                 if (!seenIndices.Add(opt.Index))
                     return new Error("Json.DuplicateOptionIndex", $"MCQ contains duplicate option index {opt.Index}.", ErrorType.Validation, Path: "options");
                 if (opt.IsCorrect) correctCount++;
             }
             if (!spec.IsMultiCorrect && correctCount > 1)
                 return new Error("Question.MultipleCorrectInSingle", $"Single-select MCQ specifies {correctCount} correct options. Set 'isMultiCorrect': true or mark only one option correct.", ErrorType.Validation, Path: "options");
+
+            int highestIndex = spec.Options.Count == 0 ? 0 : spec.Options.Max(o => o.Index);
+            if (spec.MaxOptions.HasValue)
+            {
+                var maxRes = mcq.SetMaxOptions(spec.MaxOptions.Value);
+                if (!maxRes.IsSuccess) return maxRes.Error!;
+                if (highestIndex > mcq.MaxOptions)
+                    return new Error("Question.OptionIndexExceedsMaxOptions", $"Option index {highestIndex} exceeds configured maxOptions ({mcq.MaxOptions}). Increase maxOptions (up to 26) or remove extra options.", ErrorType.Validation, Path: "options");
+            }
+            else
+            {
+                if (highestIndex > 26 || spec.Options.Count > 26)
+                    return QuestionErrors.InvalidMaxOptions(Math.Max(highestIndex, spec.Options.Count));
+                if (highestIndex > mcq.MaxOptions)
+                {
+                    var maxRes = mcq.SetMaxOptions(highestIndex);
+                    if (!maxRes.IsSuccess) return maxRes.Error!;
+                }
+            }
+            if (spec.IsMultiCorrect) mcq.ConvertToMultiple();
 
             foreach (var opt in spec.Options)
             {
@@ -113,11 +128,13 @@ internal static class JsonQuestionMaterializer
         }
 
         if (Quiz.TryParseQuestionType(typeNormalized, out var qType) &&
-            qType is QuestionType.FillBlank or QuestionType.AssertionReason or QuestionType.SpotError or QuestionType.Differentiation or QuestionType.Mechanism or QuestionType.RelabelImage)
+            qType is QuestionType.FillBlank or QuestionType.AssertionReason or QuestionType.SpotError
+                or QuestionType.Differentiation or QuestionType.Mechanism or QuestionType.RelabelImage
+                or QuestionType.Classify or QuestionType.Match or QuestionType.Numeric or QuestionType.CaseGroup)
         {
             if (spec.Front is not null || spec.Back is not null || spec.MaxOptions.HasValue ||
                 spec.IsMultiCorrect || spec.Options.Count > 0 ||
-                (!string.IsNullOrWhiteSpace(spec.ImagePath) && qType != QuestionType.RelabelImage))
+                (!string.IsNullOrWhiteSpace(spec.ImagePath) && qType is not (QuestionType.RelabelImage or QuestionType.SpotError or QuestionType.Numeric or QuestionType.CaseGroup)))
             {
                 return new Error("Json.InvalidFieldForType", $"Question type '{Question.ToWireString(qType)}' cannot specify MCQ/Flashcard fields ('front', 'back', 'options', 'maxOptions', 'isMultiCorrect', 'imagePath').", ErrorType.Validation);
             }
@@ -129,13 +146,14 @@ internal static class JsonQuestionMaterializer
                 if (Phase1PayloadCodec.TryDeserialize<FillBlankPayload>(spec.PayloadJson, out var parsed) && parsed is not null)
                 {
                     var slotsRes = Phase1PayloadRules.ParseFillBlankTemplate(parsed.Template);
-                    payload = parsed with { Blanks = slotsRes.IsSuccess ? slotsRes.Value : [] };
+                    var placeholder = string.IsNullOrWhiteSpace(parsed.Placeholder) ? null : parsed.Placeholder.Trim();
+                    payload = parsed with { Blanks = slotsRes.IsSuccess ? slotsRes.Value : [], Placeholder = placeholder };
                 }
                 else
                 {
                     var template = spec.Text ?? string.Empty;
                     var slotsRes = Phase1PayloadRules.ParseFillBlankTemplate(template);
-                    payload = new FillBlankPayload(template, slotsRes.IsSuccess ? slotsRes.Value : [], Fuzzy: true, CaseSensitive: false, Explanation: spec.Explanation);
+                    payload = new FillBlankPayload(template, slotsRes.IsSuccess ? slotsRes.Value : [], Fuzzy: true, CaseSensitive: false, Explanation: spec.Explanation, Placeholder: null);
                 }
                 canonicalPayload = Phase1PayloadCodec.Serialize(payload);
             }
@@ -153,13 +171,30 @@ internal static class JsonQuestionMaterializer
                 if (Phase1PayloadCodec.TryDeserialize<SpotErrorPayload>(spec.PayloadJson, out var parsed) && parsed is not null)
                 {
                     var segsRes = Phase1PayloadRules.ParseSpotErrorTemplate(parsed.Template);
-                    payload = parsed with { Segments = segsRes.IsSuccess ? segsRes.Value : [] };
+                    var rawImg = !string.IsNullOrWhiteSpace(parsed.ImagePath) ? parsed.ImagePath : spec.ImagePath;
+                    string? storedImg = null;
+                    if (!string.IsNullOrWhiteSpace(rawImg))
+                    {
+                        var imgCopy = await CopyConfinedImageAsync(
+                            rawImg, jsonBaseDirectory, storageDirectory, contentInspector, cancellationToken, specRootDirectory, workspaceCwdDirectory);
+                        if (!imgCopy.IsSuccess) return imgCopy.Error!;
+                        storedImg = imgCopy.Value;
+                    }
+                    payload = parsed with { Segments = segsRes.IsSuccess ? segsRes.Value : [], ImagePath = storedImg };
                 }
                 else
                 {
                     var template = spec.Text ?? string.Empty;
                     var segsRes = Phase1PayloadRules.ParseSpotErrorTemplate(template);
-                    payload = new SpotErrorPayload(template, segsRes.IsSuccess ? segsRes.Value : [], RequireFix: false, AllowNoError: false, NoError: false, Explanation: spec.Explanation);
+                    string? storedImg = null;
+                    if (!string.IsNullOrWhiteSpace(spec.ImagePath))
+                    {
+                        var imgCopy = await CopyConfinedImageAsync(
+                            spec.ImagePath, jsonBaseDirectory, storageDirectory, contentInspector, cancellationToken, specRootDirectory, workspaceCwdDirectory);
+                        if (!imgCopy.IsSuccess) return imgCopy.Error!;
+                        storedImg = imgCopy.Value;
+                    }
+                    payload = new SpotErrorPayload(template, segsRes.IsSuccess ? segsRes.Value : [], RequireFix: false, AllowNoError: false, NoError: false, Explanation: spec.Explanation, ImagePath: storedImg);
                 }
                 canonicalPayload = Phase1PayloadCodec.Serialize(payload);
             }
@@ -285,6 +320,168 @@ internal static class JsonQuestionMaterializer
                     SourceMasksPath: null,
                     IncludeLabels: null);
                 canonicalPayload = Phase1PayloadCodec.Serialize(normalized);
+            }
+            else if (qType == QuestionType.Classify)
+            {
+                if (!Phase1PayloadCodec.TryDeserialize<ClassifyPayload>(spec.PayloadJson, out var parsed) || parsed is null)
+                    return new Error("Json.InvalidQuestion", "Classify question requires valid 'buckets' and 'items' payload data.", ErrorType.Validation);
+
+                var buckets = (parsed.Buckets ?? [])
+                    .Where(b => b is not null)
+                    .Select((b, idx) => new ClassifyBucket(b.BucketId >= 0 ? b.BucketId : idx, b.Name?.Trim() ?? string.Empty))
+                    .ToList();
+                var items = (parsed.Items ?? [])
+                    .Where(it => it is not null)
+                    .Select((it, idx) => new ClassifyItem(idx, it.BucketId, it.Text?.Trim() ?? string.Empty))
+                    .ToList();
+                canonicalPayload = Phase1PayloadCodec.Serialize(new ClassifyPayload(
+                    string.IsNullOrWhiteSpace(parsed.Title) ? null : parsed.Title.Trim(),
+                    buckets,
+                    items,
+                    string.IsNullOrWhiteSpace(parsed.Explanation ?? spec.Explanation) ? null : (parsed.Explanation ?? spec.Explanation)!.Trim()));
+            }
+            else if (qType == QuestionType.Match)
+            {
+                if (!Phase1PayloadCodec.TryDeserialize<MatchPayload>(spec.PayloadJson, out var parsed) || parsed is null)
+                    return new Error("Json.InvalidQuestion", "Match question requires valid 'pairs' payload data.", ErrorType.Validation);
+
+                var pairs = (parsed.Pairs ?? [])
+                    .Where(p => p is not null)
+                    .Select((p, idx) => new MatchPair(idx, p.Left?.Trim() ?? string.Empty, p.Right?.Trim() ?? string.Empty))
+                    .ToList();
+                var distractors = (parsed.Distractors ?? [])
+                    .Where(d => !string.IsNullOrWhiteSpace(d))
+                    .Select(d => d.Trim())
+                    .ToList();
+                canonicalPayload = Phase1PayloadCodec.Serialize(new MatchPayload(
+                    string.IsNullOrWhiteSpace(parsed.Title) ? null : parsed.Title.Trim(),
+                    pairs,
+                    distractors,
+                    string.IsNullOrWhiteSpace(parsed.Explanation ?? spec.Explanation) ? null : (parsed.Explanation ?? spec.Explanation)!.Trim()));
+            }
+            else if (qType == QuestionType.Numeric)
+            {
+                NumericPayload parsed;
+                if (!Phase1PayloadCodec.TryDeserialize<NumericPayload>(spec.PayloadJson, out var np) || np is null)
+                    return new Error("Json.InvalidQuestion", "Numeric question requires valid 'answer' and prompt payload data.", ErrorType.Validation);
+                parsed = np;
+
+                if (!Phase3PayloadRules.IsValidToleranceMode(parsed.ToleranceMode))
+                    return new Error("Json.InvalidQuestion", $"Invalid numeric toleranceMode '{parsed.ToleranceMode}'. Use 'absolute' or 'percent'.", ErrorType.Validation);
+
+                string? storedImg = null;
+                var rawImg = !string.IsNullOrWhiteSpace(parsed.ImagePath) ? parsed.ImagePath : spec.ImagePath;
+                if (!string.IsNullOrWhiteSpace(rawImg))
+                {
+                    var imgCopy = await CopyConfinedImageAsync(
+                        rawImg, jsonBaseDirectory, storageDirectory, contentInspector, cancellationToken, specRootDirectory, workspaceCwdDirectory);
+                    if (!imgCopy.IsSuccess) return imgCopy.Error!;
+                    storedImg = imgCopy.Value;
+                }
+
+                var prompt = !string.IsNullOrWhiteSpace(parsed.Prompt) ? parsed.Prompt.Trim() : (spec.Text ?? string.Empty).Trim();
+                canonicalPayload = Phase1PayloadCodec.Serialize(new NumericPayload(
+                    prompt,
+                    parsed.Answer,
+                    parsed.Tolerance,
+                    Phase3PayloadRules.NormalizeToleranceMode(parsed.ToleranceMode),
+                    string.IsNullOrWhiteSpace(parsed.Unit) ? null : parsed.Unit.Trim(),
+                    string.IsNullOrWhiteSpace(parsed.Placeholder) ? null : parsed.Placeholder.Trim(),
+                    string.IsNullOrWhiteSpace(parsed.Explanation ?? spec.Explanation) ? null : (parsed.Explanation ?? spec.Explanation)!.Trim(),
+                    storedImg));
+            }
+            else if (qType == QuestionType.CaseGroup)
+            {
+                Phase1PayloadCodec.TryDeserialize<CaseGroupPayload>(spec.PayloadJson, out var parsed);
+                var title = parsed?.Title;
+                var stem = !string.IsNullOrWhiteSpace(parsed?.Stem) ? parsed!.Stem.Trim() : (spec.Text ?? string.Empty).Trim();
+                var caption = string.IsNullOrWhiteSpace(parsed?.Caption) ? null : parsed!.Caption.Trim();
+                var explanation = string.IsNullOrWhiteSpace(parsed?.Explanation ?? spec.Explanation) ? null : (parsed?.Explanation ?? spec.Explanation)!.Trim();
+
+                string? storedStemImg = null;
+                var rawStemImg = !string.IsNullOrWhiteSpace(parsed?.ImagePath) ? parsed!.ImagePath : spec.ImagePath;
+                if (!string.IsNullOrWhiteSpace(rawStemImg))
+                {
+                    var imgCopy = await CopyConfinedImageAsync(
+                        rawStemImg, jsonBaseDirectory, storageDirectory, contentInspector, cancellationToken, specRootDirectory, workspaceCwdDirectory);
+                    if (!imgCopy.IsSuccess) return imgCopy.Error!;
+                    storedStemImg = imgCopy.Value;
+                }
+
+                var subQuestions = new List<CaseSubQuestion>();
+                if (spec.SubQuestions is { Count: > 0 })
+                {
+                    for (int sIdx = 0; sIdx < spec.SubQuestions.Count; sIdx++)
+                    {
+                        var subSpec = spec.SubQuestions[sIdx];
+                        if (Quiz.TryParseQuestionType(subSpec.Type, out var subQType) && subQType == QuestionType.CaseGroup)
+                            return new Error("Case.NestedCaseNotAllowed", "Nested 'case' sub-questions inside ':::case' are not allowed.", ErrorType.Validation);
+
+                        var subMat = await MaterializeAsync(
+                            $"{questionId}_sub{sIdx}",
+                            containerId,
+                            sIdx + 1,
+                            subSpec,
+                            jsonBaseDirectory,
+                            storageDirectory,
+                            contentInspector,
+                            cancellationToken,
+                            specRootDirectory,
+                            workspaceCwdDirectory);
+                        if (!subMat.IsSuccess) return subMat.Error!;
+
+                        var sq = subMat.Value;
+                        if (sq is McqQuestion smcq)
+                        {
+                            subQuestions.Add(new CaseSubQuestion(
+                                sIdx,
+                                "mcq",
+                                Mcq: new CaseSubMcqData(
+                                    smcq.Text,
+                                    smcq.MaxOptions,
+                                    smcq.IsMultiCorrect,
+                                    smcq.Options.Select(o => new CaseSubMcqOption(o.Index, o.Text, o.ImagePath, o.IsCorrect)).ToList(),
+                                    smcq.ImagePath,
+                                    smcq.Explanation)));
+                        }
+                        else if (sq is FlashcardQuestion sfc)
+                        {
+                            subQuestions.Add(new CaseSubQuestion(
+                                sIdx,
+                                "flashcard",
+                                Flashcard: new CaseSubFlashcardData(
+                                    new(sfc.Front.Text, sfc.Front.ImagePath, sfc.Front.Position == MediaPosition.TextAboveImage ? "aboveImage" : "belowImage"),
+                                    new(sfc.Back.Text, sfc.Back.ImagePath, sfc.Back.Position == MediaPosition.TextAboveImage ? "aboveImage" : "belowImage"))));
+                        }
+                        else if (sq is PayloadQuestion spq)
+                        {
+                            subQuestions.Add(new CaseSubQuestion(
+                                sIdx,
+                                Question.ToWireString(spq.Type),
+                                PayloadJson: spq.PayloadJson));
+                        }
+                    }
+                }
+                else if (parsed?.Questions is { Count: > 0 })
+                {
+                    for (int sIdx = 0; sIdx < parsed.Questions.Count; sIdx++)
+                    {
+                        var sub = parsed.Questions[sIdx];
+                        if (sub is null)
+                            return new Error("Json.InvalidQuestion", $"Case sub-question at index {sIdx} cannot be null.", ErrorType.Validation);
+                        if (string.Equals(sub.Type?.Trim(), "case", StringComparison.OrdinalIgnoreCase))
+                            return new Error("Case.NestedCaseNotAllowed", "Nested 'case' sub-questions inside ':::case' are not allowed.", ErrorType.Validation);
+                        subQuestions.Add(sub with { Index = sIdx });
+                    }
+                }
+
+                canonicalPayload = Phase1PayloadCodec.Serialize(new CaseGroupPayload(
+                    string.IsNullOrWhiteSpace(title) ? null : title.Trim(),
+                    stem,
+                    storedStemImg,
+                    caption,
+                    subQuestions,
+                    explanation));
             }
 
             var createdRes = PayloadQuestion.Create(questionId, containerId, initialIndex, qType, canonicalPayload ?? "{}");

@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Meloberry.Application.Abstractions;
+using Meloberry.Domain.Payloads;
 using Meloberry.Domain.Questions;
 using Meloberry.Domain.Quizzes;
 using Meloberry.Domain.Sessions;
@@ -26,9 +27,10 @@ public sealed class SqliteWorkspaceRepository(
                 foreach (var comp in session.Components)
                 {
                     ownedIds.Add(comp.Id);
-                    await ExecAsync(conn, tx, "INSERT INTO Components (Id, SortIndex, Kind, QuizType, LayoutOverridesJson, Title, RefKey) VALUES ($id, $idx, $kind, $qt, $lj, $title, $ref);",
+                    var linksJson = comp.LinkCards.Count > 0 ? Phase1PayloadCodec.Serialize(comp.LinkCards) : null;
+                    await ExecAsync(conn, tx, "INSERT INTO Components (Id, SortIndex, Kind, QuizType, LayoutOverridesJson, Title, RefKey, LinksJson) VALUES ($id, $idx, $kind, $qt, $lj, $title, $ref, $links);",
                         cancellationToken, ("$id", comp.Id), ("$idx", comp.Index), ("$kind", comp.Kind.ToString()),
-                        ("$qt", comp.Quiz?.Type.ToString()), ("$lj", JsonSerializer.Serialize(comp.LayoutOverrides)), ("$title", comp.Title), ("$ref", comp.RefKey));
+                        ("$qt", comp.Quiz?.Type.ToString()), ("$lj", JsonSerializer.Serialize(comp.LayoutOverrides)), ("$title", comp.Title), ("$ref", comp.RefKey), ("$links", linksJson));
 
                     if (comp.Kind == ComponentKind.Article)
                     {
@@ -366,13 +368,13 @@ public sealed class SqliteWorkspaceRepository(
     {
         await ExecAsync(conn, null, """
             CREATE TABLE IF NOT EXISTS WorkspaceMeta (Id TEXT PRIMARY KEY, Kind TEXT NOT NULL, SubType TEXT NOT NULL, ActiveComponentId TEXT NULL, Name TEXT NULL, Description TEXT NULL);
-            CREATE TABLE IF NOT EXISTS Components (Id TEXT PRIMARY KEY, SortIndex INTEGER NOT NULL, Kind TEXT NOT NULL, QuizType TEXT NULL, LayoutOverridesJson TEXT NULL, Title TEXT NULL, RefKey TEXT NULL);
+            CREATE TABLE IF NOT EXISTS Components (Id TEXT PRIMARY KEY, SortIndex INTEGER NOT NULL, Kind TEXT NOT NULL, QuizType TEXT NULL, LayoutOverridesJson TEXT NULL, Title TEXT NULL, RefKey TEXT NULL, LinksJson TEXT NULL);
             CREATE TABLE IF NOT EXISTS ArticleBlocks (Id TEXT PRIMARY KEY, ComponentId TEXT NOT NULL, SortIndex INTEGER NOT NULL, BlockKind TEXT NOT NULL, TextContent TEXT NULL, ImagePath TEXT NULL, RefKey TEXT NULL, Caption TEXT NULL, Alt TEXT NULL, CalloutTone TEXT NULL, CalloutTitle TEXT NULL, PayloadJson TEXT NULL);
             CREATE TABLE IF NOT EXISTS Questions (Id TEXT PRIMARY KEY, ContainerId TEXT NOT NULL, SortIndex INTEGER NOT NULL, QuestionType TEXT NOT NULL, PromptText TEXT NULL, MaxOptions INTEGER NOT NULL, IsMultiCorrect INTEGER NOT NULL, FrontText TEXT NULL, FrontImagePath TEXT NULL, FrontPosition TEXT NULL, BackText TEXT NULL, BackImagePath TEXT NULL, BackPosition TEXT NULL, LayoutOverridesJson TEXT NULL, PromptImagePath TEXT NULL, Explanation TEXT NULL, RefKey TEXT NULL, PayloadJson TEXT NULL);
             CREATE TABLE IF NOT EXISTS McqOptions (QuestionId TEXT NOT NULL, OptionIndex INTEGER NOT NULL, OptionText TEXT NULL, ImagePath TEXT NULL, IsCorrect INTEGER NOT NULL, PRIMARY KEY (QuestionId, OptionIndex));
             """, ct);
         await EnsureTableColumnsAsync(conn, ct, "WorkspaceMeta", "Name", "Description");
-        await EnsureTableColumnsAsync(conn, ct, "Components", "Title", "RefKey");
+        await EnsureTableColumnsAsync(conn, ct, "Components", "Title", "RefKey", "LinksJson");
         await EnsureTableColumnsAsync(conn, ct, "ArticleBlocks", "RefKey", "Caption", "Alt", "CalloutTone", "CalloutTitle", "PayloadJson");
         await EnsureTableColumnsAsync(conn, ct, "Questions", "PromptImagePath", "Explanation", "RefKey", "PayloadJson");
     }
@@ -431,7 +433,7 @@ public sealed class SqliteWorkspaceRepository(
         await using var conn = OpenWorkspaceConnection(dbPath);
         await conn.OpenAsync(ct);
         await EnsureTableColumnsAsync(conn, ct, "WorkspaceMeta", "Name", "Description");
-        await EnsureTableColumnsAsync(conn, ct, "Components", "Title", "RefKey");
+        await EnsureTableColumnsAsync(conn, ct, "Components", "Title", "RefKey", "LinksJson");
         await EnsureTableColumnsAsync(conn, ct, "ArticleBlocks", "RefKey", "Caption", "Alt", "CalloutTone", "CalloutTitle", "PayloadJson");
         await EnsureTableColumnsAsync(conn, ct, "Questions", "PromptImagePath", "Explanation", "RefKey", "PayloadJson");
 
@@ -453,7 +455,7 @@ public sealed class SqliteWorkspaceRepository(
 
         await using (var compCmd = conn.CreateCommand())
         {
-            compCmd.CommandText = "SELECT Id, SortIndex, Kind, QuizType, LayoutOverridesJson, Title, RefKey FROM Components ORDER BY SortIndex;";
+            compCmd.CommandText = "SELECT Id, SortIndex, Kind, QuizType, LayoutOverridesJson, Title, RefKey, LinksJson FROM Components ORDER BY SortIndex;";
             await using var r = await compCmd.ExecuteReaderAsync(ct);
             while (await r.ReadAsync(ct))
             {
@@ -464,6 +466,10 @@ public sealed class SqliteWorkspaceRepository(
                 var ov = DeserializeOverrides(r.IsDBNull(4) ? null : r.GetString(4));
                 var title = r.IsDBNull(5) ? null : r.GetString(5);
                 var refKey = r.IsDBNull(6) ? null : r.GetString(6);
+                var rawLinks = r.IsDBNull(7) ? null : r.GetString(7);
+                List<ArticleLinkCard>? linkCards = null;
+                if (!string.IsNullOrWhiteSpace(rawLinks) && Phase1PayloadCodec.TryDeserialize<List<ArticleLinkCard>>(rawLinks, out var parsedLinks))
+                    linkCards = parsedLinks;
 
                 Quiz? quiz = null;
                 if (kind == ComponentKind.Quiz)
@@ -471,7 +477,7 @@ public sealed class SqliteWorkspaceRepository(
                     var qType = Enum.TryParse<QuizType>(qt, true, out var parsed) ? parsed : QuizType.Mixed;
                     quiz = Quiz.Rehydrate(cid, qType, storageDirectory, questionsByContainer.TryGetValue(cid, out var ql) ? ql : []);
                 }
-                components.Add(SessionComponent.Rehydrate(cid, sessionId, idx, kind, quiz, blocksByComp.TryGetValue(cid, out var bl) ? bl : [], ov, title, refKey));
+                components.Add(SessionComponent.Rehydrate(cid, sessionId, idx, kind, quiz, blocksByComp.TryGetValue(cid, out var bl) ? bl : [], ov, title, refKey, linkCards));
             }
         }
         return StudySession.Rehydrate(sessionId, storageDirectory, activeId, components, name, desc);
@@ -566,7 +572,7 @@ public sealed class SqliteWorkspaceRepository(
                         r.IsDBNull(15) ? null : r.GetString(15),
                         refKey),
                     QuestionType.Flashcard => RehydrateFlashcardRow(qid, cid, idx, r, ov, refKey),
-                    QuestionType.FillBlank or QuestionType.AssertionReason or QuestionType.SpotError or QuestionType.Differentiation or QuestionType.Mechanism or QuestionType.RelabelImage =>
+                    QuestionType.FillBlank or QuestionType.AssertionReason or QuestionType.SpotError or QuestionType.Differentiation or QuestionType.Mechanism or QuestionType.RelabelImage or QuestionType.CaseGroup or QuestionType.Classify or QuestionType.Match or QuestionType.Numeric =>
                         PayloadQuestion.Rehydrate(qid, cid, idx, qType, payloadJson ?? "{}", ov, refKey),
                     _ => throw new InvalidOperationException($"Unsupported persisted question type '{qType}' (payload present: {payloadJson is not null}).")
                 };

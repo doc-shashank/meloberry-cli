@@ -58,9 +58,13 @@ public sealed class Phase2CliTests : IDisposable
         using (var doc = JsonDocument.Parse(groupC.StandardOutput))
         {
             var schemas = doc.RootElement.GetProperty("data").GetProperty("schemas");
-            Assert.Equal(8, schemas.GetArrayLength());
+            Assert.Equal(12, schemas.GetArrayLength());
             var topics = schemas.EnumerateArray().Select(s => s.GetProperty("topic").GetString()).ToList();
             Assert.Contains("relabel", topics);
+            Assert.Contains("case", topics);
+            Assert.Contains("classify", topics);
+            Assert.Contains("match", topics);
+            Assert.Contains("numeric", topics);
         }
 
         var crossC = new TestConsole();

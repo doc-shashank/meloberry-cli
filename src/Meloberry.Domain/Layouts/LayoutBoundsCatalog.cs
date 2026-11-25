@@ -18,6 +18,7 @@ public sealed record LayoutPropertySpec(
 public static class LayoutBoundsCatalog
 {
     public static readonly IReadOnlyList<string> SupportedTargets = ["mcq", "flashcard", "article"];
+    public static readonly IReadOnlyList<string> GlobalOnlyProperties = ["themeMode", "slideTransitionMs"];
 
     private static readonly IReadOnlyList<LayoutPropertySpec> AllSpecs =
     [
@@ -39,8 +40,32 @@ public static class LayoutBoundsCatalog
     public static bool IsValidTargetType(string targetType) =>
         SupportedTargets.Contains(targetType.Trim(), StringComparer.OrdinalIgnoreCase);
 
+    public static bool IsGlobalOnlyProperty(string propertyName) =>
+        GlobalOnlyProperties.Contains(propertyName.Trim(), StringComparer.OrdinalIgnoreCase);
+
+    public static bool IsValidPropertyForTarget(string targetType, string propertyName) =>
+        FindSpec(targetType.Trim().ToLowerInvariant(), propertyName) is not null;
+
     public static IReadOnlyList<LayoutPropertySpec> GetSpecsForTarget(string targetType) =>
         AllSpecs.Where(s => s.ApplicableTargets.Contains(targetType.Trim(), StringComparer.OrdinalIgnoreCase)).ToList();
+
+    public static string ResolveDeckGlobalValue(
+        IReadOnlyDictionary<string, LayoutProfile> layouts,
+        string propertyName,
+        string fallbackValue)
+    {
+        string? firstPresent = null;
+        foreach (var target in new[] { "mcq", "article", "flashcard" })
+        {
+            if (!layouts.TryGetValue(target, out var profile)) continue;
+            var value = profile.GetValue(propertyName);
+            if (string.IsNullOrWhiteSpace(value)) continue;
+            firstPresent ??= value;
+            if (!string.Equals(value, fallbackValue, StringComparison.OrdinalIgnoreCase))
+                return value;
+        }
+        return firstPresent ?? fallbackValue;
+    }
 
     public static Result<(string CanonicalName, string Value)> ValidateAndResolve(string targetType, string propertyName, string rawValue)
     {
@@ -68,13 +93,36 @@ public static class LayoutBoundsCatalog
     public static Result<(string CanonicalName, string Value)> ValidateAndResolve(IReadOnlyList<string> targetTypes, string propertyName, string rawValue)
     {
         Result<(string CanonicalName, string Value)>? firstError = null;
+        Result<(string CanonicalName, string Value)>? outOfBoundsError = null;
         foreach (var target in targetTypes)
         {
             var res = ValidateAndResolve(target, propertyName, rawValue);
             if (res.IsSuccess) return res;
             firstError ??= res;
+            if (outOfBoundsError is null && string.Equals(res.Error?.Code, "Layout.OutOfBounds", StringComparison.Ordinal))
+                outOfBoundsError = res;
         }
-        return firstError ?? LayoutErrors.UnknownProperty(targetTypes.FirstOrDefault() ?? string.Empty, propertyName);
+        return outOfBoundsError ?? firstError ?? LayoutErrors.UnknownProperty(targetTypes.FirstOrDefault() ?? string.Empty, propertyName);
+    }
+
+    public static Result<(string CanonicalName, string Value)> ValidateAndResolveForEntityOverride(string targetType, string propertyName, string rawValue)
+    {
+        if (IsGlobalOnlyProperty(propertyName))
+        {
+            var canonical = GlobalOnlyProperties.First(p => string.Equals(p, propertyName.Trim(), StringComparison.OrdinalIgnoreCase));
+            return LayoutErrors.EntityGlobalPropertyNotAllowed(canonical);
+        }
+        return ValidateAndResolve(targetType, propertyName, rawValue);
+    }
+
+    public static Result<(string CanonicalName, string Value)> ValidateAndResolveForEntityOverride(IReadOnlyList<string> targetTypes, string propertyName, string rawValue)
+    {
+        if (IsGlobalOnlyProperty(propertyName))
+        {
+            var canonical = GlobalOnlyProperties.First(p => string.Equals(p, propertyName.Trim(), StringComparison.OrdinalIgnoreCase));
+            return LayoutErrors.EntityGlobalPropertyNotAllowed(canonical);
+        }
+        return ValidateAndResolve(targetTypes, propertyName, rawValue);
     }
 
     public static Result<string> ValidateAndNormalize(string targetType, string propertyName, string rawValue)

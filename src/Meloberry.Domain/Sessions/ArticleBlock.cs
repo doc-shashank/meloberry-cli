@@ -3,7 +3,7 @@ using Meloberry.Domain.Errors;
 
 namespace Meloberry.Domain.Sessions;
 
-public enum ArticleBlockKind { Text, Image, Callout, Table }
+public enum ArticleBlockKind { Text, Image, Callout, Table, DiagramExplore, Reveal }
 
 public enum CalloutTone { Pearl, Clinical, Warning }
 
@@ -101,6 +101,25 @@ public sealed class ArticleBlock : IIndexedEntity
             ? ArticleErrors.InvalidTablePayload("Table payload JSON cannot be empty.")
             : new ArticleBlock(id, componentId, 1, ArticleBlockKind.Table, null, null, calloutTitle: title, payloadJson: payloadJson);
 
+    public static Result<ArticleBlock> CreateDiagramExplore(
+        string id,
+        string componentId,
+        string imagePath,
+        string payloadJson,
+        string? title = null,
+        string? caption = null,
+        string? alt = null) =>
+        string.IsNullOrWhiteSpace(imagePath)
+            ? ArticleErrors.EmptyImagePath()
+            : string.IsNullOrWhiteSpace(payloadJson)
+                ? ArticleErrors.InvalidDiagramExplorePayload("Diagram Explorer payload JSON cannot be empty.")
+                : new ArticleBlock(id, componentId, 1, ArticleBlockKind.DiagramExplore, null, imagePath.Trim(), caption: caption, alt: alt, calloutTitle: title, payloadJson: payloadJson);
+
+    public static Result<ArticleBlock> CreateReveal(string id, string componentId, string payloadJson, string? title = null) =>
+        string.IsNullOrWhiteSpace(payloadJson)
+            ? ArticleErrors.InvalidRevealPayload("Reveal block payload JSON cannot be empty.")
+            : new ArticleBlock(id, componentId, 1, ArticleBlockKind.Reveal, null, null, calloutTitle: title, payloadJson: payloadJson);
+
     public static ArticleBlock Rehydrate(
         string id,
         string componentId,
@@ -178,6 +197,40 @@ public sealed class ArticleBlock : IIndexedEntity
     {
         if (Kind != ArticleBlockKind.Table) return ArticleErrors.WrongBlockKind(Id, "table");
         if (string.IsNullOrWhiteSpace(payloadJson)) return ArticleErrors.InvalidTablePayload("Table payload JSON cannot be empty.");
+        PayloadJson = payloadJson.Trim();
+        if (updateTitle || title is not null)
+            CalloutTitle = string.IsNullOrWhiteSpace(title) ? null : title.Trim();
+        return Result.Success();
+    }
+
+    public Result UpdateDiagramExplorePayload(
+        string imagePath,
+        string payloadJson,
+        string? title = null,
+        bool updateTitle = false,
+        string? caption = null,
+        bool updateCaption = false,
+        string? alt = null,
+        bool updateAlt = false)
+    {
+        if (Kind != ArticleBlockKind.DiagramExplore) return ArticleErrors.WrongBlockKind(Id, "diagram-explore");
+        if (string.IsNullOrWhiteSpace(imagePath)) return ArticleErrors.EmptyImagePath();
+        if (string.IsNullOrWhiteSpace(payloadJson)) return ArticleErrors.InvalidDiagramExplorePayload("Diagram Explorer payload JSON cannot be empty.");
+        ImagePath = imagePath.Trim();
+        PayloadJson = payloadJson.Trim();
+        if (updateTitle || title is not null)
+            CalloutTitle = string.IsNullOrWhiteSpace(title) ? null : title.Trim();
+        if (updateCaption || caption is not null)
+            Caption = string.IsNullOrWhiteSpace(caption) ? null : caption.Trim();
+        if (updateAlt || alt is not null)
+            Alt = string.IsNullOrWhiteSpace(alt) ? null : alt.Trim();
+        return Result.Success();
+    }
+
+    public Result UpdateRevealPayload(string payloadJson, string? title = null, bool updateTitle = false)
+    {
+        if (Kind != ArticleBlockKind.Reveal) return ArticleErrors.WrongBlockKind(Id, "reveal");
+        if (string.IsNullOrWhiteSpace(payloadJson)) return ArticleErrors.InvalidRevealPayload("Reveal block payload JSON cannot be empty.");
         PayloadJson = payloadJson.Trim();
         if (updateTitle || title is not null)
             CalloutTitle = string.IsNullOrWhiteSpace(title) ? null : title.Trim();

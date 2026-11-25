@@ -11,29 +11,39 @@ public sealed record LayoutBoundsResponse(IReadOnlyList<LayoutPropertyBoundDto> 
 public sealed record SetLayoutPropertyCommand(string TargetType, string Property, string Value);
 public sealed record LayoutMutationResponse(string TargetIdOrType, string Property, string NormalizedValue);
 public sealed record ResetLayoutProfileCommand(string TargetType, IReadOnlyList<string>? Keys = null);
-public sealed record SetEntityLayoutCommand(string TargetEntityId, string Property, string Value);
+public sealed record SaveLayoutProfilesCommand(IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>> Profiles);
+public sealed record SaveLayoutProfilesResponse(bool Saved, IReadOnlyList<string> UpdatedTargets, IReadOnlyList<string> Errors);
 
 internal static class GlobalLayoutSyncHelper
 {
-    private static readonly string[] GlobalKeys = ["themeMode", "slideTransitionMs"];
-
-    public static async Task SyncKeysIfGlobalAsync(
-        ILayoutRepository repo, string sourceTarget, LayoutProfile sourceProfile, IEnumerable<string> changedCanonicalKeys, CancellationToken ct)
+    public static void SyncKeysInMemory(
+        IDictionary<string, LayoutProfile> allProfiles,
+        string sourceTarget,
+        IEnumerable<string> changedCanonicalKeys,
+        ISet<string> modifiedTargets)
     {
-        var toSync = changedCanonicalKeys.Where(k => GlobalKeys.Contains(k, StringComparer.OrdinalIgnoreCase)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-        if (toSync.Count == 0) return;
+        var toSync = changedCanonicalKeys
+            .Where(LayoutBoundsCatalog.IsGlobalOnlyProperty)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (toSync.Count == 0 || !allProfiles.TryGetValue(sourceTarget, out var sourceProfile))
+            return;
 
         foreach (var otherTarget in LayoutBoundsCatalog.SupportedTargets)
         {
             if (string.Equals(otherTarget, sourceTarget, StringComparison.OrdinalIgnoreCase)) continue;
-            var other = await repo.GetProfileAsync(otherTarget, ct);
-            bool modified = false;
+            if (!allProfiles.TryGetValue(otherTarget, out var other))
+            {
+                other = LayoutProfile.CreateDefault(otherTarget).Value;
+                allProfiles[otherTarget] = other;
+            }
+
             foreach (var key in toSync)
             {
-                if (other.SetProperty(key, sourceProfile.GetValue(key)).IsSuccess)
-                    modified = true;
+                var val = sourceProfile.GetValue(key);
+                if (!string.IsNullOrEmpty(val) && other.SetProperty(key, val).IsSuccess)
+                    modifiedTargets.Add(otherTarget);
             }
-            if (modified) await repo.SaveProfileAsync(other, ct);
         }
     }
 }
@@ -57,7 +67,7 @@ public sealed class GetLayoutBoundsHandler(ILayoutRepository layoutRepository)
             foreach (var spec in LayoutBoundsCatalog.GetSpecsForTarget(target))
             {
                 var boundsText = spec.ValueType == LayoutPropertyType.Integer ? $"{spec.MinValue}..{spec.MaxValue}" : string.Join(" | ", spec.AllowedValues);
-                items.Add(new LayoutPropertyBoundDto(target, spec.Name, spec.ValueType == LayoutPropertyType.Integer ? "int" : "enum",
+                items.Add(new LayoutPropertyBoundDto(target, spec.Name, spec.ValueType == LayoutPropertyType.Integer ? "integer" : "enum",
                     profile.GetValue(spec.Name), spec.DefaultValue, boundsText, spec.Description));
             }
         }
@@ -72,14 +82,112 @@ public sealed class SetLayoutPropertyHandler(ILayoutRepository layoutRepository)
         var normalizedType = command.TargetType.Trim().ToLowerInvariant();
         if (!LayoutBoundsCatalog.IsValidTargetType(normalizedType)) return LayoutErrors.InvalidTargetType(command.TargetType);
 
-        var profile = await layoutRepository.GetProfileAsync(normalizedType, cancellationToken);
         var resolved = LayoutBoundsCatalog.ValidateAndResolve(normalizedType, command.Property, command.Value);
         if (!resolved.IsSuccess) return resolved.Error!;
 
+        var allProfiles = new Dictionary<string, LayoutProfile>(
+            await layoutRepository.GetAllProfilesAsync(cancellationToken),
+            StringComparer.OrdinalIgnoreCase);
+
+        if (!allProfiles.TryGetValue(normalizedType, out var profile))
+        {
+            profile = LayoutProfile.CreateDefault(normalizedType).Value;
+            allProfiles[normalizedType] = profile;
+        }
+
         profile.SetProperty(resolved.Value.CanonicalName, resolved.Value.Value);
-        await layoutRepository.SaveProfileAsync(profile, cancellationToken);
-        await GlobalLayoutSyncHelper.SyncKeysIfGlobalAsync(layoutRepository, normalizedType, profile, [resolved.Value.CanonicalName], cancellationToken);
+        var modifiedTargets = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { normalizedType };
+        GlobalLayoutSyncHelper.SyncKeysInMemory(allProfiles, normalizedType, [resolved.Value.CanonicalName], modifiedTargets);
+
+        var toSave = modifiedTargets.Select(t => allProfiles[t]).ToList();
+        await layoutRepository.SaveProfilesAsync(toSave, cancellationToken);
         return new LayoutMutationResponse(normalizedType, resolved.Value.CanonicalName, resolved.Value.Value);
+    }
+}
+
+public sealed class SaveLayoutProfilesHandler(ILayoutRepository layoutRepository)
+{
+    public async Task<Result<SaveLayoutProfilesResponse>> HandleAsync(SaveLayoutProfilesCommand command, CancellationToken cancellationToken = default)
+    {
+        if (command.Profiles is null || command.Profiles.Count == 0)
+            return new Error("Layout.EmptyUpdate", "Provide at least one profile update.", ErrorType.Validation);
+
+        var errors = new List<string>();
+        var validatedUpdates = new List<(string Target, string CanonicalKey, string NormalizedValue)>();
+
+        foreach (var (rawTarget, propMap) in command.Profiles)
+        {
+            var normalizedTarget = rawTarget.Trim().ToLowerInvariant();
+            if (!LayoutBoundsCatalog.IsValidTargetType(normalizedTarget))
+            {
+                errors.Add($"{rawTarget}: {LayoutErrors.InvalidTargetType(rawTarget).Description}");
+                continue;
+            }
+
+            if (propMap is null)
+            {
+                errors.Add($"{normalizedTarget}: Profile update must be a key/value object.");
+                continue;
+            }
+
+            foreach (var (propName, rawVal) in propMap)
+            {
+                var res = LayoutBoundsCatalog.ValidateAndResolve(normalizedTarget, propName, rawVal ?? string.Empty);
+                if (!res.IsSuccess)
+                    errors.Add($"{normalizedTarget}.{propName}: {res.Error!.Description}");
+                else
+                    validatedUpdates.Add((normalizedTarget, res.Value.CanonicalName, res.Value.Value));
+            }
+        }
+
+        if (errors.Count > 0)
+            return new SaveLayoutProfilesResponse(Saved: false, UpdatedTargets: [], Errors: errors);
+
+        if (validatedUpdates.Count == 0)
+            return new SaveLayoutProfilesResponse(Saved: true, UpdatedTargets: [], Errors: []);
+
+        var allProfiles = new Dictionary<string, LayoutProfile>(
+            await layoutRepository.GetAllProfilesAsync(cancellationToken),
+            StringComparer.OrdinalIgnoreCase);
+
+        var modifiedTargets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var globalOverrides = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var (target, canonicalKey, normalizedValue) in validatedUpdates)
+        {
+            if (!allProfiles.TryGetValue(target, out var profile))
+            {
+                profile = LayoutProfile.CreateDefault(target).Value;
+                allProfiles[target] = profile;
+            }
+
+            profile.SetProperty(canonicalKey, normalizedValue);
+            modifiedTargets.Add(target);
+            if (LayoutBoundsCatalog.IsGlobalOnlyProperty(canonicalKey))
+                globalOverrides[canonicalKey] = normalizedValue;
+        }
+
+        if (globalOverrides.Count > 0)
+        {
+            foreach (var target in LayoutBoundsCatalog.SupportedTargets)
+            {
+                if (!allProfiles.TryGetValue(target, out var profile))
+                {
+                    profile = LayoutProfile.CreateDefault(target).Value;
+                    allProfiles[target] = profile;
+                }
+
+                foreach (var (gKey, gVal) in globalOverrides)
+                {
+                    if (profile.SetProperty(gKey, gVal).IsSuccess)
+                        modifiedTargets.Add(target);
+                }
+            }
+        }
+
+        var toSave = modifiedTargets.Select(t => allProfiles[t]).ToList();
+        await layoutRepository.SaveProfilesAsync(toSave, cancellationToken);
+        return new SaveLayoutProfilesResponse(Saved: true, UpdatedTargets: [.. modifiedTargets], Errors: []);
     }
 }
 
@@ -91,56 +199,54 @@ public sealed class ResetLayoutProfileHandler(ILayoutRepository layoutRepository
         if (!LayoutBoundsCatalog.IsValidTargetType(normalizedType)) return LayoutErrors.InvalidTargetType(command.TargetType);
 
         var defaults = LayoutProfile.CreateDefault(normalizedType).Value;
-        LayoutProfile updated;
-        List<string> resetKeys;
+        var canonicalKeysToReset = new List<string>();
 
-        if (command.Keys is { Count: > 0 })
+        if (command.Keys is not null)
         {
-            updated = await layoutRepository.GetProfileAsync(normalizedType, cancellationToken);
-            resetKeys = [];
+            if (command.Keys.Count == 0)
+                return new Error("Layout.EmptyResetKeys", "Specify at least one property key to reset, or omit 'keys' to reset the entire profile.", ErrorType.Validation);
+
             foreach (var key in command.Keys)
             {
+                if (string.IsNullOrWhiteSpace(key) || !LayoutBoundsCatalog.IsValidPropertyForTarget(normalizedType, key))
+                    return LayoutErrors.UnknownProperty(normalizedType, key ?? string.Empty);
+
                 var canonical = LayoutBoundsCatalog.GetCanonicalPropertyName(normalizedType, key);
-                var defVal = defaults.GetValue(canonical);
-                if (!string.IsNullOrEmpty(defVal) && updated.SetProperty(canonical, defVal).IsSuccess)
-                    resetKeys.Add(canonical);
+                if (!canonicalKeysToReset.Contains(canonical, StringComparer.OrdinalIgnoreCase))
+                    canonicalKeysToReset.Add(canonical);
             }
         }
         else
         {
+            canonicalKeysToReset.AddRange(defaults.Values.Keys);
+        }
+
+        var allProfiles = new Dictionary<string, LayoutProfile>(
+            await layoutRepository.GetAllProfilesAsync(cancellationToken),
+            StringComparer.OrdinalIgnoreCase);
+
+        LayoutProfile updated;
+        if (command.Keys is not null)
+        {
+            updated = allProfiles.TryGetValue(normalizedType, out var existing)
+                ? existing
+                : LayoutProfile.CreateDefault(normalizedType).Value;
+            allProfiles[normalizedType] = updated;
+
+            foreach (var canonical in canonicalKeysToReset)
+                updated.SetProperty(canonical, defaults.GetValue(canonical));
+        }
+        else
+        {
             updated = defaults;
-            resetKeys = [.. defaults.Values.Keys];
+            allProfiles[normalizedType] = updated;
         }
 
-        await layoutRepository.SaveProfileAsync(updated, cancellationToken);
-        await GlobalLayoutSyncHelper.SyncKeysIfGlobalAsync(layoutRepository, normalizedType, updated, resetKeys, cancellationToken);
+        var modifiedTargets = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { normalizedType };
+        GlobalLayoutSyncHelper.SyncKeysInMemory(allProfiles, normalizedType, canonicalKeysToReset, modifiedTargets);
+
+        var toSave = modifiedTargets.Select(t => allProfiles[t]).ToList();
+        await layoutRepository.SaveProfilesAsync(toSave, cancellationToken);
         return updated;
-    }
-}
-
-public sealed class SetEntityLayoutHandler(IWorkspaceRepository workspaceRepository)
-{
-    public async Task<Result<LayoutMutationResponse>> HandleAsync(SetEntityLayoutCommand command, CancellationToken cancellationToken = default)
-    {
-        var questionOwner = await workspaceRepository.FindQuestionOwnerAsync(command.TargetEntityId, cancellationToken);
-        if (questionOwner is not null)
-        {
-            var resolved = LayoutBoundsCatalog.ValidateAndResolve(questionOwner.Question.LayoutTargetKey, command.Property, command.Value);
-            if (!resolved.IsSuccess) return resolved.Error!;
-            questionOwner.Question.SetLayoutOverride(resolved.Value.CanonicalName, resolved.Value.Value);
-            await workspaceRepository.SaveOwnerAsync(questionOwner.ToQuizOwner(), cancellationToken);
-            return new LayoutMutationResponse(questionOwner.Question.Id, resolved.Value.CanonicalName, resolved.Value.Value);
-        }
-
-        var compLookup = await workspaceRepository.FindComponentAsync(command.TargetEntityId, cancellationToken);
-        if (compLookup is not null)
-        {
-            var setRes = compLookup.Component.SetLayoutOverride(command.Property, command.Value);
-            if (!setRes.IsSuccess) return setRes.Error!;
-            await workspaceRepository.SaveSessionAsync(compLookup.Session, cancellationToken);
-            return new LayoutMutationResponse(compLookup.Component.Id, setRes.Value.CanonicalName, setRes.Value.Value);
-        }
-
-        return new Error("Layout.EntityNotFound", $"Question or component '{command.TargetEntityId}' was not found.", ErrorType.NotFound);
     }
 }

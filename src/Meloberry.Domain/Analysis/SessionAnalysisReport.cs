@@ -46,7 +46,7 @@ public sealed record SessionAnalysisReport(
             var details = s.Kind switch
             {
                 "mcq" => $"Correct: {(s.IsCorrect == true ? "Yes" : "No")}, Checks: {s.CheckAttempts ?? 0}, Selected: [{string.Join(",", s.SelectedOptionIndices ?? [])}]",
-                "fill-blank" or "assertion-reason" or "spot-error" or "diff" or "mechanism" or "relabel" => $"Correct: {(s.IsCorrect == true ? "Yes" : "No")}, Checks: {s.CheckAttempts ?? 0}",
+                "fill-blank" or "assertion-reason" or "spot-error" or "diff" or "mechanism" or "relabel" or "case" or "classify" or "match" or "numeric" => $"Correct: {(s.IsCorrect == true ? "Yes" : "No")}, Checks: {s.CheckAttempts ?? 0}",
                 "flashcard" => $"Flips: {s.FlipCount ?? 0}, Rating: {s.FlashcardRating ?? "unrated"}",
                 _ => s.VisitedCount > 0 ? "Viewed" : "Skipped"
             };

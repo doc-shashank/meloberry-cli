@@ -41,14 +41,20 @@ public sealed class PatchEntityHandler(
         ["articleBlock:image"] = new(StringComparer.OrdinalIgnoreCase) { "imagePath", "caption", "alt", "ref" },
         ["articleBlock:callout"] = new(StringComparer.OrdinalIgnoreCase) { "tone", "title", "text", "ref" },
         ["articleBlock:table"] = new(StringComparer.OrdinalIgnoreCase) { "title", "caption", "stickyFirstCol", "hideableCols", "headers", "alignments", "rows", "footnote", "ref" },
+        ["articleBlock:diagram-explore"] = new(StringComparer.OrdinalIgnoreCase) { "title", "caption", "alt", "imagePath", "hotspots", "ref" },
+        ["articleBlock:reveal"] = new(StringComparer.OrdinalIgnoreCase) { "title", "showFirst", "steps", "ref" },
         ["question:mcq"] = new(StringComparer.OrdinalIgnoreCase) { "text", "imagePath", "explanation", "isMultiCorrect", "maxOptions", "options", "ref", "layoutOverrides" },
         ["question:flashcard"] = new(StringComparer.OrdinalIgnoreCase) { "front", "back", "ref", "layoutOverrides" },
-        ["question:fill-blank"] = new(StringComparer.OrdinalIgnoreCase) { "text", "fuzzy", "caseSensitive", "explanation", "ref", "layoutOverrides" },
+        ["question:fill-blank"] = new(StringComparer.OrdinalIgnoreCase) { "text", "fuzzy", "caseSensitive", "placeholder", "explanation", "ref", "layoutOverrides" },
         ["question:assertion-reason"] = new(StringComparer.OrdinalIgnoreCase) { "assertion", "reason", "answer", "scheme", "explanation", "ref", "layoutOverrides" },
-        ["question:spot-error"] = new(StringComparer.OrdinalIgnoreCase) { "text", "requireFix", "allowNoError", "noError", "explanation", "ref", "layoutOverrides" },
+        ["question:spot-error"] = new(StringComparer.OrdinalIgnoreCase) { "text", "imagePath", "requireFix", "allowNoError", "noError", "explanation", "ref", "layoutOverrides" },
         ["question:diff"] = new(StringComparer.OrdinalIgnoreCase) { "mode", "title", "bank", "fuzzy", "caseSensitive", "allowNoError", "headers", "alignments", "rows", "explanation", "ref", "layoutOverrides" },
         ["question:mechanism"] = new(StringComparer.OrdinalIgnoreCase) { "title", "steps", "explanation", "ref", "layoutOverrides" },
-        ["question:relabel"] = new(StringComparer.OrdinalIgnoreCase) { "imagePath", "prompt", "mode", "style", "boxes", "distractors", "fuzzy", "caseSensitive", "explanation", "ref", "layoutOverrides" }
+        ["question:relabel"] = new(StringComparer.OrdinalIgnoreCase) { "imagePath", "prompt", "mode", "style", "boxes", "distractors", "fuzzy", "caseSensitive", "explanation", "ref", "layoutOverrides" },
+        ["question:case"] = new(StringComparer.OrdinalIgnoreCase) { "title", "stem", "imagePath", "caption", "questions", "explanation", "ref", "layoutOverrides" },
+        ["question:classify"] = new(StringComparer.OrdinalIgnoreCase) { "title", "buckets", "items", "explanation", "ref", "layoutOverrides" },
+        ["question:match"] = new(StringComparer.OrdinalIgnoreCase) { "title", "pairs", "distractors", "explanation", "ref", "layoutOverrides" },
+        ["question:numeric"] = new(StringComparer.OrdinalIgnoreCase) { "text", "prompt", "answer", "tolerance", "toleranceMode", "unit", "placeholder", "imagePath", "explanation", "ref", "layoutOverrides" }
     };
 
     private static readonly JsonSerializerOptions ReadOptions = new()
@@ -126,6 +132,9 @@ public sealed class PatchEntityHandler(
             }
         }
 
+        if (patchObj.Count == 0 && string.IsNullOrWhiteSpace(command.MoveSpec))
+            return new Error("Patch.Empty", "Patch payload contains no fields to update. Provide at least one field, --set k=v, or --move <idx>:<shift|exchange>.", ErrorType.Validation);
+
         if (AllowedKeysByKind.TryGetValue(schemaKey, out var allowedKeys))
         {
             foreach (var kv in patchObj)
@@ -197,6 +206,8 @@ public sealed class PatchEntityHandler(
             ArticleBlockKind.Image => "articleBlock:image",
             ArticleBlockKind.Callout => "articleBlock:callout",
             ArticleBlockKind.Table => "articleBlock:table",
+            ArticleBlockKind.DiagramExplore => "articleBlock:diagram-explore",
+            ArticleBlockKind.Reveal => "articleBlock:reveal",
             _ => "articleBlock:text"
         },
         "question" => $"question:{Question.ToWireString(target.Question!.Type)}",
@@ -255,44 +266,9 @@ public sealed class PatchEntityHandler(
 
         if (childLower is not null)
         {
-            if (topLower == "layoutoverrides")
-                return string.Equals(trimmed, "null", StringComparison.OrdinalIgnoreCase) ? null : JsonValue.Create(rawVal);
-
-            if (schemaKey == "question:flashcard" && topLower is "front" or "back")
-            {
-                if (childLower is "text" or "imagepath")
-                    return string.Equals(trimmed, "null", StringComparison.OrdinalIgnoreCase) ? null : JsonValue.Create(rawVal);
-                return JsonValue.Create(rawVal);
-            }
-
-            return JsonValue.Create(rawVal);
-        }
-
-        if (schemaKey == "question:mcq")
-        {
-            if (topLower == "ismulticorrect")
-            {
-                if (string.Equals(trimmed, "true", StringComparison.OrdinalIgnoreCase)) return JsonValue.Create(true);
-                if (string.Equals(trimmed, "false", StringComparison.OrdinalIgnoreCase)) return JsonValue.Create(false);
-                return JsonValue.Create(rawVal);
-            }
-            if (topLower == "maxoptions")
-            {
-                if (int.TryParse(trimmed, NumberStyles.Integer, CultureInfo.InvariantCulture, out int intVal))
-                    return JsonValue.Create(intVal);
-                return JsonValue.Create(rawVal);
-            }
-        }
-
-        if ((schemaKey == "articleBlock:table" && topLower == "stickyfirstcol") ||
-            (schemaKey == "question:fill-blank" && topLower is "fuzzy" or "casesensitive") ||
-            (schemaKey == "question:spot-error" && topLower is "requirefix" or "allownoerror" or "noerror") ||
-            (schemaKey == "question:diff" && topLower is "bank" or "fuzzy" or "casesensitive" or "allownoerror") ||
-            (schemaKey == "question:relabel" && topLower is "fuzzy" or "casesensitive"))
-        {
-            if (string.Equals(trimmed, "true", StringComparison.OrdinalIgnoreCase)) return JsonValue.Create(true);
-            if (string.Equals(trimmed, "false", StringComparison.OrdinalIgnoreCase)) return JsonValue.Create(false);
-            return JsonValue.Create(rawVal);
+            return string.Equals(trimmed, "null", StringComparison.OrdinalIgnoreCase)
+                ? null
+                : JsonValue.Create(rawVal);
         }
 
         if (schemaKey == "articleBlock:table" && topLower == "hideablecols")
@@ -315,32 +291,52 @@ public sealed class PatchEntityHandler(
             return arr;
         }
 
-        if (topLower is "options" or "layoutoverrides" or "front" or "back" or "headers" or "alignments" or "rows" or "steps" or "boxes" or "distractors")
+        if (string.Equals(trimmed, "null", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        if (schemaKey == "question:mcq")
         {
-            if (string.Equals(trimmed, "null", StringComparison.OrdinalIgnoreCase)) return null;
+            if (topLower == "ismulticorrect")
+            {
+                if (string.Equals(trimmed, "true", StringComparison.OrdinalIgnoreCase)) return JsonValue.Create(true);
+                if (string.Equals(trimmed, "false", StringComparison.OrdinalIgnoreCase)) return JsonValue.Create(false);
+                return JsonValue.Create(rawVal);
+            }
+            if (topLower == "maxoptions")
+            {
+                if (int.TryParse(trimmed, NumberStyles.Integer, CultureInfo.InvariantCulture, out int intVal))
+                    return JsonValue.Create(intVal);
+                return JsonValue.Create(rawVal);
+            }
+        }
+
+        if ((schemaKey == "articleBlock:table" && topLower == "stickyfirstcol") ||
+            (schemaKey == "articleBlock:reveal" && topLower == "showfirst") ||
+            (schemaKey == "question:fill-blank" && topLower is "fuzzy" or "casesensitive") ||
+            (schemaKey == "question:spot-error" && topLower is "requirefix" or "allownoerror" or "noerror") ||
+            (schemaKey == "question:diff" && topLower is "bank" or "fuzzy" or "casesensitive" or "allownoerror") ||
+            (schemaKey == "question:relabel" && topLower is "fuzzy" or "casesensitive"))
+        {
+            if (string.Equals(trimmed, "true", StringComparison.OrdinalIgnoreCase)) return JsonValue.Create(true);
+            if (string.Equals(trimmed, "false", StringComparison.OrdinalIgnoreCase)) return JsonValue.Create(false);
+            return JsonValue.Create(rawVal);
+        }
+
+        if (schemaKey == "question:numeric" && topLower == "answer")
+        {
+            if (double.TryParse(trimmed, NumberStyles.Float, CultureInfo.InvariantCulture, out double dVal))
+                return JsonValue.Create(dVal);
+            return JsonValue.Create(rawVal);
+        }
+
+        if (topLower is "options" or "layoutoverrides" or "front" or "back" or "headers" or "alignments" or "rows" or "steps" or "boxes" or "distractors" or "hotspots" or "buckets" or "items" or "pairs" or "questions")
+        {
             if ((trimmed.StartsWith('{') && trimmed.EndsWith('}')) || (trimmed.StartsWith('[') && trimmed.EndsWith(']')))
             {
                 try { return JsonNode.Parse(trimmed); } catch { }
             }
             return JsonValue.Create(rawVal);
         }
-
-        bool isNullableString = (schemaKey, topLower) switch
-        {
-            ("session" or "quiz", "description") => true,
-            (_, "ref") => true,
-            ("articleBlock:image", "caption" or "alt") => true,
-            ("articleBlock:callout", "title") => true,
-            ("articleBlock:table", "title" or "caption" or "footnote") => true,
-            ("question:mcq", "imagepath" or "explanation") => true,
-            ("question:fill-blank" or "question:assertion-reason" or "question:spot-error", "explanation") => true,
-            ("question:diff" or "question:mechanism", "title" or "explanation") => true,
-            ("question:relabel", "prompt" or "explanation" or "imagepath") => true,
-            _ => false
-        };
-
-        if (isNullableString && string.Equals(trimmed, "null", StringComparison.OrdinalIgnoreCase))
-            return null;
 
         return JsonValue.Create(rawVal);
     }
@@ -431,6 +427,14 @@ public sealed class PatchEntityHandler(
         if (block.Kind == ArticleBlockKind.Table)
         {
             return ApplyTableBlockPatch(block, patch);
+        }
+        if (block.Kind == ArticleBlockKind.DiagramExplore)
+        {
+            return await ApplyDiagramExploreBlockPatchAsync(block, storageDir, jsonDir, patch, ct);
+        }
+        if (block.Kind == ArticleBlockKind.Reveal)
+        {
+            return ApplyRevealBlockPatch(block, patch);
         }
         if (TryGetProp(patch, "text", out var textNode))
         {
@@ -651,6 +655,137 @@ public sealed class PatchEntityHandler(
         return block.UpdateTablePayload(Phase1PayloadCodec.Serialize(updated), title, updateTitle);
     }
 
+    private async Task<Result> ApplyDiagramExploreBlockPatchAsync(
+        ArticleBlock block,
+        string storageDir,
+        string jsonDir,
+        JsonObject patch,
+        CancellationToken ct)
+    {
+        if (!Phase1PayloadCodec.TryDeserialize<DiagramExplorePayload>(block.PayloadJson, out var current) || current is null)
+            return ArticleErrors.InvalidDiagramExplorePayload("Existing diagram-explore block has corrupted payload JSON.");
+
+        var imagePath = !string.IsNullOrWhiteSpace(current.ImagePath) ? current.ImagePath : (block.ImagePath ?? string.Empty);
+        var title = current.Title ?? block.CalloutTitle;
+        var caption = current.Caption ?? block.Caption;
+        var alt = block.Alt;
+        var hotspots = current.Hotspots ?? [];
+        bool updateTitle = false, updateCaption = false, updateAlt = false;
+
+        if (TryGetProp(patch, "title", out var tN))
+        {
+            if (tN is not null && tN.GetValueKind() != JsonValueKind.String)
+                return new Error("Patch.InvalidValue", "'title' must be a string or null.", ErrorType.Validation, Path: "title");
+            title = string.IsNullOrWhiteSpace(tN?.GetValue<string>()) ? null : tN!.GetValue<string>().Trim();
+            updateTitle = true;
+        }
+        if (TryGetProp(patch, "caption", out var cN))
+        {
+            if (cN is not null && cN.GetValueKind() != JsonValueKind.String)
+                return new Error("Patch.InvalidValue", "'caption' must be a string or null.", ErrorType.Validation, Path: "caption");
+            caption = string.IsNullOrWhiteSpace(cN?.GetValue<string>()) ? null : cN!.GetValue<string>().Trim();
+            updateCaption = true;
+        }
+        if (TryGetProp(patch, "alt", out var aN))
+        {
+            if (aN is not null && aN.GetValueKind() != JsonValueKind.String)
+                return new Error("Patch.InvalidValue", "'alt' must be a string or null.", ErrorType.Validation, Path: "alt");
+            alt = string.IsNullOrWhiteSpace(aN?.GetValue<string>()) ? null : aN!.GetValue<string>().Trim();
+            updateAlt = true;
+        }
+        if (TryGetProp(patch, "imagePath", out var imgN))
+        {
+            var rawImg = imgN?.GetValueKind() == JsonValueKind.String ? imgN.GetValue<string>() : null;
+            if (string.IsNullOrWhiteSpace(rawImg))
+                return new Error("Patch.InvalidValue", "'imagePath' must be a non-empty string.", ErrorType.Validation, Path: "imagePath");
+            var copyRes = await JsonQuestionMaterializer.CopyConfinedImageAsync(rawImg, jsonDir, storageDir, contentInspector, ct, workspaceCwdDirectory: workingDirectoryProvider.GetCurrentDirectory());
+            if (!copyRes.IsSuccess) return copyRes.Error!;
+            imagePath = copyRes.Value ?? imagePath;
+        }
+        if (TryGetProp(patch, "hotspots", out var hsN))
+        {
+            if (hsN is not JsonArray hArr || hArr.Count == 0)
+                return new Error("Patch.InvalidValue", "'hotspots' must be a non-empty array.", ErrorType.Validation, Path: "hotspots");
+            var parsed = new List<DiagramHotspot>(hArr.Count);
+            for (int i = 0; i < hArr.Count; i++)
+            {
+                if (hArr[i] is not JsonObject ho ||
+                    !TryGetProp(ho, "label", out var lN) || lN is null || lN.GetValueKind() != JsonValueKind.String ||
+                    !TryGetProp(ho, "note", out var nN) || nN is null || nN.GetValueKind() != JsonValueKind.String)
+                    return new Error("Patch.InvalidValue", $"Hotspot at index {i} must specify 'label' and 'note' strings.", ErrorType.Validation, Path: "hotspots");
+
+                double bx, by, bw, bh;
+                if (TryGetProp(ho, "rect", out var rectN) && rectN is JsonArray rArr && rArr.Count == 4 &&
+                    rArr[0] is JsonValue r0 && r0.TryGetValue<double>(out bx) &&
+                    rArr[1] is JsonValue r1 && r1.TryGetValue<double>(out by) &&
+                    rArr[2] is JsonValue r2 && r2.TryGetValue<double>(out bw) &&
+                    rArr[3] is JsonValue r3 && r3.TryGetValue<double>(out bh))
+                {
+                }
+                else if (TryGetProp(ho, "x", out var xN) && xN is JsonValue xv && xv.TryGetValue<double>(out bx) &&
+                         TryGetProp(ho, "y", out var yN) && yN is JsonValue yv && yv.TryGetValue<double>(out by) &&
+                         TryGetProp(ho, "w", out var wN) && wN is JsonValue wv && wv.TryGetValue<double>(out bw) &&
+                         TryGetProp(ho, "h", out var hN) && hN is JsonValue hv && hv.TryGetValue<double>(out bh))
+                {
+                }
+                else
+                {
+                    return new Error("Patch.InvalidValue", $"Hotspot at index {i} must specify 'rect: [x,y,w,h]' or 'x','y','w','h'.", ErrorType.Validation, Path: "hotspots");
+                }
+
+                var candidate = new DiagramHotspot(i, lN.GetValue<string>().Trim(), nN.GetValue<string>().Trim(), bx, by, bw, bh);
+                if (!Phase3PayloadRules.HasValidHotspotBounds(candidate))
+                    return new Error("Patch.InvalidValue", $"Hotspot at index {i} bounds are out of [0..1] range.", ErrorType.Validation, Path: "hotspots");
+                parsed.Add(candidate);
+            }
+            hotspots = parsed;
+        }
+
+        var canonical = Phase1PayloadCodec.Serialize(new DiagramExplorePayload(imagePath, title, caption, hotspots));
+        return block.UpdateDiagramExplorePayload(imagePath, canonical, title, updateTitle, caption, updateCaption, alt, updateAlt);
+    }
+
+    private static Result ApplyRevealBlockPatch(ArticleBlock block, JsonObject patch)
+    {
+        if (!Phase1PayloadCodec.TryDeserialize<RevealBlockPayload>(block.PayloadJson, out var current) || current is null)
+            return ArticleErrors.InvalidRevealPayload("Existing reveal block has corrupted payload JSON.");
+
+        var title = current.Title ?? block.CalloutTitle;
+        var showFirst = current.ShowFirst;
+        var steps = current.Steps ?? [];
+        bool updateTitle = false;
+
+        if (TryGetProp(patch, "title", out var tN))
+        {
+            if (tN is not null && tN.GetValueKind() != JsonValueKind.String)
+                return new Error("Patch.InvalidValue", "'title' must be a string or null.", ErrorType.Validation, Path: "title");
+            title = string.IsNullOrWhiteSpace(tN?.GetValue<string>()) ? null : tN!.GetValue<string>().Trim();
+            updateTitle = true;
+        }
+        if (TryGetProp(patch, "showFirst", out var sfN))
+        {
+            if (sfN is not JsonValue sfv || !sfv.TryGetValue<bool>(out showFirst))
+                return new Error("Patch.InvalidValue", "'showFirst' must be a boolean.", ErrorType.Validation, Path: "showFirst");
+        }
+        if (TryGetProp(patch, "steps", out var stN))
+        {
+            if (stN is not JsonArray stArr || stArr.Count == 0)
+                return new Error("Patch.InvalidValue", "'steps' must be a non-empty array of {heading, body}.", ErrorType.Validation, Path: "steps");
+            var parsed = new List<RevealStep>(stArr.Count);
+            for (int i = 0; i < stArr.Count; i++)
+            {
+                if (stArr[i] is not JsonObject so ||
+                    !TryGetProp(so, "heading", out var hN) || hN is null || hN.GetValueKind() != JsonValueKind.String ||
+                    !TryGetProp(so, "body", out var bN) || bN is null || bN.GetValueKind() != JsonValueKind.String)
+                    return new Error("Patch.InvalidValue", $"Reveal step at index {i} must specify 'heading' and 'body' strings.", ErrorType.Validation, Path: "steps");
+                parsed.Add(new RevealStep(i, hN.GetValue<string>().Trim(), bN.GetValue<string>().Trim()));
+            }
+            steps = parsed;
+        }
+
+        return block.UpdateRevealPayload(Phase1PayloadCodec.Serialize(new RevealBlockPayload(title, showFirst, steps)), title, updateTitle);
+    }
+
     private async Task<Result> ApplyPayloadQuestionPatchAsync(PayloadQuestion pq, string storageDir, string jsonDir, JsonObject patch, CancellationToken ct)
     {
         switch (pq.Type)
@@ -665,6 +800,7 @@ public sealed class PatchEntityHandler(
                 var fuzzy = current.Fuzzy;
                 var caseSensitive = current.CaseSensitive;
                 var explanation = current.Explanation;
+                var placeholder = current.Placeholder;
 
                 if (TryGetProp(patch, "text", out var textNode))
                 {
@@ -685,6 +821,12 @@ public sealed class PatchEntityHandler(
                     if (csNode is not JsonValue cv || !cv.TryGetValue<bool>(out caseSensitive))
                         return new Error("Patch.InvalidValue", "'caseSensitive' must be a boolean.", ErrorType.Validation, Path: "caseSensitive");
                 }
+                if (TryGetProp(patch, "placeholder", out var phNode))
+                {
+                    if (phNode is not null && phNode.GetValueKind() != JsonValueKind.String)
+                        return new Error("Patch.InvalidValue", "'placeholder' must be a string or null.", ErrorType.Validation, Path: "placeholder");
+                    placeholder = string.IsNullOrWhiteSpace(phNode?.GetValue<string>()) ? null : phNode!.GetValue<string>().Trim();
+                }
                 if (TryGetProp(patch, "explanation", out var expNode))
                 {
                     if (expNode is not null && expNode.GetValueKind() != JsonValueKind.String)
@@ -692,7 +834,7 @@ public sealed class PatchEntityHandler(
                     explanation = string.IsNullOrWhiteSpace(expNode?.GetValue<string>()) ? null : expNode!.GetValue<string>().Trim();
                 }
 
-                return pq.SetPayloadJson(Phase1PayloadCodec.Serialize(new FillBlankPayload(template, blanks, fuzzy, caseSensitive, explanation)));
+                return pq.SetPayloadJson(Phase1PayloadCodec.Serialize(new FillBlankPayload(template, blanks, fuzzy, caseSensitive, explanation, placeholder)));
             }
             case QuestionType.AssertionReason:
             {
@@ -763,6 +905,7 @@ public sealed class PatchEntityHandler(
                 var allowNoError = current.AllowNoError;
                 var noError = current.NoError;
                 var explanation = current.Explanation;
+                var imagePath = current.ImagePath;
 
                 if (TryGetProp(patch, "text", out var textNode))
                 {
@@ -772,6 +915,23 @@ public sealed class PatchEntityHandler(
                     var segsRes = Phase1PayloadRules.ParseSpotErrorTemplate(template);
                     if (!segsRes.IsSuccess) return segsRes.Error!;
                     segments = segsRes.Value;
+                }
+                if (TryGetProp(patch, "imagePath", out var imgNode))
+                {
+                    if (imgNode is null || string.IsNullOrWhiteSpace(imgNode.GetValueKind() == JsonValueKind.String ? imgNode.GetValue<string>() : null))
+                    {
+                        if (imgNode is not null && imgNode.GetValueKind() != JsonValueKind.String)
+                            return new Error("Patch.InvalidValue", "'imagePath' must be a string or null.", ErrorType.Validation, Path: "imagePath");
+                        imagePath = null;
+                    }
+                    else
+                    {
+                        var copyRes = await JsonQuestionMaterializer.CopyConfinedImageAsync(
+                            imgNode.GetValue<string>(), jsonDir, storageDir, contentInspector, ct,
+                            workspaceCwdDirectory: workingDirectoryProvider.GetCurrentDirectory());
+                        if (!copyRes.IsSuccess) return copyRes.Error!;
+                        imagePath = copyRes.Value;
+                    }
                 }
                 if (TryGetProp(patch, "requireFix", out var rfNode))
                 {
@@ -799,7 +959,7 @@ public sealed class PatchEntityHandler(
                     explanation = string.IsNullOrWhiteSpace(expNode?.GetValue<string>()) ? null : expNode!.GetValue<string>().Trim();
                 }
 
-                return pq.SetPayloadJson(Phase1PayloadCodec.Serialize(new SpotErrorPayload(template, segments, requireFix, allowNoError, noError, explanation)));
+                return pq.SetPayloadJson(Phase1PayloadCodec.Serialize(new SpotErrorPayload(template, segments, requireFix, allowNoError, noError, explanation, imagePath)));
             }
             case QuestionType.Differentiation:
             {
@@ -1168,6 +1328,257 @@ public sealed class PatchEntityHandler(
                 return pq.SetPayloadJson(Phase1PayloadCodec.Serialize(new RelabelImagePayload(
                     imagePath, prompt, mode, style, boxes, distractors, fuzzy, caseSensitive, explanation)));
             }
+            case QuestionType.Classify:
+            {
+                if (!Phase1PayloadCodec.TryDeserialize<ClassifyPayload>(pq.PayloadJson, out var current) || current is null)
+                    return new Error("Patch.InvalidValue", "Existing classify question has corrupted payload JSON.", ErrorType.Validation);
+
+                var title = current.Title;
+                var buckets = current.Buckets ?? [];
+                var items = current.Items ?? [];
+                var explanation = current.Explanation;
+
+                if (TryGetProp(patch, "title", out var titleN))
+                {
+                    if (titleN is not null && titleN.GetValueKind() != JsonValueKind.String)
+                        return new Error("Patch.InvalidValue", "'title' must be a string or null.", ErrorType.Validation, Path: "title");
+                    title = string.IsNullOrWhiteSpace(titleN?.GetValue<string>()) ? null : titleN!.GetValue<string>().Trim();
+                }
+                if (TryGetProp(patch, "explanation", out var expN))
+                {
+                    if (expN is not null && expN.GetValueKind() != JsonValueKind.String)
+                        return new Error("Patch.InvalidValue", "'explanation' must be a string or null.", ErrorType.Validation, Path: "explanation");
+                    explanation = string.IsNullOrWhiteSpace(expN?.GetValue<string>()) ? null : expN!.GetValue<string>().Trim();
+                }
+                if (TryGetProp(patch, "buckets", out var bN))
+                {
+                    if (bN is not JsonArray bArr || bArr.Count == 0)
+                        return new Error("Patch.InvalidValue", "'buckets' must be a non-empty array.", ErrorType.Validation, Path: "buckets");
+                    var parsedB = new List<ClassifyBucket>(bArr.Count);
+                    for (int i = 0; i < bArr.Count; i++)
+                    {
+                        var el = bArr[i];
+                        if (el is JsonValue sv && sv.GetValueKind() == JsonValueKind.String)
+                            parsedB.Add(new ClassifyBucket(i, sv.GetValue<string>().Trim()));
+                        else if (el is JsonObject bo && TryGetProp(bo, "name", out var bn) && bn is not null && bn.GetValueKind() == JsonValueKind.String)
+                        {
+                            int bid = TryGetProp(bo, "bucketId", out var bi) && bi is JsonValue biv && biv.TryGetValue<int>(out var bIdVal) ? bIdVal : i;
+                            parsedB.Add(new ClassifyBucket(bid, bn.GetValue<string>().Trim()));
+                        }
+                        else return new Error("Patch.InvalidValue", $"Classify bucket at index {i} must be string or {{bucketId, name}}.", ErrorType.Validation, Path: "buckets");
+                    }
+                    buckets = parsedB;
+                }
+                if (TryGetProp(patch, "items", out var itN))
+                {
+                    if (itN is not JsonArray itArr || itArr.Count == 0)
+                        return new Error("Patch.InvalidValue", "'items' must be a non-empty array.", ErrorType.Validation, Path: "items");
+                    var parsedItems = new List<ClassifyItem>(itArr.Count);
+                    for (int i = 0; i < itArr.Count; i++)
+                    {
+                        if (itArr[i] is not JsonObject io || !TryGetProp(io, "text", out var txN) || txN is null || txN.GetValueKind() != JsonValueKind.String)
+                            return new Error("Patch.InvalidValue", $"Classify item at index {i} must have 'text'.", ErrorType.Validation, Path: "items");
+                        int bid = -1;
+                        if (TryGetProp(io, "bucketId", out var biN) && biN is JsonValue biv && biv.TryGetValue<int>(out var bidVal))
+                            bid = bidVal;
+                        else if (TryGetProp(io, "bucket", out var bNameN) && bNameN is not null && bNameN.GetValueKind() == JsonValueKind.String)
+                            bid = buckets.FirstOrDefault(b => string.Equals(b.Name, bNameN.GetValue<string>().Trim(), StringComparison.OrdinalIgnoreCase))?.BucketId ?? -1;
+                        parsedItems.Add(new ClassifyItem(i, bid, txN.GetValue<string>().Trim()));
+                    }
+                    items = parsedItems;
+                }
+
+                return pq.SetPayloadJson(Phase1PayloadCodec.Serialize(new ClassifyPayload(title, buckets, items, explanation)));
+            }
+            case QuestionType.Match:
+            {
+                if (!Phase1PayloadCodec.TryDeserialize<MatchPayload>(pq.PayloadJson, out var current) || current is null)
+                    return new Error("Patch.InvalidValue", "Existing match question has corrupted payload JSON.", ErrorType.Validation);
+
+                var title = current.Title;
+                var pairs = current.Pairs ?? [];
+                var distractors = current.Distractors ?? [];
+                var explanation = current.Explanation;
+
+                if (TryGetProp(patch, "title", out var titleN))
+                {
+                    if (titleN is not null && titleN.GetValueKind() != JsonValueKind.String)
+                        return new Error("Patch.InvalidValue", "'title' must be a string or null.", ErrorType.Validation, Path: "title");
+                    title = string.IsNullOrWhiteSpace(titleN?.GetValue<string>()) ? null : titleN!.GetValue<string>().Trim();
+                }
+                if (TryGetProp(patch, "explanation", out var expN))
+                {
+                    if (expN is not null && expN.GetValueKind() != JsonValueKind.String)
+                        return new Error("Patch.InvalidValue", "'explanation' must be a string or null.", ErrorType.Validation, Path: "explanation");
+                    explanation = string.IsNullOrWhiteSpace(expN?.GetValue<string>()) ? null : expN!.GetValue<string>().Trim();
+                }
+                if (TryGetProp(patch, "pairs", out var pairsN))
+                {
+                    if (pairsN is not JsonArray pArr || pArr.Count == 0)
+                        return new Error("Patch.InvalidValue", "'pairs' must be a non-empty array of {left, right}.", ErrorType.Validation, Path: "pairs");
+                    var parsedPairs = new List<MatchPair>(pArr.Count);
+                    for (int i = 0; i < pArr.Count; i++)
+                    {
+                        if (pArr[i] is not JsonObject po ||
+                            !TryGetProp(po, "left", out var lN) || lN is null || lN.GetValueKind() != JsonValueKind.String ||
+                            !TryGetProp(po, "right", out var rN) || rN is null || rN.GetValueKind() != JsonValueKind.String)
+                            return new Error("Patch.InvalidValue", $"Match pair at index {i} must specify 'left' and 'right' strings.", ErrorType.Validation, Path: "pairs");
+                        parsedPairs.Add(new MatchPair(i, lN.GetValue<string>().Trim(), rN.GetValue<string>().Trim()));
+                    }
+                    pairs = parsedPairs;
+                }
+                if (TryGetProp(patch, "distractors", out var distN))
+                {
+                    if (distN is null) distractors = [];
+                    else if (distN is JsonArray dArr)
+                        distractors = dArr.Select(x => x?.GetValue<string>()?.Trim() ?? string.Empty).Where(s => !string.IsNullOrEmpty(s)).ToList();
+                    else
+                        return new Error("Patch.InvalidValue", "'distractors' must be an array of strings or null.", ErrorType.Validation, Path: "distractors");
+                }
+
+                return pq.SetPayloadJson(Phase1PayloadCodec.Serialize(new MatchPayload(title, pairs, distractors, explanation)));
+            }
+            case QuestionType.Numeric:
+            {
+                if (!Phase1PayloadCodec.TryDeserialize<NumericPayload>(pq.PayloadJson, out var current) || current is null)
+                    return new Error("Patch.InvalidValue", "Existing numeric question has corrupted payload JSON.", ErrorType.Validation);
+
+                var prompt = current.Prompt;
+                var answer = current.Answer;
+                var tolerance = current.Tolerance;
+                var tolMode = current.ToleranceMode;
+                var unit = current.Unit;
+                var placeholder = current.Placeholder;
+                var explanation = current.Explanation;
+                var imagePath = current.ImagePath;
+
+                if (TryGetProp(patch, "prompt", out var prN) || TryGetProp(patch, "text", out prN))
+                {
+                    if (prN is null || prN.GetValueKind() != JsonValueKind.String || string.IsNullOrWhiteSpace(prN.GetValue<string>()))
+                        return new Error("Patch.InvalidValue", "'prompt'/'text' must be a non-empty string.", ErrorType.Validation, Path: "prompt");
+                    prompt = prN.GetValue<string>().Trim();
+                }
+                if (TryGetProp(patch, "answer", out var ansN))
+                {
+                    if (ansN is not JsonValue av || !av.TryGetValue<double>(out answer) || !double.IsFinite(answer))
+                        return new Error("Patch.InvalidValue", "'answer' must be a finite number.", ErrorType.Validation, Path: "answer");
+                }
+                if (TryGetProp(patch, "tolerance", out var tolN))
+                {
+                    if (tolN is JsonValue tv && tv.GetValueKind() == JsonValueKind.Number && tv.TryGetValue<double>(out double dblTol) && double.IsFinite(dblTol) && dblTol >= 0)
+                    {
+                        tolerance = dblTol;
+                    }
+                    else if (tolN is JsonValue sv && sv.GetValueKind() == JsonValueKind.String &&
+                             Phase3PayloadRules.TryParseToleranceSpec(sv.GetValue<string>(), tolMode, out double parsedTol, out string parsedMode))
+                    {
+                        tolerance = parsedTol;
+                        tolMode = parsedMode;
+                    }
+                    else
+                    {
+                        return new Error("Patch.InvalidValue", "'tolerance' must be a non-negative number or percentage like '5%'.", ErrorType.Validation, Path: "tolerance");
+                    }
+                }
+                if (TryGetProp(patch, "toleranceMode", out var tmN))
+                {
+                    if (tmN is null || tmN.GetValueKind() != JsonValueKind.String || !Phase3PayloadRules.IsValidToleranceMode(tmN.GetValue<string>()))
+                        return new Error("Patch.InvalidValue", "'toleranceMode' must be 'absolute' or 'percent'.", ErrorType.Validation, Path: "toleranceMode");
+                    tolMode = Phase3PayloadRules.NormalizeToleranceMode(tmN.GetValue<string>());
+                }
+                if (TryGetProp(patch, "unit", out var uN))
+                {
+                    if (uN is not null && uN.GetValueKind() != JsonValueKind.String)
+                        return new Error("Patch.InvalidValue", "'unit' must be a string or null.", ErrorType.Validation, Path: "unit");
+                    unit = string.IsNullOrWhiteSpace(uN?.GetValue<string>()) ? null : uN!.GetValue<string>().Trim();
+                }
+                if (TryGetProp(patch, "placeholder", out var phN))
+                {
+                    if (phN is not null && phN.GetValueKind() != JsonValueKind.String)
+                        return new Error("Patch.InvalidValue", "'placeholder' must be a string or null.", ErrorType.Validation, Path: "placeholder");
+                    placeholder = string.IsNullOrWhiteSpace(phN?.GetValue<string>()) ? null : phN!.GetValue<string>().Trim();
+                }
+                if (TryGetProp(patch, "explanation", out var expN))
+                {
+                    if (expN is not null && expN.GetValueKind() != JsonValueKind.String)
+                        return new Error("Patch.InvalidValue", "'explanation' must be a string or null.", ErrorType.Validation, Path: "explanation");
+                    explanation = string.IsNullOrWhiteSpace(expN?.GetValue<string>()) ? null : expN!.GetValue<string>().Trim();
+                }
+                if (TryGetProp(patch, "imagePath", out var imgN))
+                {
+                    if (imgN is null) imagePath = null;
+                    else if (imgN.GetValueKind() == JsonValueKind.String)
+                    {
+                        var copyRes = await JsonQuestionMaterializer.CopyConfinedImageAsync(imgN.GetValue<string>(), jsonDir, storageDir, contentInspector, ct, workspaceCwdDirectory: workingDirectoryProvider.GetCurrentDirectory());
+                        if (!copyRes.IsSuccess) return copyRes.Error!;
+                        imagePath = copyRes.Value;
+                    }
+                    else return new Error("Patch.InvalidValue", "'imagePath' must be a string or null.", ErrorType.Validation, Path: "imagePath");
+                }
+
+                return pq.SetPayloadJson(Phase1PayloadCodec.Serialize(new NumericPayload(prompt, answer, tolerance, tolMode, unit, placeholder, explanation, imagePath)));
+            }
+            case QuestionType.CaseGroup:
+            {
+                if (!Phase1PayloadCodec.TryDeserialize<CaseGroupPayload>(pq.PayloadJson, out var current) || current is null)
+                    return new Error("Patch.InvalidValue", "Existing case question has corrupted payload JSON.", ErrorType.Validation);
+
+                var title = current.Title;
+                var stem = current.Stem;
+                var imagePath = current.ImagePath;
+                var caption = current.Caption;
+                var questions = current.Questions ?? [];
+                var explanation = current.Explanation;
+
+                if (TryGetProp(patch, "title", out var titleN))
+                {
+                    if (titleN is not null && titleN.GetValueKind() != JsonValueKind.String)
+                        return new Error("Patch.InvalidValue", "'title' must be a string or null.", ErrorType.Validation, Path: "title");
+                    title = string.IsNullOrWhiteSpace(titleN?.GetValue<string>()) ? null : titleN!.GetValue<string>().Trim();
+                }
+                if (TryGetProp(patch, "stem", out var stemN))
+                {
+                    if (stemN is null || stemN.GetValueKind() != JsonValueKind.String || string.IsNullOrWhiteSpace(stemN.GetValue<string>()))
+                        return new Error("Patch.InvalidValue", "'stem' must be a non-empty string.", ErrorType.Validation, Path: "stem");
+                    stem = stemN.GetValue<string>().Trim();
+                }
+                if (TryGetProp(patch, "caption", out var capN))
+                {
+                    if (capN is not null && capN.GetValueKind() != JsonValueKind.String)
+                        return new Error("Patch.InvalidValue", "'caption' must be a string or null.", ErrorType.Validation, Path: "caption");
+                    caption = string.IsNullOrWhiteSpace(capN?.GetValue<string>()) ? null : capN!.GetValue<string>().Trim();
+                }
+                if (TryGetProp(patch, "explanation", out var expN))
+                {
+                    if (expN is not null && expN.GetValueKind() != JsonValueKind.String)
+                        return new Error("Patch.InvalidValue", "'explanation' must be a string or null.", ErrorType.Validation, Path: "explanation");
+                    explanation = string.IsNullOrWhiteSpace(expN?.GetValue<string>()) ? null : expN!.GetValue<string>().Trim();
+                }
+                if (TryGetProp(patch, "imagePath", out var imgN))
+                {
+                    if (imgN is null) imagePath = null;
+                    else if (imgN.GetValueKind() == JsonValueKind.String)
+                    {
+                        var copyRes = await JsonQuestionMaterializer.CopyConfinedImageAsync(imgN.GetValue<string>(), jsonDir, storageDir, contentInspector, ct, workspaceCwdDirectory: workingDirectoryProvider.GetCurrentDirectory());
+                        if (!copyRes.IsSuccess) return copyRes.Error!;
+                        imagePath = copyRes.Value;
+                    }
+                    else return new Error("Patch.InvalidValue", "'imagePath' must be a string or null.", ErrorType.Validation, Path: "imagePath");
+                }
+                if (TryGetProp(patch, "questions", out var qN))
+                {
+                    List<CaseSubQuestion>? deserialized;
+                    try { deserialized = JsonSerializer.Deserialize<List<CaseSubQuestion>>(qN?.ToJsonString() ?? "null", ReadOptions); }
+                    catch (JsonException ex) { return new Error("Patch.InvalidValue", $"Invalid 'questions' array: {ex.Message}", ErrorType.Validation, Path: "questions"); }
+                    if (deserialized is null || deserialized.Count < 2)
+                        return new Error("Patch.InvalidValue", "'questions' must contain at least 2 valid sub-questions.", ErrorType.Validation, Path: "questions");
+                    if (deserialized.Any(s => string.Equals(s.Type?.Trim(), "case", StringComparison.OrdinalIgnoreCase)))
+                        return new Error("Case.NestedCaseNotAllowed", "Nested 'case' sub-questions inside 'case' are not allowed.", ErrorType.Validation, Path: "questions");
+                    questions = deserialized.Select((s, idx) => s with { Index = idx }).ToList();
+                }
+
+                return pq.SetPayloadJson(Phase1PayloadCodec.Serialize(new CaseGroupPayload(title, stem, imagePath, caption, questions, explanation)));
+            }
             default:
                 return new Error("Patch.UnsupportedTarget", $"Unsupported question type '{pq.Type}'.", ErrorType.Validation);
         }
@@ -1222,6 +1633,10 @@ public sealed class PatchEntityHandler(
         {
             if (optsNode is not JsonArray optsArr)
                 return new Error("Patch.InvalidValue", "'options' must be an array.", ErrorType.Validation, Path: "options");
+            if (optsArr.Count < 2)
+                return new Error("Patch.InvalidValue", "'options' must contain at least 2 options.", ErrorType.Validation, Path: "options");
+            if (optsArr.Count > 26)
+                return QuestionErrors.InvalidMaxOptions(optsArr.Count);
 
             var parsedOpts = new List<PatchOptionDto>(optsArr.Count);
             for (int i = 0; i < optsArr.Count; i++)
@@ -1252,12 +1667,27 @@ public sealed class PatchEntityHandler(
             {
                 var o = parsedOpts[i];
                 int idx = o.Index > 0 ? o.Index : i + 1;
+                if (o.Index < 0)
+                    return new Error("Patch.InvalidValue", $"Option index {o.Index} must be >= 1.", ErrorType.Validation, Path: $"options[{i}]");
                 if (!seenIndices.Add(idx))
                     return new Error("Json.DuplicateOptionIndex", $"MCQ contains duplicate option index {idx}.", ErrorType.Validation, Path: $"options[{i}]");
                 if (o.IsCorrect) correctCount++;
             }
             if (!effectiveMulti && correctCount > 1)
                 return new Error("Question.MultipleCorrectInSingle", $"Single-select MCQ specifies {correctCount} correct options. Set 'isMultiCorrect': true or mark only one option correct.", ErrorType.Validation, Path: "options");
+
+            int highestIndex = seenIndices.Max();
+            if (hasMaxOptions)
+            {
+                if (maxVal is < 2 or > 26)
+                    return QuestionErrors.InvalidMaxOptions(maxVal);
+                if (highestIndex > maxVal)
+                    return new Error("Question.OptionIndexExceedsMaxOptions", $"Option index {highestIndex} exceeds maxOptions ({maxVal}).", ErrorType.Validation, Path: "options");
+            }
+            else if (highestIndex > 26)
+            {
+                return QuestionErrors.InvalidMaxOptions(highestIndex);
+            }
 
             // Materialize images first before clearing existing options
             var materialized = new List<(int Index, string? Text, string? Img, bool IsCorrect)>(parsedOpts.Count);
@@ -1270,14 +1700,15 @@ public sealed class PatchEntityHandler(
                 materialized.Add((idx, o.Text, imgRes.Value, o.IsCorrect));
             }
 
-            // Validate maxOptions bounds before mutating
-            if (hasMaxOptions && (maxVal < 2 || maxVal > 26))
-                return QuestionErrors.InvalidMaxOptions(maxVal);
-
             mcq.ClearOptions();
             if (hasMaxOptions)
             {
                 var maxRes = mcq.SetMaxOptions(maxVal);
+                if (!maxRes.IsSuccess) return maxRes.Error!;
+            }
+            else if (highestIndex > mcq.MaxOptions)
+            {
+                var maxRes = mcq.SetMaxOptions(highestIndex);
                 if (!maxRes.IsSuccess) return maxRes.Error!;
             }
             if (hasMulti)

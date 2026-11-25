@@ -193,6 +193,8 @@ public sealed class InspectEntityHandler(EntityAddressResolver addressResolver)
             ArticleBlockKind.Image => "image",
             ArticleBlockKind.Callout => "callout",
             ArticleBlockKind.Table => "table",
+            ArticleBlockKind.DiagramExplore => "diagram-explore",
+            ArticleBlockKind.Reveal => "reveal",
             _ => "text"
         };
         string? toneStr = block.CalloutTone.HasValue ? ArticleBlock.CalloutToneToString(block.CalloutTone.Value) : null;
@@ -207,6 +209,8 @@ public sealed class InspectEntityHandler(EntityAddressResolver addressResolver)
                 ArticleBlockKind.Image => string.IsNullOrWhiteSpace(block.Caption) ? block.ImagePath : $"{block.ImagePath} ({block.Caption})",
                 ArticleBlockKind.Callout => $"[{toneStr ?? "pearl"}] {(string.IsNullOrWhiteSpace(block.CalloutTitle) ? "" : block.CalloutTitle + ": ")}{block.TextContent}",
                 ArticleBlockKind.Table => FormatTableOutline(block),
+                ArticleBlockKind.DiagramExplore => FormatDiagramExploreOutline(block),
+                ArticleBlockKind.Reveal => FormatRevealOutline(block),
                 _ => block.TextContent
             };
             return new(Id: block.Id, Index: block.Index, Kind: kind, Path: path, Ref: block.RefKey, Snippet: MakeSnippet(raw), Tone: toneStr);
@@ -235,6 +239,26 @@ public sealed class InspectEntityHandler(EntityAddressResolver addressResolver)
             return $"[table] {title} ({t.Rows?.Count ?? 0}x{t.Headers?.Count ?? 0})";
         }
         return "[table]";
+    }
+
+    private static string FormatDiagramExploreOutline(ArticleBlock block)
+    {
+        if (Phase1PayloadCodec.TryDeserialize<DiagramExplorePayload>(block.PayloadJson, out var d) && d is not null)
+        {
+            var title = !string.IsNullOrWhiteSpace(d.Title) ? d.Title : (block.CalloutTitle ?? d.ImagePath);
+            return $"[diagram-explore] {title} ({d.Hotspots?.Count ?? 0} hotspots)";
+        }
+        return "[diagram-explore]";
+    }
+
+    private static string FormatRevealOutline(ArticleBlock block)
+    {
+        if (Phase1PayloadCodec.TryDeserialize<RevealBlockPayload>(block.PayloadJson, out var r) && r is not null)
+        {
+            var title = !string.IsNullOrWhiteSpace(r.Title) ? r.Title : (block.CalloutTitle ?? "Reveal");
+            return $"[reveal] {title} ({r.Steps?.Count ?? 0} steps)";
+        }
+        return "[reveal]";
     }
 
     private static InspectQuestionDto MapQuestion(Question question, string path, InspectViewMode view)
@@ -332,6 +356,14 @@ public sealed class InspectEntityHandler(EntityAddressResolver addressResolver)
             $"[mechanism] {(!string.IsNullOrWhiteSpace(m.Title) ? m.Title : (m.Steps ?? []).FirstOrDefault(s => s is not null && !s.IsDistractor)?.Text)} ({(m.Steps ?? []).Count(s => s is not null && !s.IsDistractor)} steps)",
         QuestionType.RelabelImage when Phase1PayloadCodec.TryDeserialize<RelabelImagePayload>(q.PayloadJson, out var r) && r is not null =>
             $"[relabel:{r.Mode}/{r.Style}] {(!string.IsNullOrWhiteSpace(r.Prompt) ? r.Prompt : r.ImagePath)} ({r.Boxes?.Count ?? 0} boxes)",
+        QuestionType.Classify when Phase1PayloadCodec.TryDeserialize<ClassifyPayload>(q.PayloadJson, out var cl) && cl is not null =>
+            $"[classify] {(!string.IsNullOrWhiteSpace(cl.Title) ? cl.Title : "Classification")} ({cl.Buckets?.Count ?? 0} buckets, {cl.Items?.Count ?? 0} items)",
+        QuestionType.Match when Phase1PayloadCodec.TryDeserialize<MatchPayload>(q.PayloadJson, out var mt) && mt is not null =>
+            $"[match] {(!string.IsNullOrWhiteSpace(mt.Title) ? mt.Title : mt.Pairs?.FirstOrDefault()?.Left)} ({mt.Pairs?.Count ?? 0} pairs)",
+        QuestionType.Numeric when Phase1PayloadCodec.TryDeserialize<NumericPayload>(q.PayloadJson, out var nm) && nm is not null =>
+            $"[numeric] {nm.Prompt} ({nm.Answer} +/- {nm.Tolerance}{(nm.ToleranceMode == "percent" ? "%" : "")}{(string.IsNullOrWhiteSpace(nm.Unit) ? "" : " " + nm.Unit)})",
+        QuestionType.CaseGroup when Phase1PayloadCodec.TryDeserialize<CaseGroupPayload>(q.PayloadJson, out var cs) && cs is not null =>
+            $"[case] {(!string.IsNullOrWhiteSpace(cs.Title) ? cs.Title : cs.Stem)} ({cs.Questions?.Count ?? 0} sub-questions)",
         _ => q.PayloadJson
     };
 

@@ -224,13 +224,20 @@ public sealed class LintAndExportGuardTests : IDisposable
         Assert.Equal("mby", infraMeta.ExecutableName);
 
         var editorBuilder = provider.GetRequiredService<ILayoutEditorPageBuilder>();
-        var html = editorBuilder.BuildHtml("mcq-options", infraMeta);
+        var html = editorBuilder.BuildHtml("mcq-options", infraMeta, "test-csrf-token");
         Assert.Contains("<meta name=\"generator\" content=\"Meloberry CLI (mby) 2.0.0\"", html);
+        Assert.Contains("<link rel=\"icon\" href=\"data:,\" />", html);
+        Assert.Contains("X-Mby-Editor-Token", html);
+        Assert.Contains("test-csrf-token", html);
         Assert.Contains("mby v2.0.0", html);
         Assert.Contains("Article Text Block", html);
+        Assert.Contains("Callout", html);
+        Assert.Contains("Table", html);
         Assert.Contains("Image Block", html);
         Assert.Contains("MCQ Question", html);
         Assert.Contains("MCQ Options", html);
+        Assert.Contains("Fill-in-the-Blank", html);
+        Assert.Contains("Relabel", html);
         Assert.Contains("Flashcard", html);
         Assert.Contains("mby-flashcard-scene", html);
         Assert.Contains("repeat(var(--option-columns, 1)", html);
@@ -238,7 +245,7 @@ public sealed class LintAndExportGuardTests : IDisposable
         Assert.DoesNotContain("spec.allowedValues", html);
         Assert.Contains("spec.allowedBounds", html);
         Assert.Contains("id=\"saveAllBtn\" type=\"button\" class=\"mby-nav-btn primary\"", html);
-        Assert.Contains("const keys = (comp.fields || []).map(k => k.key)", html);
+        Assert.Contains("const keys = getVisibleFields(comp).map(k => k.key)", html);
         Assert.Contains("data-theme=\"paper\"", html);
     }
 
@@ -298,7 +305,6 @@ public sealed class LintAndExportGuardTests : IDisposable
 
         var apply = provider.GetRequiredService<ApplySpecHandler>();
         var patch = provider.GetRequiredService<PatchEntityHandler>();
-        var setEntityLayout = provider.GetRequiredService<SetEntityLayoutHandler>();
 
         var quizJson = Path.Combine(_tempRoot, "card_spec.json");
         await File.WriteAllTextAsync(quizJson, $$"""
@@ -320,11 +326,14 @@ public sealed class LintAndExportGuardTests : IDisposable
 
         var appliedQuiz = (await apply.HandleAsync(new ApplySpecCommand(null, quizJson, WorkingDirectory: workDir))).Value;
         var cardId = appliedQuiz.AddedQuestionIds![0];
-        var overrideRes = await setEntityLayout.HandleAsync(new SetEntityLayoutCommand(cardId, "FLIPDURATIONMS", "350"));
+        var overrideRes = await patch.HandleAsync(new PatchEntityCommand(cardId, SetPairs: ["layoutOverrides.FLIPDURATIONMS=350"]));
         Assert.True(overrideRes.IsSuccess);
-        Assert.Equal("flipDurationMs", overrideRes.Value.Property);
+        var repo = provider.GetRequiredService<IWorkspaceRepository>();
+        var qOwner = await repo.FindQuestionOwnerAsync(cardId);
+        Assert.NotNull(qOwner);
+        Assert.Equal("350", qOwner!.Question.LayoutOverrides["flipDurationMs"]);
 
-        // WebApp disables raw HTML/XSS, escapes openFinishScreen id, applies defaultTextPosition & URL encoding
+        // WebApp disables raw HTML/XSS, hides openFinishScreen component ID in dataset instead of visible HTML, applies defaultTextPosition & URL encoding
         Assert.True((await setLayout.HandleAsync(new SetLayoutPropertyCommand("flashcard", "defaultTextPosition", "aboveImage"))).IsSuccess);
         var buildWeb = provider.GetRequiredService<BuildWebAppHandler>();
         var webRes = await buildWeb.HandleAsync(new BuildWebAppCommand(appliedQuiz.TargetId, Path.Combine(_tempRoot, "web_out")));
@@ -332,7 +341,8 @@ public sealed class LintAndExportGuardTests : IDisposable
         var appJs = await File.ReadAllTextAsync(Path.Combine(webRes.Value.OutputDirectory, "app.js"));
         Assert.DoesNotContain("<script>alert(1)</script>", appJs);
         Assert.DoesNotContain("javascript:alert(2)", appJs);
-        Assert.Contains("escapeHtml(s.id)", appJs);
+        Assert.DoesNotContain("<code>${escapeHtml(s.id)}</code>", appJs);
+        Assert.Contains("dataset.componentId = s.id", appJs);
         Assert.Contains("aboveImage", appJs);
         Assert.Contains("diagram_final%20v2", appJs);
 

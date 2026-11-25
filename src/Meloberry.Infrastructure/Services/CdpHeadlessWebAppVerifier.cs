@@ -257,7 +257,7 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
                 return (0, 0);
             }
             slideCount = slidesEl.GetArrayLength();
-            CollectImagePathsRecursive(slidesEl, p =>
+            CollectImagePathsRecursive(doc.RootElement, p =>
             {
                 imgCount++;
                 if (p.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || p.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
@@ -308,6 +308,7 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
 
         int nextMsgId = 1;
         var pending = new ConcurrentDictionary<int, TaskCompletionSource<JsonElement>>();
+        var requestUrls = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
         var consoleErrors = new ConcurrentQueue<string>();
         var brokenAssets = new ConcurrentQueue<string>();
         var pageLoadedTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -405,13 +406,42 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
                                         lvl.ValueKind == JsonValueKind.String &&
                                         lvl.GetString() == "error")
                                     {
+                                        var entryUrl = le.TryGetProperty("url", out var urlEl) && urlEl.ValueKind == JsonValueKind.String
+                                            ? urlEl.GetString()
+                                            : null;
+                                        if (IsOptionalProbeUrl(entryUrl))
+                                            break;
                                         var text = le.TryGetProperty("text", out var txtEl) && txtEl.ValueKind == JsonValueKind.String
                                             ? txtEl.GetString()
                                             : "Browser error";
                                         consoleErrors.Enqueue($"Log.error: {text}");
                                     }
                                     break;
+                                case "Network.requestWillBeSent":
+                                    if (hasParams &&
+                                        p.TryGetProperty("requestId", out var reqSentIdEl) &&
+                                        reqSentIdEl.ValueKind == JsonValueKind.String &&
+                                        p.TryGetProperty("request", out var reqObj) &&
+                                        reqObj.ValueKind == JsonValueKind.Object &&
+                                        reqObj.TryGetProperty("url", out var reqUrlEl) &&
+                                        reqUrlEl.ValueKind == JsonValueKind.String)
+                                    {
+                                        var reqIdStr = reqSentIdEl.GetString();
+                                        var reqUrlStr = reqUrlEl.GetString();
+                                        if (!string.IsNullOrEmpty(reqIdStr) && !string.IsNullOrEmpty(reqUrlStr))
+                                            requestUrls[reqIdStr] = reqUrlStr;
+                                    }
+                                    break;
                                 case "Network.loadingFailed":
+                                    var failedReqId = hasParams && p.TryGetProperty("requestId", out var failIdEl) && failIdEl.ValueKind == JsonValueKind.String
+                                        ? failIdEl.GetString()
+                                        : null;
+                                    if (!string.IsNullOrEmpty(failedReqId) &&
+                                        requestUrls.TryGetValue(failedReqId, out var failedUrl) &&
+                                        IsOptionalProbeUrl(failedUrl))
+                                    {
+                                        break;
+                                    }
                                     var errText = hasParams && p.TryGetProperty("errorText", out var etEl) && etEl.ValueKind == JsonValueKind.String
                                         ? etEl.GetString()
                                         : "Failed";
@@ -428,7 +458,7 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
                                         var u = resp.TryGetProperty("url", out var uEl) && uEl.ValueKind == JsonValueKind.String
                                             ? uEl.GetString()
                                             : "";
-                                        if (!string.IsNullOrWhiteSpace(u) && u.EndsWith("/favicon.ico", StringComparison.OrdinalIgnoreCase))
+                                        if (IsOptionalProbeUrl(u))
                                             break;
                                         brokenAssets.Enqueue($"HTTP {statusCode}: {u}");
                                     }
@@ -576,29 +606,58 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
                 const card = scopeEl.querySelector('.mby-card, .mby-flashcard-scene');
                 checkCardOverflow(card, sIdx, qLabel);
 
-                // Verify Relabel image stage dimensions & mask box bounds (within 4px tolerance)
-                const relabelStages = card?.querySelectorAll('.mby-relabel-stage') || [];
+                // Verify Relabel & Diagram-Explore image stage dimensions and overlay bounds (within 4px tolerance)
+                const relabelStages = card?.querySelectorAll('.mby-relabel-stage, .mby-diagram-stage') || [];
                 for (const stage of relabelStages) {
-                  const stageImg = stage.querySelector('.mby-relabel-img');
+                  const stageImg = stage.querySelector('.mby-relabel-img, .mby-diagram-img');
                   const imgRect = stageImg?.getBoundingClientRect();
                   if (!imgRect || imgRect.width <= 0 || imgRect.height <= 0) {
-                    out.brokenAssets.push(`Relabel stage image has zero dimensions on slide ${sIdx + 1}${qLabel}`);
+                    out.brokenAssets.push(`Diagram/Relabel stage image has zero dimensions on slide ${sIdx + 1}${qLabel}`);
                     continue;
                   }
-                  for (const box of stage.querySelectorAll('.mby-mask-box')) {
+                  for (const box of stage.querySelectorAll('.mby-mask-box, .mby-diagram-hotspot')) {
                     const br = box.getBoundingClientRect();
                     if (br.left < imgRect.left - 4 || br.top < imgRect.top - 4 ||
                         br.right > imgRect.right + 4 || br.bottom > imgRect.bottom + 4) {
-                      out.overflowIssues.push(`Relabel mask box out of image bounds on slide ${sIdx + 1}${qLabel}`);
+                      out.overflowIssues.push(`Overlay hotspot/mask out of image bounds on slide ${sIdx + 1}${qLabel}`);
                     }
                   }
                 }
 
-                // Exercise interactive mechanism chips before grading so sequence slots & canonical order are also checked
-                const mechChips = card?.querySelectorAll('.mby-mech-chip') || [];
+                // Exercise Diagram-Explore hotspot click and verify annotation card KaTeX/overflow
+                const diagSpots = card?.querySelectorAll('.mby-diagram-hotspot') || [];
+                if (diagSpots.length > 0) {
+                  diagSpots[0].click();
+                  await sleep(25);
+                  checkCardOverflow(card, sIdx, `${qLabel} (Diagram Card)`);
+                  const diagKErrs = scopeEl.querySelectorAll('.katex-error');
+                  if (diagKErrs.length > 0)
+                    out.katexErrors.push(`${diagKErrs.length} diagram hotspot KaTeX error(s) on slide ${sIdx + 1}${qLabel}`);
+                }
+
+                // Exercise Progressive Reveal unlock button
+                const revBtns = card?.querySelectorAll('.mby-reveal-unlock-btn') || [];
+                if (revBtns.length > 0) {
+                  revBtns[0].click();
+                  await sleep(25);
+                  checkCardOverflow(card, sIdx, `${qLabel} (Reveal)`);
+                }
+
+                // Exercise interactive mechanism/classify/match/numeric widgets before grading
+                const mechChips = card?.querySelectorAll('.mby-mech-chip, .mby-classify-chip, .mby-match-chip') || [];
                 if (mechChips.length > 0) {
                   mechChips[0].click();
                   await sleep(20);
+                }
+                const clsBucket = card?.querySelector('.mby-classify-bucket');
+                if (clsBucket) { clsBucket.click(); await sleep(15); }
+                const matchSlot = card?.querySelector('.mby-match-slot');
+                if (matchSlot) { matchSlot.click(); await sleep(15); }
+                const numIn = card?.querySelector('.mby-numeric-input');
+                if (numIn) {
+                  numIn.value = '10';
+                  numIn.dispatchEvent(new Event('input', { bubbles: true }));
+                  await sleep(15);
                 }
 
                 // Exercise interactive relabel mask overlay clicks to verify zero runtime console errors
@@ -608,19 +667,38 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
                   await sleep(20);
                 }
 
-                // Trigger Check Answer for graded questions (with or without explanation) and verify post-check layout
-                const checkBtn = card?.querySelector('.mby-check-btn');
-                if (checkBtn) {
-                  checkBtn.click();
-                  await sleep(30);
-                  checkCardOverflow(card, sIdx, `${qLabel} (Checked)`);
-                  const postKErrors = scopeEl.querySelectorAll('.katex-error');
-                  if (postKErrors.length > 0)
-                    out.katexErrors.push(`${postKErrors.length} post-check KaTeX parse error(s) on slide ${sIdx + 1}${qLabel}`);
+                // Exercise Case-Group sub-question tabs if present
+                const caseTabs = card?.querySelectorAll('.mby-case-tab') || [];
+                if (caseTabs.length > 0) {
+                  for (let ctIdx = 0; ctIdx < caseTabs.length; ctIdx++) {
+                    caseTabs[ctIdx].click();
+                    await sleep(25);
+                    checkCardOverflow(card, sIdx, `${qLabel} (Case Part ${ctIdx + 1})`);
+                    const subCheck = card?.querySelector('.mby-case-subhost .mby-check-btn');
+                    if (subCheck) {
+                      subCheck.click();
+                      await sleep(25);
+                      checkCardOverflow(card, sIdx, `${qLabel} (Case Part ${ctIdx + 1} Checked)`);
+                    }
+                    const subKErrs = scopeEl.querySelectorAll('.katex-error');
+                    if (subKErrs.length > 0)
+                      out.katexErrors.push(`${subKErrs.length} case sub-question KaTeX error(s) on slide ${sIdx + 1}${qLabel}`);
+                  }
+                } else {
+                  // Trigger Check Answer for graded questions (with or without explanation) and verify post-check layout
+                  const checkBtn = card?.querySelector('.mby-check-btn');
+                  if (checkBtn) {
+                    checkBtn.click();
+                    await sleep(30);
+                    checkCardOverflow(card, sIdx, `${qLabel} (Checked)`);
+                    const postKErrors = scopeEl.querySelectorAll('.katex-error');
+                    if (postKErrors.length > 0)
+                      out.katexErrors.push(`${postKErrors.length} post-check KaTeX parse error(s) on slide ${sIdx + 1}${qLabel}`);
+                  }
                 }
 
-                // Exercise Native Table hide/show toggles if present
-                const tblBtns = card?.querySelectorAll('.mby-table-toggle-btn') || [];
+                // Exercise Native Table hide/show toggles if present (B-3)
+                const tblBtns = card?.querySelectorAll('.mby-th-hideable, .mby-table-toggle-btn') || [];
                 for (const tb of tblBtns) {
                   tb.click();
                   await sleep(15);
@@ -841,6 +919,15 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
         return string.Empty;
     }
 
+    private static bool IsOptionalProbeUrl(string? rawUrl)
+    {
+        if (string.IsNullOrWhiteSpace(rawUrl)) return false;
+        var clean = rawUrl.Split('?', '#')[0];
+        return clean.EndsWith("/favicon.ico", StringComparison.OrdinalIgnoreCase) ||
+               clean.EndsWith("/preview-index.js", StringComparison.OrdinalIgnoreCase) ||
+               clean.EndsWith("/preview-index.json", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static async Task ServeStaticDirectoryAsync(HttpListener listener, string rootDir, ConcurrentQueue<string> httpFailures, CancellationToken ct)
     {
         var fullRoot = Path.GetFullPath(rootDir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
@@ -871,7 +958,8 @@ public sealed class CdpHeadlessWebAppVerifier : IHeadlessWebAppVerifier
                 if (!PathConfinement.TryResolveInside(fullRoot, relPath, out var filePath) || !File.Exists(filePath))
                 {
                     ctx.Response.StatusCode = 404;
-                    httpFailures.Enqueue($"HTTP 404: /{relPath}");
+                    if (!IsOptionalProbeUrl("/" + relPath))
+                        httpFailures.Enqueue($"HTTP 404: /{relPath}");
                     ctx.Response.Close();
                     continue;
                 }

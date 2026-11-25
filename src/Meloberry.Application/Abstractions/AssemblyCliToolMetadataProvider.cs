@@ -29,10 +29,25 @@ public sealed class AssemblyCliToolMetadataProvider(
         if (string.IsNullOrWhiteSpace(productName))
             productName = "Meloberry CLI";
 
+        var metadataAttrs = assembly.GetCustomAttributes<AssemblyMetadataAttribute>().ToList();
+        var appName = metadataAttrs
+            .FirstOrDefault(a => string.Equals(a.Key, "AppName", StringComparison.OrdinalIgnoreCase))?.Value;
+        if (string.IsNullOrWhiteSpace(appName))
+            appName = assembly.GetCustomAttribute<AssemblyCompanyAttribute>()?.Company;
+        if (string.IsNullOrWhiteSpace(appName))
+            appName = "Meloberry";
+
+        var repoUrl = metadataAttrs
+            .FirstOrDefault(a => string.Equals(a.Key, "RepositoryUrl", StringComparison.OrdinalIgnoreCase))?.Value;
+        if (string.IsNullOrWhiteSpace(repoUrl))
+            repoUrl = "https://github.com/doc-shashank/meloberry-cli/";
+
         return new CliToolMetadata(
             ProductName: productName,
             ExecutableName: executableName,
             Version: cleanVer,
-            Runtime: RuntimeInformation.FrameworkDescription);
+            Runtime: RuntimeInformation.FrameworkDescription,
+            AppName: appName.Trim(),
+            RepositoryUrl: repoUrl.Trim());
     }
 }

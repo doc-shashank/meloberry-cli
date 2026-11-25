@@ -94,6 +94,10 @@ public sealed class Quiz
             "diff" or "differentiation" => (true, QuestionType.Differentiation),
             "mechanism" => (true, QuestionType.Mechanism),
             "relabel" or "relabel-image" or "relabelimage" => (true, QuestionType.RelabelImage),
+            "case" or "case-group" or "casegroup" => (true, QuestionType.CaseGroup),
+            "classify" or "bucket-sort" => (true, QuestionType.Classify),
+            "match" or "match-following" => (true, QuestionType.Match),
+            "numeric" or "numeric-tolerance" => (true, QuestionType.Numeric),
             _ => (false, default(QuestionType))
         };
         return ok;

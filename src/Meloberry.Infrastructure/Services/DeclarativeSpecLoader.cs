@@ -26,10 +26,13 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
         "type", "explanation", "maxOptions", "isMultiCorrect", "options", "index", "isCorrect",
         "front", "back", "position", "textPosition",
         "stickyFirstCol", "hideableCols", "headers", "alignments", "rows", "footnote",
-        "fuzzy", "caseSensitive", "assertion", "reason", "answer", "scheme",
+        "fuzzy", "caseSensitive", "placeholder", "assertion", "reason", "answer", "scheme",
         "requireFix", "allowNoError", "noError",
         "mode", "bank", "steps", "stepId", "orderGroup", "isDistractor",
-        "prompt", "style", "masks", "masksPath", "include", "boxes", "label", "aliases", "rect", "x", "y", "w", "h", "distractors"
+        "prompt", "style", "masks", "masksPath", "include", "boxes", "label", "aliases", "rect", "x", "y", "w", "h", "distractors",
+        "hotspots", "note", "showFirst", "heading", "body", "buckets", "bucketId", "items", "bucket", "pairs", "left", "right",
+        "tolerance", "toleranceMode", "unit", "stem",
+        "links", "id"
     ];
 
     [GeneratedRegex(@"property\s+'(?<prop>[^']+)'", RegexOptions.IgnoreCase)]
@@ -196,7 +199,8 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
                     null,
                     spec.LayoutOverrides,
                     Ref: spec.Ref,
-                    SourceDirectory: fullDir));
+                    SourceDirectory: fullDir,
+                    Links: spec.Links));
             }
             else if (spec.Questions is { Count: > 0 } || spec.Kind?.ToLowerInvariant() is "quiz" or "mcq" or "flashcard" or "mixed")
             {
@@ -213,7 +217,8 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
                     spec.Questions,
                     spec.LayoutOverrides,
                     Ref: spec.Ref,
-                    SourceDirectory: fullDir));
+                    SourceDirectory: fullDir,
+                    Links: spec.Links));
             }
             else
             {
@@ -331,7 +336,10 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
                     var qRes = MapQuestions(c.Questions, $"components[{i}].questions");
                     if (!qRes.IsSuccess) return qRes.Error!;
 
-                    components.Add(new DeclarativeComponentSpec(c.Kind, c.Title, c.QuizType, blocksRes.Value, qRes.Value, c.LayoutOverrides, c.Ref));
+                    var linksRes = MapLinks(c.Links, $"components[{i}].links");
+                    if (!linksRes.IsSuccess) return linksRes.Error!;
+
+                    components.Add(new DeclarativeComponentSpec(c.Kind, c.Title, c.QuizType, blocksRes.Value, qRes.Value, c.LayoutOverrides, c.Ref, Links: linksRes.Value));
                 }
             }
 
@@ -340,6 +348,9 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
 
             var rootQuestionsRes = MapQuestions(dto.Questions, "questions");
             if (!rootQuestionsRes.IsSuccess) return rootQuestionsRes.Error!;
+
+            var rootLinksRes = MapLinks(dto.Links, "links");
+            if (!rootLinksRes.IsSuccess) return rootLinksRes.Error!;
 
             return new DeclarativeApplySpec(
                 dto.Kind,
@@ -352,7 +363,8 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
                 rootQuestionsRes.Value,
                 dto.LayoutOverrides,
                 Ref: dto.Ref,
-                Order: dto.Order);
+                Order: dto.Order,
+                Links: rootLinksRes.Value);
         }
         catch (JsonException ex)
         {
@@ -420,9 +432,13 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
 
             bool hasTableFields = b.StickyFirstCol.HasValue || b.HideableCols is not null || b.Headers is not null ||
                                   b.Alignments is not null || b.Rows is not null || b.Footnote is not null;
+            bool hasDiagramFields = b.Hotspots is not null || b.Masks is not null || b.MasksPath is not null;
+            bool hasRevealFields = b.ShowFirst.HasValue || b.Steps is not null;
 
             if (string.Equals(b.Kind.Trim(), "table", StringComparison.OrdinalIgnoreCase))
             {
+                if (hasDiagramFields || hasRevealFields)
+                    return new Error("Json.InvalidFieldForType", $"Article block kind '{b.Kind}' cannot specify diagram-explore or reveal fields.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
                 if (b.Headers is not null && b.Headers.Any(h => h is null))
                     return new Error("Json.InvalidSpec", $"Table block at '{pathPrefix}[{i}]' contains a null entry in 'headers'.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].headers");
                 if (b.Alignments is not null && b.Alignments.Any(a => a is null))
@@ -460,15 +476,98 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
                 continue;
             }
 
-            if (hasTableFields)
-                return new Error("Json.InvalidFieldForType", $"Article block kind '{b.Kind}' cannot specify table fields ('headers', 'rows', 'alignments', 'stickyFirstCol', 'hideableCols', 'footnote').", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
+            if (b.Kind.Trim().Equals("diagram-explore", StringComparison.OrdinalIgnoreCase) ||
+                b.Kind.Trim().Equals("diagramexplore", StringComparison.OrdinalIgnoreCase))
+            {
+                if (hasTableFields || hasRevealFields || !string.IsNullOrWhiteSpace(b.Text) || !string.IsNullOrWhiteSpace(b.Tone))
+                    return new Error("Json.InvalidFieldForType", "Article diagram-explore block specifies fields belonging to another block type.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
+                if (!string.IsNullOrWhiteSpace(b.Masks) && !string.IsNullOrWhiteSpace(b.MasksPath))
+                    return new Error("Json.InvalidSpec", "Diagram Explorer block cannot specify both 'masks' and 'masksPath'.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
+
+                var masksPath = !string.IsNullOrWhiteSpace(b.MasksPath) ? b.MasksPath.Trim() : (string.IsNullOrWhiteSpace(b.Masks) ? null : b.Masks.Trim());
+                var hotspots = new List<DiagramHotspot>();
+                if (b.Hotspots is not null)
+                {
+                    for (int hIdx = 0; hIdx < b.Hotspots.Count; hIdx++)
+                    {
+                        var hs = b.Hotspots[hIdx];
+                        if (hs is null)
+                            return new Error("Json.InvalidSpec", $"Hotspot at '{pathPrefix}[{i}].hotspots[{hIdx}]' cannot be null.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].hotspots[{hIdx}]");
+
+                        double bx = 0, by = 0, bw = 0, bh = 0;
+                        bool hasInlineCoords = hs.Rect is not null || hs.X.HasValue || hs.Y.HasValue || hs.W.HasValue || hs.H.HasValue;
+                        if (masksPath is not null && hasInlineCoords)
+                            return new Error("Json.InvalidSpec", $"Hotspot '{hs.Label}' cannot specify both 'masksPath' sidecar and inline coordinates.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].hotspots[{hIdx}]");
+
+                        if (masksPath is null)
+                        {
+                            if (hs.Rect is not null)
+                            {
+                                if (hs.Rect.Count != 4)
+                                    return new Error("Json.InvalidSpec", $"Hotspot at '{pathPrefix}[{i}].hotspots[{hIdx}]' 'rect' must contain 4 numbers [x,y,w,h].", ErrorType.Validation, Path: $"{pathPrefix}[{i}].hotspots[{hIdx}].rect");
+                                bx = hs.Rect[0]; by = hs.Rect[1]; bw = hs.Rect[2]; bh = hs.Rect[3];
+                            }
+                            else if (hs.X.HasValue && hs.Y.HasValue && hs.W.HasValue && hs.H.HasValue)
+                            {
+                                bx = hs.X.Value; by = hs.Y.Value; bw = hs.W.Value; bh = hs.H.Value;
+                            }
+                            else
+                            {
+                                return new Error("Json.InvalidSpec", $"Hotspot at '{pathPrefix}[{i}].hotspots[{hIdx}]' requires 'rect: [x,y,w,h]' or 'x','y','w','h' when no masksPath is set.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].hotspots[{hIdx}]");
+                            }
+                        }
+
+                        hotspots.Add(new DiagramHotspot(hIdx, hs.Label?.Trim() ?? string.Empty, hs.Note?.Trim() ?? string.Empty, bx, by, bw, bh));
+                    }
+                }
+
+                var payload = new DiagramExplorePayload(
+                    b.ImagePath?.Trim() ?? string.Empty,
+                    string.IsNullOrWhiteSpace(b.Title) ? null : b.Title.Trim(),
+                    string.IsNullOrWhiteSpace(b.Caption) ? null : b.Caption.Trim(),
+                    hotspots,
+                    masksPath);
+
+                list.Add(new DeclarativeArticleBlockSpec(
+                    "diagram-explore", null, null, b.Ref, b.Caption, b.Alt, null, b.Title,
+                    PayloadJson: Phase1PayloadCodec.Serialize(payload)));
+                continue;
+            }
+
+            if (b.Kind.Trim().Equals("reveal", StringComparison.OrdinalIgnoreCase))
+            {
+                if (hasTableFields || hasDiagramFields || !string.IsNullOrWhiteSpace(b.Text) ||
+                    !string.IsNullOrWhiteSpace(b.ImagePath) || !string.IsNullOrWhiteSpace(b.Caption) ||
+                    !string.IsNullOrWhiteSpace(b.Alt) || !string.IsNullOrWhiteSpace(b.Tone))
+                {
+                    return new Error("Json.InvalidFieldForType", "Article reveal block specifies fields belonging to another block type.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
+                }
+                if (b.Steps is not null && b.Steps.Any(s => s is null))
+                    return new Error("Json.InvalidSpec", $"Reveal block at '{pathPrefix}[{i}]' contains a null step.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].steps");
+
+                var steps = (b.Steps ?? [])
+                    .Select((s, sIdx) => new RevealStep(sIdx, s!.Heading?.Trim() ?? string.Empty, s.Body?.Trim() ?? string.Empty))
+                    .ToList();
+                var payload = new RevealBlockPayload(
+                    string.IsNullOrWhiteSpace(b.Title) ? null : b.Title.Trim(),
+                    b.ShowFirst ?? false,
+                    steps);
+
+                list.Add(new DeclarativeArticleBlockSpec(
+                    "reveal", null, null, b.Ref, null, null, null, b.Title,
+                    PayloadJson: Phase1PayloadCodec.Serialize(payload)));
+                continue;
+            }
+
+            if (hasTableFields || hasDiagramFields || hasRevealFields)
+                return new Error("Json.InvalidFieldForType", $"Article block kind '{b.Kind}' cannot specify table, diagram-explore, or reveal fields.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
 
             list.Add(new DeclarativeArticleBlockSpec(b.Kind, b.Text, b.ImagePath, b.Ref, b.Caption, b.Alt, b.Tone, b.Title));
         }
         return Result<IReadOnlyList<DeclarativeArticleBlockSpec>?>.Success(list);
     }
 
-    private static Result<IReadOnlyList<JsonQuestionSpec>?> MapQuestions(List<ApplyQuestionDto?>? rawQuestions, string pathPrefix)
+    private static Result<IReadOnlyList<JsonQuestionSpec>?> MapQuestions(List<ApplyQuestionDto?>? rawQuestions, string pathPrefix, int caseDepth = 0)
     {
         if (rawQuestions is null) return Result<IReadOnlyList<JsonQuestionSpec>?>.Success(null);
         var list = new List<JsonQuestionSpec>(rawQuestions.Count);
@@ -487,55 +586,76 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
             static JsonFlashcardSideSpec? MapSide(ApplySideDto? s) =>
                 s is null ? null : new JsonFlashcardSideSpec(s.Text, s.ImagePath, s.Position ?? s.TextPosition);
 
+            static string? AsString(JsonElement? el) =>
+                el is { ValueKind: JsonValueKind.String } ? el.Value.GetString() :
+                el is { ValueKind: JsonValueKind.Number or JsonValueKind.True or JsonValueKind.False } ? el.Value.GetRawText() : null;
+
             bool hasMcqOnly = q.MaxOptions.HasValue || q.IsMultiCorrect || options.Count > 0;
             bool hasImagePath = !string.IsNullOrWhiteSpace(q.ImagePath);
             bool hasFlashcardOnly = q.Front is not null || q.Back is not null;
             bool hasRecallFlags = q.Fuzzy.HasValue || q.CaseSensitive.HasValue;
-            bool hasArOnly = q.Assertion is not null || q.Reason is not null || q.Answer is not null || q.Scheme is not null;
+            bool hasPlaceholder = q.Placeholder is not null;
+            bool hasArOnly = q.Assertion is not null || q.Reason is not null || q.Scheme is not null;
+            bool hasAnswer = q.Answer.HasValue && q.Answer.Value.ValueKind != JsonValueKind.Null;
             bool hasSpotOnly = q.RequireFix.HasValue || q.NoError.HasValue;
             bool hasTableShape = q.Headers is not null || q.Alignments is not null || q.Rows is not null;
             bool hasMode = q.Mode is not null;
             bool hasDiffOnly = q.Bank.HasValue || hasTableShape;
             bool hasMechOnly = q.Steps is not null;
-            bool hasRelabelOnly = q.Prompt is not null || q.Style is not null || q.Masks is not null || q.MasksPath is not null ||
-                                  q.Include is not null || q.Boxes is not null || q.Distractors is not null;
+            bool hasRelabelOnly = q.Style is not null || q.Masks is not null || q.MasksPath is not null ||
+                                  q.Include is not null || q.Boxes is not null;
+            bool hasPrompt = q.Prompt is not null;
+            bool hasDistractors = q.Distractors is not null;
+            bool hasClassifyOnly = q.Buckets is not null || q.Items is not null;
+            bool hasMatchOnly = q.Pairs is not null;
+            bool hasNumericOnly = (q.Tolerance.HasValue && q.Tolerance.Value.ValueKind != JsonValueKind.Null) || q.ToleranceMode is not null || q.Unit is not null;
+            bool hasCaseOnly = q.Stem is not null || q.Questions is not null || q.Caption is not null;
 
             if (Quiz.TryParseQuestionType(q.Type, out var qType) &&
-                qType is QuestionType.FillBlank or QuestionType.AssertionReason or QuestionType.SpotError or QuestionType.Differentiation or QuestionType.Mechanism or QuestionType.RelabelImage)
+                qType is QuestionType.FillBlank or QuestionType.AssertionReason or QuestionType.SpotError
+                    or QuestionType.Differentiation or QuestionType.Mechanism or QuestionType.RelabelImage
+                    or QuestionType.Classify or QuestionType.Match or QuestionType.Numeric or QuestionType.CaseGroup)
             {
+                if (qType == QuestionType.CaseGroup && caseDepth > 0)
+                    return new Error("Case.NestedCaseNotAllowed", "Nested 'case' sub-questions inside 'case' are not allowed.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
+
                 string payloadJson;
+                IReadOnlyList<JsonQuestionSpec>? subQuestionSpecs = null;
+
                 if (qType == QuestionType.FillBlank)
                 {
-                    if (hasMcqOnly || hasImagePath || hasFlashcardOnly || hasArOnly || hasSpotOnly || q.AllowNoError.HasValue || hasMode || hasDiffOnly || hasMechOnly || hasRelabelOnly || q.Title is not null)
+                    if (hasMcqOnly || hasImagePath || hasFlashcardOnly || hasArOnly || hasAnswer || hasSpotOnly || q.AllowNoError.HasValue || hasMode || hasDiffOnly || hasMechOnly || hasRelabelOnly || hasPrompt || hasDistractors || hasClassifyOnly || hasMatchOnly || hasNumericOnly || hasCaseOnly || q.Title is not null)
                         return new Error("Json.InvalidFieldForType", "Fill-in-the-blank question specifies fields belonging to another question type.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
                     var template = q.Text ?? string.Empty;
                     var slotsRes = Phase1PayloadRules.ParseFillBlankTemplate(template);
-                    var payload = new FillBlankPayload(template, slotsRes.IsSuccess ? slotsRes.Value : [], q.Fuzzy ?? true, q.CaseSensitive ?? false, string.IsNullOrWhiteSpace(q.Explanation) ? null : q.Explanation.Trim());
+                    var payload = new FillBlankPayload(template, slotsRes.IsSuccess ? slotsRes.Value : [], q.Fuzzy ?? true, q.CaseSensitive ?? false, string.IsNullOrWhiteSpace(q.Explanation) ? null : q.Explanation.Trim(), string.IsNullOrWhiteSpace(q.Placeholder) ? null : q.Placeholder.Trim());
                     payloadJson = Phase1PayloadCodec.Serialize(payload);
                 }
                 else if (qType == QuestionType.AssertionReason)
                 {
-                    if (hasMcqOnly || hasImagePath || hasFlashcardOnly || hasRecallFlags || hasSpotOnly || q.AllowNoError.HasValue || hasMode || hasDiffOnly || hasMechOnly || hasRelabelOnly || q.Title is not null || !string.IsNullOrWhiteSpace(q.Text))
+                    if (hasMcqOnly || hasImagePath || hasFlashcardOnly || hasRecallFlags || hasPlaceholder || hasSpotOnly || q.AllowNoError.HasValue || hasMode || hasDiffOnly || hasMechOnly || hasRelabelOnly || hasPrompt || hasDistractors || hasClassifyOnly || hasMatchOnly || hasNumericOnly || hasCaseOnly || q.Title is not null || !string.IsNullOrWhiteSpace(q.Text))
                         return new Error("Json.InvalidFieldForType", "Assertion-Reason question cannot specify 'text' or fields belonging to another question type.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
-                    var ans = Phase1PayloadRules.NormalizeAssertionReasonAnswer(q.Answer);
+                    if (q.Answer is { ValueKind: JsonValueKind.Number })
+                        return new Error("Json.InvalidQuestion", "Assertion-Reason 'answer' must be a code string (e.g. 'both-explain').", ErrorType.Validation, Path: $"{pathPrefix}[{i}].answer");
+                    var ans = Phase1PayloadRules.NormalizeAssertionReasonAnswer(AsString(q.Answer));
                     var sch = Phase1PayloadRules.ResolveAssertionReasonScheme(q.Scheme, ans);
                     var payload = new AssertionReasonPayload(q.Assertion?.Trim() ?? string.Empty, q.Reason?.Trim() ?? string.Empty, ans, sch, string.IsNullOrWhiteSpace(q.Explanation) ? null : q.Explanation.Trim());
                     payloadJson = Phase1PayloadCodec.Serialize(payload);
                 }
                 else if (qType == QuestionType.SpotError)
                 {
-                    if (hasMcqOnly || hasImagePath || hasFlashcardOnly || hasRecallFlags || hasArOnly || hasMode || hasDiffOnly || hasMechOnly || hasRelabelOnly || q.Title is not null)
+                    if (hasMcqOnly || hasFlashcardOnly || hasRecallFlags || hasPlaceholder || hasArOnly || hasAnswer || hasMode || hasDiffOnly || hasMechOnly || hasRelabelOnly || hasPrompt || hasDistractors || hasClassifyOnly || hasMatchOnly || hasNumericOnly || hasCaseOnly || q.Title is not null)
                         return new Error("Json.InvalidFieldForType", "Spot-the-error question specifies fields belonging to another question type.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
                     var template = q.Text ?? string.Empty;
                     var segsRes = Phase1PayloadRules.ParseSpotErrorTemplate(template);
                     bool noError = q.NoError ?? false;
                     bool allowNoError = q.AllowNoError ?? noError;
-                    var payload = new SpotErrorPayload(template, segsRes.IsSuccess ? segsRes.Value : [], q.RequireFix ?? false, allowNoError, noError, string.IsNullOrWhiteSpace(q.Explanation) ? null : q.Explanation.Trim());
+                    var payload = new SpotErrorPayload(template, segsRes.IsSuccess ? segsRes.Value : [], q.RequireFix ?? false, allowNoError, noError, string.IsNullOrWhiteSpace(q.Explanation) ? null : q.Explanation.Trim(), string.IsNullOrWhiteSpace(q.ImagePath) ? null : q.ImagePath.Trim());
                     payloadJson = Phase1PayloadCodec.Serialize(payload);
                 }
                 else if (qType == QuestionType.Differentiation)
                 {
-                    if (hasMcqOnly || hasImagePath || hasFlashcardOnly || hasArOnly || hasSpotOnly || hasMechOnly || hasRelabelOnly || !string.IsNullOrWhiteSpace(q.Text))
+                    if (hasMcqOnly || hasImagePath || hasFlashcardOnly || hasPlaceholder || hasArOnly || hasAnswer || hasSpotOnly || hasMechOnly || hasRelabelOnly || hasPrompt || hasDistractors || hasClassifyOnly || hasMatchOnly || hasNumericOnly || hasCaseOnly || !string.IsNullOrWhiteSpace(q.Text))
                         return new Error("Json.InvalidFieldForType", "Differentiation question cannot specify 'text' or fields belonging to another question type.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
                     if (q.Headers is not null && q.Headers.Any(h => h is null))
                         return new Error("Json.InvalidSpec", $"Differentiation question at '{pathPrefix}[{i}]' contains a null entry in 'headers'.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].headers");
@@ -573,7 +693,7 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
                 }
                 else if (qType == QuestionType.Mechanism)
                 {
-                    if (hasMcqOnly || hasImagePath || hasFlashcardOnly || hasRecallFlags || hasArOnly || hasSpotOnly || q.AllowNoError.HasValue || hasMode || hasDiffOnly || hasRelabelOnly || !string.IsNullOrWhiteSpace(q.Text))
+                    if (hasMcqOnly || hasImagePath || hasFlashcardOnly || hasRecallFlags || hasPlaceholder || hasArOnly || hasAnswer || hasSpotOnly || q.AllowNoError.HasValue || hasMode || hasDiffOnly || hasRelabelOnly || hasPrompt || hasDistractors || hasClassifyOnly || hasMatchOnly || hasNumericOnly || hasCaseOnly || !string.IsNullOrWhiteSpace(q.Text))
                         return new Error("Json.InvalidFieldForType", "Mechanism question cannot specify 'text' or fields belonging to another question type.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
                     if (q.Steps is not null && q.Steps.Any(s => s is null))
                         return new Error("Json.InvalidSpec", $"Mechanism question at '{pathPrefix}[{i}]' contains a null entry in 'steps'.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].steps");
@@ -591,9 +711,9 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
                         string.IsNullOrWhiteSpace(q.Explanation) ? null : q.Explanation.Trim());
                     payloadJson = Phase1PayloadCodec.Serialize(payload);
                 }
-                else
+                else if (qType == QuestionType.RelabelImage)
                 {
-                    if (hasMcqOnly || hasFlashcardOnly || hasArOnly || hasSpotOnly || q.AllowNoError.HasValue || hasDiffOnly || hasMechOnly || q.Title is not null || !string.IsNullOrWhiteSpace(q.Text))
+                    if (hasMcqOnly || hasFlashcardOnly || hasPlaceholder || hasArOnly || hasAnswer || hasSpotOnly || q.AllowNoError.HasValue || hasDiffOnly || hasMechOnly || hasClassifyOnly || hasMatchOnly || hasNumericOnly || hasCaseOnly || q.Title is not null || !string.IsNullOrWhiteSpace(q.Text))
                         return new Error("Json.InvalidFieldForType", "Relabel question cannot specify 'text' or fields belonging to another question type.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
                     if (!string.IsNullOrWhiteSpace(q.Masks) && !string.IsNullOrWhiteSpace(q.MasksPath))
                         return new Error("Json.InvalidQuestion", "Relabel question cannot specify both 'masks' and 'masksPath'.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
@@ -651,18 +771,156 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
                         IncludeLabels: q.Include?.Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x!.Trim()).ToList());
                     payloadJson = Phase1PayloadCodec.Serialize(payload);
                 }
+                else if (qType == QuestionType.Classify)
+                {
+                    if (hasMcqOnly || hasImagePath || hasFlashcardOnly || hasRecallFlags || hasPlaceholder || hasArOnly || hasAnswer || hasSpotOnly || q.AllowNoError.HasValue || hasMode || hasDiffOnly || hasMechOnly || hasRelabelOnly || hasPrompt || hasDistractors || hasMatchOnly || hasNumericOnly || hasCaseOnly || !string.IsNullOrWhiteSpace(q.Text))
+                        return new Error("Json.InvalidFieldForType", "Classify question specifies fields belonging to another question type.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
 
-                var outerImagePath = qType == QuestionType.RelabelImage ? null : q.ImagePath;
-                list.Add(new JsonQuestionSpec(q.Type, null, q.MaxOptions, q.IsMultiCorrect, options, MapSide(q.Front), MapSide(q.Back), q.LayoutOverrides, outerImagePath, q.Explanation, q.Ref, payloadJson));
+                    var buckets = new List<ClassifyBucket>();
+                    if (q.Buckets is not null)
+                    {
+                        for (int bIdx = 0; bIdx < q.Buckets.Count; bIdx++)
+                        {
+                            var be = q.Buckets[bIdx];
+                            if (be.ValueKind == JsonValueKind.String)
+                            {
+                                buckets.Add(new ClassifyBucket(bIdx, be.GetString()?.Trim() ?? string.Empty));
+                            }
+                            else if (be.ValueKind == JsonValueKind.Object)
+                            {
+                                int bid = be.TryGetProperty("bucketId", out var idEl) && idEl.ValueKind == JsonValueKind.Number && idEl.TryGetInt32(out var idVal) ? idVal : bIdx;
+                                string bName = be.TryGetProperty("name", out var nEl) && nEl.ValueKind == JsonValueKind.String ? nEl.GetString()?.Trim() ?? string.Empty : string.Empty;
+                                buckets.Add(new ClassifyBucket(bid, bName));
+                            }
+                            else
+                            {
+                                return new Error("Json.InvalidQuestion", $"Classify bucket at '{pathPrefix}[{i}].buckets[{bIdx}]' must be string or object {{bucketId, name}}.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].buckets[{bIdx}]");
+                            }
+                        }
+                    }
+
+                    var items = new List<ClassifyItem>();
+                    if (q.Items is not null)
+                    {
+                        for (int itIdx = 0; itIdx < q.Items.Count; itIdx++)
+                        {
+                            var it = q.Items[itIdx];
+                            if (it is null)
+                                return new Error("Json.InvalidQuestion", $"Classify item at '{pathPrefix}[{i}].items[{itIdx}]' cannot be null.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].items[{itIdx}]");
+                            int bid = it.BucketId ?? (string.IsNullOrWhiteSpace(it.Bucket)
+                                ? -1
+                                : buckets.FirstOrDefault(b => string.Equals(b.Name, it.Bucket.Trim(), StringComparison.OrdinalIgnoreCase))?.BucketId ?? -1);
+                            items.Add(new ClassifyItem(itIdx, bid, it.Text?.Trim() ?? string.Empty));
+                        }
+                    }
+
+                    payloadJson = Phase1PayloadCodec.Serialize(new ClassifyPayload(
+                        string.IsNullOrWhiteSpace(q.Title) ? null : q.Title.Trim(),
+                        buckets,
+                        items,
+                        string.IsNullOrWhiteSpace(q.Explanation) ? null : q.Explanation.Trim()));
+                }
+                else if (qType == QuestionType.Match)
+                {
+                    if (hasMcqOnly || hasImagePath || hasFlashcardOnly || hasRecallFlags || hasPlaceholder || hasArOnly || hasAnswer || hasSpotOnly || q.AllowNoError.HasValue || hasMode || hasDiffOnly || hasMechOnly || hasRelabelOnly || hasPrompt || hasClassifyOnly || hasNumericOnly || hasCaseOnly || !string.IsNullOrWhiteSpace(q.Text))
+                        return new Error("Json.InvalidFieldForType", "Match question specifies fields belonging to another question type.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
+                    if (q.Pairs is not null && q.Pairs.Any(p => p is null))
+                        return new Error("Json.InvalidQuestion", $"Match question at '{pathPrefix}[{i}]' contains a null entry in 'pairs'.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].pairs");
+                    if (q.Distractors is not null && q.Distractors.Any(d => d is null))
+                        return new Error("Json.InvalidQuestion", $"Match question at '{pathPrefix}[{i}]' contains a null entry in 'distractors'.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].distractors");
+
+                    var pairs = (q.Pairs ?? [])
+                        .Select((p, pIdx) => new MatchPair(pIdx, p!.Left?.Trim() ?? string.Empty, p.Right?.Trim() ?? string.Empty))
+                        .ToList();
+                    var distractors = (q.Distractors ?? []).Select(d => d!.Trim()).Where(s => !string.IsNullOrEmpty(s)).ToList();
+                    payloadJson = Phase1PayloadCodec.Serialize(new MatchPayload(
+                        string.IsNullOrWhiteSpace(q.Title) ? null : q.Title.Trim(),
+                        pairs,
+                        distractors,
+                        string.IsNullOrWhiteSpace(q.Explanation) ? null : q.Explanation.Trim()));
+                }
+                else if (qType == QuestionType.Numeric)
+                {
+                    if (hasMcqOnly || hasFlashcardOnly || hasRecallFlags || hasArOnly || hasSpotOnly || q.AllowNoError.HasValue || hasMode || hasDiffOnly || hasMechOnly || hasRelabelOnly || hasDistractors || hasClassifyOnly || hasMatchOnly || hasCaseOnly || q.Title is not null)
+                        return new Error("Json.InvalidFieldForType", "Numeric question specifies fields belonging to another question type.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
+
+                    double ansVal = double.NaN;
+                    if (q.Answer is { ValueKind: JsonValueKind.Number } numEl && numEl.TryGetDouble(out var parsedAns))
+                        ansVal = parsedAns;
+                    else if (q.Answer is { ValueKind: JsonValueKind.String } strAns &&
+                             double.TryParse(strAns.GetString()?.Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var parsedStrAns))
+                        ansVal = parsedStrAns;
+                    else if (hasAnswer)
+                        return new Error("Json.InvalidQuestion", $"Numeric question 'answer' must be a number.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].answer");
+
+                    var rawTolStr = q.Tolerance is { ValueKind: JsonValueKind.String or JsonValueKind.Number } ? AsString(q.Tolerance) : null;
+                    if (!Phase3PayloadRules.TryParseToleranceSpec(rawTolStr, q.ToleranceMode, out var tolVal, out var tolMode))
+                        tolVal = -1;
+
+                    var promptText = !string.IsNullOrWhiteSpace(q.Prompt) ? q.Prompt.Trim() : (q.Text?.Trim() ?? string.Empty);
+                    payloadJson = Phase1PayloadCodec.Serialize(new NumericPayload(
+                        promptText,
+                        ansVal,
+                        tolVal,
+                        tolMode,
+                        string.IsNullOrWhiteSpace(q.Unit) ? null : q.Unit.Trim(),
+                        string.IsNullOrWhiteSpace(q.Placeholder) ? null : q.Placeholder.Trim(),
+                        string.IsNullOrWhiteSpace(q.Explanation) ? null : q.Explanation.Trim(),
+                        string.IsNullOrWhiteSpace(q.ImagePath) ? null : q.ImagePath.Trim()));
+                }
+                else
+                {
+                    if (hasMcqOnly || hasFlashcardOnly || hasRecallFlags || hasPlaceholder || hasArOnly || hasAnswer || hasSpotOnly || q.AllowNoError.HasValue || hasMode || hasDiffOnly || hasMechOnly || hasRelabelOnly || hasPrompt || hasDistractors || hasClassifyOnly || hasMatchOnly || hasNumericOnly || !string.IsNullOrWhiteSpace(q.Text))
+                        return new Error("Json.InvalidFieldForType", "Case question specifies fields belonging to another question type.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
+
+                    var subRes = MapQuestions(q.Questions, $"{pathPrefix}[{i}].questions", caseDepth + 1);
+                    if (!subRes.IsSuccess) return subRes.Error!;
+                    subQuestionSpecs = subRes.Value ?? [];
+
+                    payloadJson = Phase1PayloadCodec.Serialize(new CaseGroupPayload(
+                        string.IsNullOrWhiteSpace(q.Title) ? null : q.Title.Trim(),
+                        q.Stem?.Trim() ?? string.Empty,
+                        string.IsNullOrWhiteSpace(q.ImagePath) ? null : q.ImagePath.Trim(),
+                        string.IsNullOrWhiteSpace(q.Caption) ? null : q.Caption.Trim(),
+                        [],
+                        string.IsNullOrWhiteSpace(q.Explanation) ? null : q.Explanation.Trim()));
+                }
+
+                var outerImagePath = qType is QuestionType.RelabelImage or QuestionType.SpotError or QuestionType.Numeric or QuestionType.CaseGroup ? null : q.ImagePath;
+                list.Add(new JsonQuestionSpec(q.Type, null, q.MaxOptions, q.IsMultiCorrect, options, MapSide(q.Front), MapSide(q.Back), q.LayoutOverrides, outerImagePath, q.Explanation, q.Ref, payloadJson, subQuestionSpecs));
                 continue;
             }
 
-            if (hasRecallFlags || hasArOnly || hasSpotOnly || q.AllowNoError.HasValue || hasMode || hasDiffOnly || hasMechOnly || hasRelabelOnly || q.Title is not null)
+            if (hasRecallFlags || hasPlaceholder || hasArOnly || hasAnswer || hasSpotOnly || q.AllowNoError.HasValue || hasMode || hasDiffOnly || hasMechOnly || hasRelabelOnly || hasPrompt || hasDistractors || hasClassifyOnly || hasMatchOnly || hasNumericOnly || hasCaseOnly || q.Title is not null)
                 return new Error("Json.InvalidFieldForType", $"Question type '{q.Type}' cannot specify specialized payload fields.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
 
             list.Add(new JsonQuestionSpec(q.Type, q.Text, q.MaxOptions, q.IsMultiCorrect, options, MapSide(q.Front), MapSide(q.Back), q.LayoutOverrides, q.ImagePath, q.Explanation, q.Ref));
         }
         return Result<IReadOnlyList<JsonQuestionSpec>?>.Success(list);
+    }
+
+    private static Result<IReadOnlyList<DeclarativeLinkCardSpec>?> MapLinks(List<ApplyLinkCardDto?>? rawLinks, string pathPrefix)
+    {
+        if (rawLinks is null) return Result<IReadOnlyList<DeclarativeLinkCardSpec>?>.Success(null);
+        var list = new List<DeclarativeLinkCardSpec>(rawLinks.Count);
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < rawLinks.Count; i++)
+        {
+            var l = rawLinks[i];
+            if (l is null || string.IsNullOrWhiteSpace(l.Id))
+                return new Error("Json.InvalidSpec", $"Link card at '{pathPrefix}[{i}]' must specify a non-empty 'id'.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
+            var idRes = ArticleLinkRules.ValidateAndNormalizeCardId(l.Id);
+            if (!idRes.IsSuccess || string.IsNullOrWhiteSpace(idRes.Value))
+                return idRes.Error ?? new Error("Json.InvalidSpec", $"Invalid link card id '{l.Id}' at '{pathPrefix}[{i}]'.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].id");
+            if (!seen.Add(idRes.Value))
+                return new Error("Json.DuplicateLinkId", $"Duplicate link card id '{idRes.Value}' in '{pathPrefix}'.", ErrorType.Conflict, Path: $"{pathPrefix}[{i}].id");
+            var text = string.IsNullOrWhiteSpace(l.Text) ? null : l.Text.Trim();
+            var img = string.IsNullOrWhiteSpace(l.ImagePath) ? null : l.ImagePath.Trim();
+            if (text is null && img is null)
+                return new Error("Json.InvalidSpec", $"Link card '{idRes.Value}' at '{pathPrefix}[{i}]' must specify 'text', 'imagePath', or both.", ErrorType.Validation, Path: $"{pathPrefix}[{i}]");
+            list.Add(new DeclarativeLinkCardSpec(idRes.Value, string.IsNullOrWhiteSpace(l.Title) ? null : l.Title.Trim(), text, img));
+        }
+        return Result<IReadOnlyList<DeclarativeLinkCardSpec>?>.Success(list);
     }
 
     private sealed class ApplySpecDto
@@ -677,6 +935,7 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
         public List<ApplyComponentDto?>? Components { get; set; }
         public List<ApplyArticleBlockDto?>? Blocks { get; set; }
         public List<ApplyQuestionDto?>? Questions { get; set; }
+        public List<ApplyLinkCardDto?>? Links { get; set; }
         public Dictionary<string, string>? LayoutOverrides { get; set; }
     }
 
@@ -688,7 +947,16 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
         public string? QuizType { get; set; }
         public List<ApplyArticleBlockDto?>? Blocks { get; set; }
         public List<ApplyQuestionDto?>? Questions { get; set; }
+        public List<ApplyLinkCardDto?>? Links { get; set; }
         public Dictionary<string, string>? LayoutOverrides { get; set; }
+    }
+
+    private sealed class ApplyLinkCardDto
+    {
+        public string? Id { get; set; }
+        public string? Title { get; set; }
+        public string? Text { get; set; }
+        public string? ImagePath { get; set; }
     }
 
     private sealed class ApplyArticleBlockDto
@@ -707,6 +975,11 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
         public List<string?>? Alignments { get; set; }
         public List<List<string?>?>? Rows { get; set; }
         public string? Footnote { get; set; }
+        public string? Masks { get; set; }
+        public string? MasksPath { get; set; }
+        public List<ApplyDiagramHotspotDto?>? Hotspots { get; set; }
+        public bool? ShowFirst { get; set; }
+        public List<ApplyRevealStepDto?>? Steps { get; set; }
     }
 
     private sealed class ApplyQuestionDto
@@ -724,9 +997,10 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
         public Dictionary<string, string>? LayoutOverrides { get; set; }
         public bool? Fuzzy { get; set; }
         public bool? CaseSensitive { get; set; }
+        public string? Placeholder { get; set; }
         public string? Assertion { get; set; }
         public string? Reason { get; set; }
-        public string? Answer { get; set; }
+        public JsonElement? Answer { get; set; }
         public string? Scheme { get; set; }
         public bool? RequireFix { get; set; }
         public bool? AllowNoError { get; set; }
@@ -745,6 +1019,15 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
         public List<string?>? Include { get; set; }
         public List<ApplyRelabelBoxDto?>? Boxes { get; set; }
         public List<string?>? Distractors { get; set; }
+        public List<JsonElement>? Buckets { get; set; }
+        public List<ApplyClassifyItemDto?>? Items { get; set; }
+        public List<ApplyMatchPairDto?>? Pairs { get; set; }
+        public JsonElement? Tolerance { get; set; }
+        public string? ToleranceMode { get; set; }
+        public string? Unit { get; set; }
+        public string? Stem { get; set; }
+        public string? Caption { get; set; }
+        public List<ApplyQuestionDto?>? Questions { get; set; }
     }
 
     private sealed class ApplyOptionDto
@@ -780,5 +1063,35 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
         public double? Y { get; set; }
         public double? W { get; set; }
         public double? H { get; set; }
+    }
+
+    private sealed class ApplyDiagramHotspotDto
+    {
+        public string? Label { get; set; }
+        public string? Note { get; set; }
+        public List<double>? Rect { get; set; }
+        public double? X { get; set; }
+        public double? Y { get; set; }
+        public double? W { get; set; }
+        public double? H { get; set; }
+    }
+
+    private sealed class ApplyRevealStepDto
+    {
+        public string? Heading { get; set; }
+        public string? Body { get; set; }
+    }
+
+    private sealed class ApplyClassifyItemDto
+    {
+        public int? BucketId { get; set; }
+        public string? Bucket { get; set; }
+        public string? Text { get; set; }
+    }
+
+    private sealed class ApplyMatchPairDto
+    {
+        public string? Left { get; set; }
+        public string? Right { get; set; }
     }
 }

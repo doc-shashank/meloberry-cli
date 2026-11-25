@@ -17,7 +17,7 @@ public sealed class ApplyCliCommand : CliCommand
             HandlerType: typeof(Handler),
             AllowedFlagOptions: AllowedFlags,
             AllowedValueOptions: AllowedValues,
-            Prerequisites: "Input must be a valid JSON spec, Markdown (.md), directory of .md/.json, or '-' (stdin). '--verify' and '--static-only' require '--build <webDir>'.",
+            Prerequisites: "Input must be a valid JSON spec, Markdown (.md), directory of .md/.json, or '-' (stdin). Optional [addr] targets a session, component, or standalone quiz only (use 'patch' for blocks/questions). Plain 'apply' allows draft writes and returns data.lint; mandatory exit-2 lint gating runs on 'check', 'build', 'apply --build', 'apply --export', and 'pkg export'.",
             OptionsHelp:
             [
                 "-o, --out <dir>          Base workspace folder (defaults to .meloberry/workspaces).",
@@ -88,10 +88,10 @@ public sealed class PatchCliCommand : CliCommand
             Description: "Surgically updates or reorders an entity by ID, path (#c1.b2), or #ref.",
             HandlerType: typeof(Handler),
             AllowedValueOptions: AllowedValues,
-            Prerequisites: "Target entity must exist (addressed by direct ID, <wsId>#c<n>[.b<m>|.q<m>], <setId>#q<m>, or <wsId>#<ref>). Provide a patch JSON file/'-', --set, and/or --move.",
+            Prerequisites: "Target entity must exist (addressed by direct ID, <sessionId>#c<n>[.b<m>|.q<m>], <setId>#q<m>, or <wsId>#<ref>). Provide a non-empty patch JSON file/'-', --set, and/or --move (empty {} without --move fails with Patch.Empty).",
             OptionsHelp:
             [
-                "--set <k=v>          Repeatable field update; supports dot paths (e.g. layoutOverrides.<k>=<v|null>, front.text=...).",
+                "--set <k=v>          Repeatable field update; supports dot paths (e.g. layoutOverrides.<k>=<v|null>, front.text=...). 'null' clears nullable fields/overrides and rejects non-nullable fields.",
                 "--move <idx>:<mode>  Reorder component, block, or question to 1-based <idx> using 'shift' or 'exchange'."
             ],
             Examples:

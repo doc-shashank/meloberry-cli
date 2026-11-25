@@ -1,4 +1,5 @@
 using System.Net;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Meloberry.Application.Abstractions;
@@ -14,6 +15,8 @@ public sealed class LocalPreviewHost(
     ILayoutEditorPageBuilder layoutEditorPageBuilder,
     ICliToolMetadataProvider metadataProvider) : ILocalPreviewHost
 {
+    private const int MaxLayoutRequestBodyBytes = 64 * 1024;
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -58,78 +61,83 @@ public sealed class LocalPreviewHost(
                 jsonOutput);
         }
 
-        var prefix = $"http://127.0.0.1:{FindFreePort()}/";
         if (noWait)
         {
+            var noWaitPrefix = $"http://127.0.0.1:{FindFreePort()}/";
             if (jsonOutput)
             {
                 WriteJsonEnvelope(console, new
                 {
                     mode = exitAfterFirstAnalysis ? "live-analysis" : "preview",
-                    url = prefix,
+                    url = noWaitPrefix,
                     root = fullDir
                 });
             }
             else if (!silent)
             {
                 var modeLabel = exitAfterFirstAnalysis ? "Live analysis capture ready" : "Preview ready";
-                console.Out.WriteLine($"{modeLabel} at {prefix} (root: '{fullDir}')");
+                console.Out.WriteLine($"{modeLabel} at {noWaitPrefix} (root: '{fullDir}')");
             }
 
             return ExitCodes.Success;
         }
 
-        if (!silent)
+        var (listener, prefix) = StartHttpListenerWithRetry();
+        using (listener)
         {
-            console.Out.WriteLine(exitAfterFirstAnalysis
-                ? $"Serving Meloberry WebApp at {prefix} — complete the quiz and click 'Finish & Analyze' to capture results (Ctrl+C to cancel)..."
-                : $"Serving Meloberry WebApp at {prefix} — press Ctrl+C to stop.");
+            if (!silent)
+            {
+                console.Out.WriteLine(exitAfterFirstAnalysis
+                    ? $"Serving Meloberry WebApp at {prefix} — complete the quiz and click 'Finish & Analyze' to capture results (Ctrl+C to cancel)..."
+                    : $"Serving Meloberry WebApp at {prefix} — press Ctrl+C to stop.");
+                console.Out.Flush();
+            }
+
+            await RunHttpServerLoopAsync(listener, cancellationToken, async ctx =>
+            {
+                var path = ctx.Request.Url?.AbsolutePath ?? "/";
+                if (ctx.Request.HttpMethod == "POST" && string.Equals(path, "/api/analysis", StringComparison.OrdinalIgnoreCase))
+                {
+                    var shouldStop = await HandleAnalysisPostAsync(ctx, fullDir, console, exitAfterFirstAnalysis, jsonOutput, cancellationToken);
+                    return shouldStop;
+                }
+
+                if (!Uri.TryCreate("http://localhost" + path, UriKind.Absolute, out _))
+                {
+                    await TryWriteStatusAsync(ctx.Response, 400, cancellationToken);
+                    return false;
+                }
+
+                string rel;
+                try
+                {
+                    rel = Uri.UnescapeDataString(path.TrimStart('/'));
+                }
+                catch (UriFormatException)
+                {
+                    await TryWriteStatusAsync(ctx.Response, 400, cancellationToken);
+                    return false;
+                }
+
+                if (string.IsNullOrWhiteSpace(rel))
+                    rel = "index.html";
+
+                if (!PathConfinement.TryResolveInside(fullDir, rel.Replace('/', Path.DirectorySeparatorChar), out var safePath) ||
+                    !File.Exists(safePath))
+                {
+                    await TryWriteStatusAsync(ctx.Response, 404, cancellationToken);
+                    return false;
+                }
+
+                var ext = Path.GetExtension(safePath);
+                if (string.Equals(ext, ".svg", StringComparison.OrdinalIgnoreCase))
+                    ctx.Response.AddHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox");
+
+                var bytes = await File.ReadAllBytesAsync(safePath, cancellationToken);
+                await TryWriteBytesAsync(ctx.Response, 200, GetMimeType(ext), bytes, cancellationToken);
+                return false;
+            });
         }
-
-        await RunHttpServerAsync(prefix, cancellationToken, async ctx =>
-        {
-            var path = ctx.Request.Url?.AbsolutePath ?? "/";
-            if (ctx.Request.HttpMethod == "POST" && string.Equals(path, "/api/analysis", StringComparison.OrdinalIgnoreCase))
-            {
-                var shouldStop = await HandleAnalysisPostAsync(ctx, fullDir, console, exitAfterFirstAnalysis, jsonOutput, cancellationToken);
-                return shouldStop;
-            }
-
-            if (!Uri.TryCreate("http://localhost" + path, UriKind.Absolute, out _))
-            {
-                await TryWriteStatusAsync(ctx.Response, 400, cancellationToken);
-                return false;
-            }
-
-            string rel;
-            try
-            {
-                rel = Uri.UnescapeDataString(path.TrimStart('/'));
-            }
-            catch (UriFormatException)
-            {
-                await TryWriteStatusAsync(ctx.Response, 400, cancellationToken);
-                return false;
-            }
-
-            if (string.IsNullOrWhiteSpace(rel))
-                rel = "index.html";
-
-            if (!PathConfinement.TryResolveInside(fullDir, rel.Replace('/', Path.DirectorySeparatorChar), out var safePath) ||
-                !File.Exists(safePath))
-            {
-                await TryWriteStatusAsync(ctx.Response, 404, cancellationToken);
-                return false;
-            }
-
-            var ext = Path.GetExtension(safePath);
-            if (string.Equals(ext, ".svg", StringComparison.OrdinalIgnoreCase))
-                ctx.Response.AddHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox");
-
-            var bytes = await File.ReadAllBytesAsync(safePath, cancellationToken);
-            await TryWriteBytesAsync(ctx.Response, 200, GetMimeType(ext), bytes, cancellationToken);
-            return false;
-        });
 
         return ExitCodes.Success;
     }
@@ -227,94 +235,166 @@ public sealed class LocalPreviewHost(
             return CliResultExtensions.WriteValidationError(
                 console,
                 "Layout.InvalidTargetType",
-                $"Invalid target '{targetType}'. Use 'article-text', 'image', 'mcq-question', 'mcq-options', 'flashcard' (or legacy 'article', 'mcq').",
+                $"Invalid target '{targetType}'. Use 'article-text', 'callout', 'table', 'image', 'mcq-question', 'mcq-options', 'fill-blank', 'assertion-reason', 'spot-error', 'diff', 'mechanism', 'relabel', 'flashcard' (or legacy 'article', 'mcq').",
                 json);
         }
 
-        var prefix = $"http://127.0.0.1:{FindFreePort()}/";
         if (noWait)
         {
+            var noWaitPrefix = $"http://127.0.0.1:{FindFreePort()}/";
             if (json)
-                WriteJsonEnvelope(console, new { target = initialComponent, profile = defaultProfile, url = prefix });
+                WriteJsonEnvelope(console, new { target = initialComponent, profile = defaultProfile, url = noWaitPrefix });
             else if (!silent)
-                console.Out.WriteLine($"Component GUI Layout Editor ready for '{initialComponent}' at {prefix}");
+                console.Out.WriteLine($"Component GUI Layout Editor ready for '{initialComponent}' at {noWaitPrefix}");
 
             return ExitCodes.Success;
         }
 
         var toolMeta = metadataProvider.GetMetadata();
-        if (!silent)
-        {
-            console.Out.WriteLine(
-                $"Meloberry ({toolMeta.ExecutableName} v{toolMeta.Version}) Component GUI Layout Editor ({initialComponent}) running at {prefix} — press Ctrl+C to stop.");
-        }
+        var csrfToken = Convert.ToHexString(RandomNumberGenerator.GetBytes(24));
+        var (listener, prefix) = StartHttpListenerWithRetry();
 
-        await RunHttpServerAsync(prefix, cancellationToken, async ctx =>
+        using (listener)
         {
-            var path = ctx.Request.Url?.AbsolutePath ?? "/";
-            var method = ctx.Request.HttpMethod;
-
-            if (method == "GET" && path == "/api/layout")
+            if (!silent)
             {
-                using var scope = scopeFactory.CreateScope();
-                var handler = scope.ServiceProvider.GetRequiredService<GetLayoutBoundsHandler>();
-                var res = await handler.HandleAsync(new GetLayoutBoundsQuery(null), cancellationToken);
-                if (!res.IsSuccess)
+                if (json)
                 {
-                    await TryWriteJsonAsync(ctx.Response, 400, res.Error, cancellationToken);
+                    WriteJsonEnvelope(console, new
+                    {
+                        target = initialComponent,
+                        profile = defaultProfile,
+                        url = prefix,
+                        running = true
+                    });
+                }
+                else
+                {
+                    console.Out.WriteLine(
+                        $"Meloberry ({toolMeta.ExecutableName} v{toolMeta.Version}) Component GUI Layout Editor ({initialComponent}) running at {prefix} — press Ctrl+C to stop.");
+                }
+                console.Out.Flush();
+            }
+
+            await RunHttpServerLoopAsync(listener, cancellationToken, async ctx =>
+            {
+                var path = ctx.Request.Url?.AbsolutePath ?? "/";
+                var method = ctx.Request.HttpMethod;
+
+                if (string.Equals(path, "/", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(path, "/index.html", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!string.Equals(method, "GET", StringComparison.OrdinalIgnoreCase))
+                    {
+                        await WriteMethodNotAllowedAsync(ctx.Response, "GET", isApi: false, cancellationToken);
+                        return false;
+                    }
+
+                    ctx.Response.AddHeader("Cache-Control", "no-store");
+                    var html = layoutEditorPageBuilder.BuildHtml(initialComponent, toolMeta, csrfToken);
+                    await TryWriteBytesAsync(ctx.Response, 200, "text/html; charset=utf-8", Encoding.UTF8.GetBytes(html), cancellationToken);
                     return false;
                 }
 
-                var grouped = res.Value.Properties
-                    .GroupBy(p => p.TargetType, StringComparer.OrdinalIgnoreCase)
-                    .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.OrdinalIgnoreCase);
+                if (string.Equals(path, "/favicon.ico", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!string.Equals(method, "GET", StringComparison.OrdinalIgnoreCase) &&
+                        !string.Equals(method, "HEAD", StringComparison.OrdinalIgnoreCase))
+                    {
+                        await WriteMethodNotAllowedAsync(ctx.Response, "GET, HEAD", isApi: false, cancellationToken);
+                        return false;
+                    }
 
-                await TryWriteJsonAsync(ctx.Response, 200, new { tool = toolMeta, initialComponent, profiles = grouped }, cancellationToken);
+                    await TryWriteNoContentAsync(ctx.Response);
+                    return false;
+                }
+
+                if (string.Equals(path, "/api/layout", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (string.Equals(method, "GET", StringComparison.OrdinalIgnoreCase))
+                    {
+                        using var scope = scopeFactory.CreateScope();
+                        var handler = scope.ServiceProvider.GetRequiredService<GetLayoutBoundsHandler>();
+                        var res = await handler.HandleAsync(new GetLayoutBoundsQuery(null), cancellationToken);
+                        if (!res.IsSuccess)
+                        {
+                            await TryWriteJsonAsync(ctx.Response, 400, res.Error, cancellationToken);
+                            return false;
+                        }
+
+                        var grouped = res.Value.Properties
+                            .GroupBy(p => p.TargetType, StringComparer.OrdinalIgnoreCase)
+                            .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.OrdinalIgnoreCase);
+
+                        await TryWriteJsonAsync(ctx.Response, 200, new { tool = toolMeta, initialComponent, profiles = grouped }, cancellationToken);
+                        return false;
+                    }
+
+                    if (string.Equals(method, "POST", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!IsValidCsrfToken(ctx.Request, csrfToken))
+                        {
+                            await TryWriteJsonAsync(ctx.Response, 403, new { saved = false, errors = new[] { "Invalid or missing editor CSRF token." } }, cancellationToken);
+                            return false;
+                        }
+
+                        await HandleLayoutSaveAsync(ctx, defaultProfile, cancellationToken);
+                        return false;
+                    }
+
+                    await WriteMethodNotAllowedAsync(ctx.Response, "GET, POST", isApi: true, cancellationToken);
+                    return false;
+                }
+
+                if (string.Equals(path, "/api/layout/reset", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!string.Equals(method, "POST", StringComparison.OrdinalIgnoreCase))
+                    {
+                        await WriteMethodNotAllowedAsync(ctx.Response, "POST", isApi: true, cancellationToken);
+                        return false;
+                    }
+
+                    if (!IsValidCsrfToken(ctx.Request, csrfToken))
+                    {
+                        await TryWriteJsonAsync(ctx.Response, 403, new { reset = false, errors = new[] { "Invalid or missing editor CSRF token." } }, cancellationToken);
+                        return false;
+                    }
+
+                    await HandleLayoutResetAsync(ctx, cancellationToken);
+                    return false;
+                }
+
+                if (path.StartsWith("/api/", StringComparison.OrdinalIgnoreCase))
+                {
+                    await TryWriteJsonAsync(ctx.Response, 404, new { error = $"Endpoint '{path}' not found." }, cancellationToken);
+                    return false;
+                }
+
+                await TryWriteBytesAsync(ctx.Response, 404, "text/plain; charset=utf-8", Encoding.UTF8.GetBytes("Not Found"), cancellationToken);
                 return false;
-            }
-
-            if (method == "GET" && path == "/api/bounds")
-            {
-                var requestedTarget = ctx.Request.QueryString["target"];
-                var effectiveTarget = string.Equals(requestedTarget, "all", StringComparison.OrdinalIgnoreCase)
-                    ? null
-                    : (!string.IsNullOrWhiteSpace(requestedTarget) ? requestedTarget : defaultProfile);
-
-                using var scope = scopeFactory.CreateScope();
-                var handler = scope.ServiceProvider.GetRequiredService<GetLayoutBoundsHandler>();
-                var res = await handler.HandleAsync(new GetLayoutBoundsQuery(effectiveTarget), cancellationToken);
-                await TryWriteJsonAsync(ctx.Response, res.IsSuccess ? 200 : 400, res.IsSuccess ? res.Value : res.Error, cancellationToken);
-                return false;
-            }
-
-            if (method == "POST" && path == "/api/layout")
-            {
-                await HandleLayoutSaveAsync(ctx, defaultProfile, cancellationToken);
-                return false;
-            }
-
-            if (method == "POST" && path == "/api/layout/reset")
-            {
-                await HandleLayoutResetAsync(ctx, cancellationToken);
-                return false;
-            }
-
-            var html = layoutEditorPageBuilder.BuildHtml(initialComponent, toolMeta);
-            await TryWriteBytesAsync(ctx.Response, 200, "text/html; charset=utf-8", Encoding.UTF8.GetBytes(html), cancellationToken);
-            return false;
-        });
+            });
+        }
 
         return ExitCodes.Success;
     }
 
     private async Task HandleLayoutSaveAsync(HttpListenerContext ctx, string defaultProfile, CancellationToken cancellationToken)
     {
-        using var reader = new StreamReader(ctx.Request.InputStream, Encoding.UTF8);
-        var body = await reader.ReadToEndAsync(cancellationToken);
-        var errors = new List<string>();
+        var (tooLarge, body) = await ReadRequestBodyBoundedAsync(ctx.Request, MaxLayoutRequestBodyBytes, cancellationToken);
+        if (tooLarge)
+        {
+            await TryWriteJsonAsync(ctx.Response, 413, new { saved = false, errors = new[] { "Request body exceeds 64 KB limit." } }, cancellationToken);
+            return;
+        }
 
-        using var scope = scopeFactory.CreateScope();
-        var setter = scope.ServiceProvider.GetRequiredService<SetLayoutPropertyHandler>();
+        if (string.IsNullOrWhiteSpace(body))
+        {
+            await TryWriteJsonAsync(ctx.Response, 400, new { saved = false, errors = new[] { "Request body must be a non-empty JSON object." } }, cancellationToken);
+            return;
+        }
+
+        var errors = new List<string>();
+        var parsedProfiles = new Dictionary<string, IReadOnlyDictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
 
         try
         {
@@ -324,37 +404,120 @@ public sealed class LocalPreviewHost(
             {
                 errors.Add("Request body must be a JSON object.");
             }
-            else if (root.TryGetProperty("profiles", out var profilesEl) && profilesEl.ValueKind == JsonValueKind.Object)
+            else if (root.TryGetProperty("profiles", out var profilesEl))
             {
-                foreach (var profileProp in profilesEl.EnumerateObject())
+                if (profilesEl.ValueKind != JsonValueKind.Object)
                 {
-                    if (profileProp.Value.ValueKind == JsonValueKind.Object)
-                        await ApplyProfileUpdatesAsync(setter, profileProp.Name, profileProp.Value, errors, cancellationToken);
+                    errors.Add("Field 'profiles' must be a JSON object.");
+                }
+                else
+                {
+                    foreach (var profileProp in profilesEl.EnumerateObject())
+                    {
+                        if (profileProp.Value.ValueKind != JsonValueKind.Object)
+                        {
+                            errors.Add($"Profile '{profileProp.Name}' must be a JSON object.");
+                            continue;
+                        }
+
+                        var propMap = ExtractScalarPropertyMap(profileProp.Name, profileProp.Value, errors);
+                        if (propMap.Count == 0 && errors.Count == 0)
+                            errors.Add($"Profile '{profileProp.Name}' must contain at least one property update.");
+                        else
+                            parsedProfiles[profileProp.Name] = propMap;
+                    }
+
+                    if (parsedProfiles.Count == 0 && errors.Count == 0)
+                        errors.Add("Field 'profiles' must contain at least one profile update.");
                 }
             }
-            else if (root.TryGetProperty("targetType", out var targetEl) &&
-                     root.TryGetProperty("values", out var valuesEl) &&
-                     valuesEl.ValueKind == JsonValueKind.Object)
+            else if (root.TryGetProperty("targetType", out var targetEl) || root.TryGetProperty("values", out _))
             {
-                await ApplyProfileUpdatesAsync(setter, targetEl.GetString() ?? defaultProfile, valuesEl, errors, cancellationToken);
+                if (targetEl.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(targetEl.GetString()))
+                {
+                    errors.Add("Field 'targetType' must be a non-empty string.");
+                }
+                else if (!root.TryGetProperty("values", out var valuesEl) || valuesEl.ValueKind != JsonValueKind.Object)
+                {
+                    errors.Add("Field 'values' must be a JSON object.");
+                }
+                else
+                {
+                    var targetName = targetEl.GetString()!;
+                    var propMap = ExtractScalarPropertyMap(targetName, valuesEl, errors);
+                    if (propMap.Count == 0 && errors.Count == 0)
+                        errors.Add("Field 'values' must contain at least one property update.");
+                    else
+                        parsedProfiles[targetName] = propMap;
+                }
             }
             else
             {
-                await ApplyProfileUpdatesAsync(setter, defaultProfile, root, errors, cancellationToken);
+                var propMap = ExtractScalarPropertyMap(defaultProfile, root, errors);
+                if (propMap.Count == 0 && errors.Count == 0)
+                    errors.Add("Request object must contain at least one property update.");
+                else
+                    parsedProfiles[defaultProfile] = propMap;
             }
         }
         catch (JsonException ex)
         {
-            errors.Add(ex.Message);
+            errors.Add($"Invalid JSON payload: {ex.Message}");
         }
 
-        await TryWriteJsonAsync(ctx.Response, errors.Count == 0 ? 200 : 400, new { saved = errors.Count == 0, errors }, cancellationToken);
+        if (errors.Count > 0)
+        {
+            await TryWriteJsonAsync(ctx.Response, 400, new { saved = false, errors }, cancellationToken);
+            return;
+        }
+
+        using var scope = scopeFactory.CreateScope();
+        var saveHandler = scope.ServiceProvider.GetRequiredService<SaveLayoutProfilesHandler>();
+        var saveRes = await saveHandler.HandleAsync(new SaveLayoutProfilesCommand(parsedProfiles), cancellationToken);
+        if (!saveRes.IsSuccess)
+        {
+            await TryWriteJsonAsync(ctx.Response, 400, new { saved = false, errors = new[] { saveRes.Error!.Description } }, cancellationToken);
+            return;
+        }
+
+        if (!saveRes.Value.Saved)
+        {
+            await TryWriteJsonAsync(ctx.Response, 400, new { saved = false, errors = saveRes.Value.Errors }, cancellationToken);
+            return;
+        }
+
+        await TryWriteJsonAsync(ctx.Response, 200, new
+        {
+            saved = true,
+            updatedTargets = saveRes.Value.UpdatedTargets,
+            errors = Array.Empty<string>()
+        }, cancellationToken);
+    }
+
+    private static Dictionary<string, string> ExtractScalarPropertyMap(string targetLabel, JsonElement objEl, List<string> errors)
+    {
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var prop in objEl.EnumerateObject())
+        {
+            if (prop.Value.ValueKind == JsonValueKind.String)
+                map[prop.Name] = prop.Value.GetString() ?? string.Empty;
+            else if (prop.Value.ValueKind == JsonValueKind.Number)
+                map[prop.Name] = prop.Value.GetRawText();
+            else
+                errors.Add($"{targetLabel}.{prop.Name}: Value must be a string or number.");
+        }
+        return map;
     }
 
     private async Task HandleLayoutResetAsync(HttpListenerContext ctx, CancellationToken cancellationToken)
     {
-        using var reader = new StreamReader(ctx.Request.InputStream, Encoding.UTF8);
-        var body = await reader.ReadToEndAsync(cancellationToken);
+        var (tooLarge, body) = await ReadRequestBodyBoundedAsync(ctx.Request, MaxLayoutRequestBodyBytes, cancellationToken);
+        if (tooLarge)
+        {
+            await TryWriteJsonAsync(ctx.Response, 413, new { reset = false, errors = new[] { "Request body exceeds 64 KB limit." } }, cancellationToken);
+            return;
+        }
+
         var targetsToReset = new List<string>();
         List<string>? keysToReset = null;
 
@@ -369,21 +532,51 @@ public sealed class LocalPreviewHost(
                     return;
                 }
 
-                if (doc.RootElement.TryGetProperty("targetType", out var tEl) && tEl.ValueKind == JsonValueKind.String)
+                if (doc.RootElement.TryGetProperty("targetType", out var tEl))
                 {
-                    var tVal = tEl.GetString();
-                    if (!string.IsNullOrWhiteSpace(tVal))
-                        targetsToReset.Add(tVal);
+                    if (tEl.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(tEl.GetString()))
+                    {
+                        await TryWriteJsonAsync(ctx.Response, 400, new { reset = false, errors = new[] { "Field 'targetType' must be a non-empty valid target string ('article', 'mcq', or 'flashcard')." } }, cancellationToken);
+                        return;
+                    }
+
+                    var tVal = tEl.GetString()!.Trim();
+                    if (!LayoutBoundsCatalog.IsValidTargetType(tVal))
+                    {
+                        await TryWriteJsonAsync(ctx.Response, 400, new { reset = false, errors = new[] { $"Invalid layout target type '{tVal}'." } }, cancellationToken);
+                        return;
+                    }
+
+                    targetsToReset.Add(tVal.ToLowerInvariant());
                 }
 
-                if (doc.RootElement.TryGetProperty("keys", out var kEl) && kEl.ValueKind == JsonValueKind.Array)
+                if (doc.RootElement.TryGetProperty("keys", out var kEl))
                 {
-                    keysToReset = kEl.EnumerateArray()
-                        .Where(x => x.ValueKind == JsonValueKind.String)
-                        .Select(x => x.GetString())
-                        .Where(x => !string.IsNullOrWhiteSpace(x))
-                        .Select(x => x!)
-                        .ToList();
+                    if (kEl.ValueKind != JsonValueKind.Array)
+                    {
+                        await TryWriteJsonAsync(ctx.Response, 400, new { reset = false, errors = new[] { "Field 'keys' must be a non-empty array of property names." } }, cancellationToken);
+                        return;
+                    }
+
+                    var parsedKeys = new List<string>();
+                    foreach (var item in kEl.EnumerateArray())
+                    {
+                        if (item.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(item.GetString()))
+                        {
+                            await TryWriteJsonAsync(ctx.Response, 400, new { reset = false, errors = new[] { "Every entry in 'keys' must be a non-empty property name string." } }, cancellationToken);
+                            return;
+                        }
+
+                        parsedKeys.Add(item.GetString()!.Trim());
+                    }
+
+                    if (parsedKeys.Count == 0)
+                    {
+                        await TryWriteJsonAsync(ctx.Response, 400, new { reset = false, errors = new[] { "Field 'keys' must contain at least one property name, or omit 'keys' to reset the whole profile." } }, cancellationToken);
+                        return;
+                    }
+
+                    keysToReset = parsedKeys;
                 }
             }
             catch (JsonException ex)
@@ -395,6 +588,25 @@ public sealed class LocalPreviewHost(
 
         if (targetsToReset.Count == 0)
             targetsToReset.AddRange(LayoutBoundsCatalog.SupportedTargets);
+
+        var preErrors = new List<string>();
+        if (keysToReset is not null)
+        {
+            foreach (var target in targetsToReset)
+            {
+                foreach (var key in keysToReset)
+                {
+                    if (!LayoutBoundsCatalog.IsValidPropertyForTarget(target, key))
+                        preErrors.Add($"Layout property '{key}' is not valid for target '{target}'.");
+                }
+            }
+        }
+
+        if (preErrors.Count > 0)
+        {
+            await TryWriteJsonAsync(ctx.Response, 400, new { reset = false, errors = preErrors }, cancellationToken);
+            return;
+        }
 
         using var scope = scopeFactory.CreateScope();
         var resetHandler = scope.ServiceProvider.GetRequiredService<ResetLayoutProfileHandler>();
@@ -410,15 +622,11 @@ public sealed class LocalPreviewHost(
         await TryWriteJsonAsync(ctx.Response, errors.Count == 0 ? 200 : 400, new { reset = errors.Count == 0, errors }, cancellationToken);
     }
 
-    private static async Task RunHttpServerAsync(
-        string prefix,
+    private static async Task RunHttpServerLoopAsync(
+        HttpListener listener,
         CancellationToken cancellationToken,
         Func<HttpListenerContext, Task<bool>> handleRequestAsync)
     {
-        using var listener = new HttpListener();
-        listener.Prefixes.Add(prefix);
-        listener.Start();
-
         while (!cancellationToken.IsCancellationRequested)
         {
             HttpListenerContext ctx;
@@ -451,23 +659,93 @@ public sealed class LocalPreviewHost(
         }
     }
 
-    private static async Task ApplyProfileUpdatesAsync(
-        SetLayoutPropertyHandler setter,
-        string targetType,
-        JsonElement valuesObj,
-        List<string> errors,
+    private static (HttpListener Listener, string Prefix) StartHttpListenerWithRetry()
+    {
+        HttpListenerException? lastEx = null;
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            var prefix = $"http://127.0.0.1:{FindFreePort()}/";
+            var listener = new HttpListener();
+            listener.Prefixes.Add(prefix);
+            try
+            {
+                listener.Start();
+                return (listener, prefix);
+            }
+            catch (HttpListenerException ex)
+            {
+                lastEx = ex;
+                listener.Close();
+            }
+        }
+
+        throw lastEx ?? new HttpListenerException(0, "Failed to bind local preview HTTP listener.");
+    }
+
+    private static bool IsValidCsrfToken(HttpListenerRequest request, string expectedToken)
+    {
+        var supplied = request.Headers["X-Mby-Editor-Token"];
+        if (string.IsNullOrWhiteSpace(supplied))
+            return false;
+
+        var expectedBytes = Encoding.UTF8.GetBytes(expectedToken);
+        var suppliedBytes = Encoding.UTF8.GetBytes(supplied.Trim());
+        return expectedBytes.Length == suppliedBytes.Length &&
+               CryptographicOperations.FixedTimeEquals(expectedBytes, suppliedBytes);
+    }
+
+    private static async Task<(bool TooLarge, string Body)> ReadRequestBodyBoundedAsync(
+        HttpListenerRequest request,
+        int maxBytes,
         CancellationToken cancellationToken)
     {
-        foreach (var prop in valuesObj.EnumerateObject())
-        {
-            var valStr = prop.Value.ValueKind == JsonValueKind.String
-                ? (prop.Value.GetString() ?? string.Empty)
-                : prop.Value.ToString();
+        if (request.ContentLength64 > maxBytes)
+            return (true, string.Empty);
 
-            var r = await setter.HandleAsync(new SetLayoutPropertyCommand(targetType, prop.Name, valStr), cancellationToken);
-            if (!r.IsSuccess)
-                errors.Add($"{targetType}.{prop.Name}: {r.Error!.Description}");
+        using var ms = new MemoryStream();
+        var buffer = new byte[4096];
+        int totalRead = 0;
+        while (true)
+        {
+            int read = await request.InputStream.ReadAsync(buffer, cancellationToken);
+            if (read <= 0)
+                break;
+
+            totalRead += read;
+            if (totalRead > maxBytes)
+                return (true, string.Empty);
+
+            ms.Write(buffer, 0, read);
         }
+
+        return (false, Encoding.UTF8.GetString(ms.ToArray()));
+    }
+
+    private static Task WriteMethodNotAllowedAsync(
+        HttpListenerResponse response,
+        string allowHeader,
+        bool isApi,
+        CancellationToken cancellationToken)
+    {
+        response.AddHeader("Allow", allowHeader);
+        return isApi
+            ? TryWriteJsonAsync(response, 405, new { error = $"Method not allowed. Allowed: {allowHeader}." }, cancellationToken)
+            : TryWriteBytesAsync(response, 405, "text/plain; charset=utf-8", Encoding.UTF8.GetBytes($"Method Not Allowed. Allowed: {allowHeader}"), cancellationToken);
+    }
+
+    private static Task TryWriteNoContentAsync(HttpListenerResponse response)
+    {
+        try
+        {
+            response.StatusCode = 204;
+            response.ContentLength64 = 0;
+            response.Close();
+        }
+        catch (Exception ex) when (ex is HttpListenerException or IOException or ObjectDisposedException)
+        {
+            // Client disconnected or listener closed.
+        }
+        return Task.CompletedTask;
     }
 
     private static Task TryWriteJsonAsync(HttpListenerResponse response, int statusCode, object? payload, CancellationToken cancellationToken)
@@ -512,7 +790,17 @@ public sealed class LocalPreviewHost(
         {
             case "article-text":
             case "article":
+            case "diagram-explore":
+            case "reveal":
                 initialComponent = "article-text";
+                defaultProfile = "article";
+                return true;
+            case "callout":
+                initialComponent = "callout";
+                defaultProfile = "article";
+                return true;
+            case "table":
+                initialComponent = "table";
                 defaultProfile = "article";
                 return true;
             case "image":
@@ -521,11 +809,39 @@ public sealed class LocalPreviewHost(
                 return true;
             case "mcq-question":
             case "mcq":
+            case "classify":
+            case "match":
+            case "numeric":
+            case "case":
                 initialComponent = "mcq-question";
                 defaultProfile = "mcq";
                 return true;
             case "mcq-options":
                 initialComponent = "mcq-options";
+                defaultProfile = "mcq";
+                return true;
+            case "fill-blank":
+                initialComponent = "fill-blank";
+                defaultProfile = "mcq";
+                return true;
+            case "assertion-reason":
+                initialComponent = "assertion-reason";
+                defaultProfile = "mcq";
+                return true;
+            case "spot-error":
+                initialComponent = "spot-error";
+                defaultProfile = "mcq";
+                return true;
+            case "diff":
+                initialComponent = "diff";
+                defaultProfile = "mcq";
+                return true;
+            case "mechanism":
+                initialComponent = "mechanism";
+                defaultProfile = "mcq";
+                return true;
+            case "relabel":
+                initialComponent = "relabel";
                 defaultProfile = "mcq";
                 return true;
             case "flashcard":

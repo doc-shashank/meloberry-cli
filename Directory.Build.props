@@ -8,6 +8,7 @@
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <Product>Meloberry CLI</Product>
     <Company>Meloberry</Company>
+    <RepositoryUrl>https://github.com/doc-shashank/meloberry-cli/</RepositoryUrl>
     <Description>Portable .NET 10 Clean CLI for authoring, linting, packaging, and rendering interactive Meloberry Study Sessions and Quizzes.</Description>
 
     <NuGetAudit>false</NuGetAudit>
@@ -16,4 +17,8 @@
     <UseSharedCompilation>false</UseSharedCompilation>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
   </PropertyGroup>
+  <ItemGroup>
+    <AssemblyMetadata Include="AppName" Value="$(Company)" />
+    <AssemblyMetadata Include="RepositoryUrl" Value="$(RepositoryUrl)" />
+  </ItemGroup>
 </Project>

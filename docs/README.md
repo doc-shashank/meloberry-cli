@@ -17,15 +17,15 @@ Stateless, AI-agent-first compiler for deterministic study helper WebApps. Agent
 | `Component_<YYYYMMDD_HHMMSS_fff>` | Session Component (`article` \| `quiz`) | Parent session SQLite DB |
 | `ArtComp_<YYYYMMDD_HHMMSS_fff>` | Article Block (`text` \| `image` \| `callout` \| `table`) | Parent session SQLite DB |
 | `Set_<YYYYMMDD_HHMMSS_fff>` | Standalone Quiz (`mcq` \| `flashcard` \| `mixed`) | `<dir>/<id>/<id>.db` + `assets/` |
-| `Q_<YYYYMMDD_HHMMSS_fff>` | Question (`mcq` \| `flashcard` \| `fill-blank` \| `assertion-reason` \| `spot-error`) | Parent quiz/component |
+| `Q_<YYYYMMDD_HHMMSS_fff>` | Question (`mcq` \| `flashcard` \| `fill-blank` \| `assertion-reason` \| `spot-error` \| `diff` \| `mechanism` \| `relabel`) | Parent quiz/component |
 
 Unless `-o` is specified, new workspace DB folders default under `.meloberry/workspaces/<id>/`, while `ls` discovers both CWD and `.meloberry/workspaces/`. Component `ref` slugs (`^[a-z0-9][a-z0-9_-]{0,31}$`) are deterministically auto-generated from `title`/filename if omitted.
 
-All read, patch, lint, and delete commands accept either a direct ID or a workspace path/slug:
-- `<wsId>#c<n>` — 1-based component in session
-- `<wsId>#c<n>.b<m>` — 1-based block in article component
-- `<wsId>#c<n>.q<m>` — 1-based question in quiz component
-- `<setId>#q<m>` — 1-based question in standalone quiz
+All read (`get`), `patch`, `check`, and `rm` commands accept either a direct ID or a workspace path/slug (`apply [addr]` targets a `session`, `component`, or standalone `quiz` only — use `patch` for blocks or questions):
+- `<sessionId>#c<n>` — 1-based component in session
+- `<sessionId>#c<n>.b<m>` — 1-based block in article component
+- `<sessionId>#c<n>.q<m>` — 1-based question in quiz component
+- `<setId>#q<m>` — 1-based question in standalone quiz (`Set_*` only; use `<sessionId>#c<n>.q<m>` inside sessions)
 - `<wsId>#<ref>` — entity with matching `ref` slug (`^[a-z0-9][a-z0-9_-]{0,31}$`)
 
 ## Global Flags & Environment

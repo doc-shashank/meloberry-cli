@@ -161,7 +161,7 @@ public sealed class PkgCliCommand : CliCommand
             Description: "Exports (content-only default, non-interactive) or imports .mbypkg v2.0 archives (backward-compatible with v1.0).",
             HandlerType: typeof(Handler),
             AllowedFlagOptions: AllowedFlags,
-            Prerequisites: "Runs mandatory lint before export; default export writes <wsId>.mbypkg into the workspace's project root (for .meloberry/workspaces) or parent directory unless [outPath] is given. Import defaults to CWD unless [destDir] is given.",
+            Prerequisites: "Runs mandatory lint before export; default export writes <wsId>.mbypkg into the workspace's project root (for .meloberry/workspaces) or parent directory unless [outPath] is given. [outPath] resolves as a directory if it exists or ends with '/' or '\\', otherwise as a .mbypkg file path. Import defaults to CWD unless [destDir] is given.",
             OptionsHelp:
             [
                 "--include-layout   Bundle non-default global layout profiles & entity layoutOverrides inside the .mbypkg."
@@ -225,11 +225,11 @@ public sealed class LayoutCliCommand : CliCommand
     public LayoutCliCommand()
         : base(new CommandDescriptor(
             Verb: "layout",
-            Usage: "layout <get [mcq|flashcard|article] | set <mcq|flashcard|article> <prop> <val> | edit [target] [--no-wait]>",
-            Description: "Reads layout bounds, updates global profile properties, or launches the local GUI layout editor.",
+            Usage: "layout <get [mcq|flashcard|article] | set <mcq|flashcard|article> <prop> <val> | reset [mcq|flashcard|article] [prop...] | edit [target] [--no-wait]>",
+            Description: "Reads layout bounds, updates or resets global profile properties, or launches the local GUI layout editor.",
             HandlerType: typeof(Handler),
             AllowedFlagOptions: AllowedFlags,
-            Prerequisites: "Global layout profiles persist in <app-data>/app_settings.db. 'themeMode' and 'slideTransitionMs' synchronize across all three profiles ('article', 'mcq', 'flashcard').",
+            Prerequisites: "Global layout profiles persist in <app-data>/app_settings.db. 'themeMode' and 'slideTransitionMs' are deck-global only and synchronize across all three profiles ('article', 'mcq', 'flashcard').",
             OptionsHelp:
             [
                 "--no-wait   Exit immediately after printing the local GUI editor URL (used with 'layout edit')."
@@ -238,7 +238,8 @@ public sealed class LayoutCliCommand : CliCommand
             [
                 "mby layout get mcq --json",
                 "mby layout set article blockSpacingPx 24 --json",
-                "mby layout edit article-text --no-wait --json"
+                "mby layout reset mcq optionColumns --json",
+                "mby layout edit fill-blank --no-wait --json"
             ]))
     {
     }
@@ -246,21 +247,29 @@ public sealed class LayoutCliCommand : CliCommand
     public sealed class Handler(
         GetLayoutBoundsHandler boundsHandler,
         SetLayoutPropertyHandler setHandler,
+        ResetLayoutProfileHandler resetHandler,
         ILocalPreviewHost previewHost) : ICommandHandler
     {
-        public Task<int> InvokeAsync(CliInvocationContext context)
+        public async Task<int> InvokeAsync(CliInvocationContext context)
         {
             if (context.PositionalArgs.Count < 1)
-                return Task.FromResult(CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: layout <get|set|edit> ...", context.GlobalOptions.Json));
+                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: layout <get|set|reset|edit> ...", context.GlobalOptions.Json);
 
             var sub = context.PositionalArgs[0].Trim().ToLowerInvariant();
+            if (!string.Equals(sub, "edit", StringComparison.Ordinal) && context.HasFlag("no-wait"))
+                return CliResultExtensions.WriteValidationError(
+                    context.Console,
+                    "Cli.UnsupportedOption",
+                    $"Option '--no-wait' is not supported by 'layout {sub}'. Use '--no-wait' only with 'layout edit'.",
+                    context.GlobalOptions.Json);
+
             if (sub == "get")
             {
                 if (context.PositionalArgs.Count > 2)
-                    return Task.FromResult(CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: layout get [mcq|flashcard|article]", context.GlobalOptions.Json));
+                    return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: layout get [mcq|flashcard|article]", context.GlobalOptions.Json);
 
                 var targetType = context.PositionalArgs.Count == 2 ? context.PositionalArgs[1] : null;
-                return CliCommandHelpers.FinishAsync(
+                return await CliCommandHelpers.FinishAsync(
                     context,
                     boundsHandler.HandleAsync(new GetLayoutBoundsQuery(targetType), context.CancellationToken),
                     res => string.Join(
@@ -272,21 +281,60 @@ public sealed class LayoutCliCommand : CliCommand
             if (sub == "set")
             {
                 if (context.PositionalArgs.Count != 4)
-                    return Task.FromResult(CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: layout set <mcq|flashcard|article> <property> <value>", context.GlobalOptions.Json));
+                    return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: layout set <mcq|flashcard|article> <property> <value>", context.GlobalOptions.Json);
 
-                return CliCommandHelpers.FinishAsync(
+                return await CliCommandHelpers.FinishAsync(
                     context,
                     setHandler.HandleAsync(new SetLayoutPropertyCommand(context.PositionalArgs[1], context.PositionalArgs[2], context.PositionalArgs[3]), context.CancellationToken),
                     v => $"Updated {v.TargetIdOrType}.{v.Property} = {v.NormalizedValue}");
             }
 
-            if (sub == "edit")
+            if (sub == "reset")
             {
-                var targetType = context.PositionalArgs.Count >= 2 ? context.PositionalArgs[1] : "article-text";
-                return previewHost.ServeLayoutEditorAsync(targetType, context.Console, context.HasFlag("no-wait"), context.GlobalOptions.Json, silent: false, context.CancellationToken);
+                if (context.PositionalArgs.Count == 1)
+                {
+                    var targets = Meloberry.Domain.Layouts.LayoutBoundsCatalog.SupportedTargets;
+                    var resetTargets = new List<string>(targets.Count);
+                    foreach (var target in targets)
+                    {
+                        var res = await resetHandler.HandleAsync(new ResetLayoutProfileCommand(target), context.CancellationToken);
+                        if (!res.IsSuccess) return res.ToExitCode(context.Console, context.GlobalOptions.Json);
+                        resetTargets.Add(res.Value.TargetType);
+                    }
+                    CliCommandHelpers.WriteOutput(
+                        context,
+                        new { reset = true, targets = resetTargets, keys = (IReadOnlyList<string>?)null },
+                        $"Reset all layout profiles ({string.Join(", ", resetTargets)}) to defaults.");
+                    return ExitCodes.Success;
+                }
+
+                var resetTarget = context.PositionalArgs[1];
+                IReadOnlyList<string>? resetKeys = context.PositionalArgs.Count > 2
+                    ? context.PositionalArgs.Skip(2).ToList()
+                    : null;
+                var singleRes = await resetHandler.HandleAsync(new ResetLayoutProfileCommand(resetTarget, resetKeys), context.CancellationToken);
+                if (!singleRes.IsSuccess) return singleRes.ToExitCode(context.Console, context.GlobalOptions.Json);
+
+                var summary = resetKeys is { Count: > 0 }
+                    ? $"Reset {singleRes.Value.TargetType} properties ({string.Join(", ", resetKeys)}) to defaults."
+                    : $"Reset {singleRes.Value.TargetType} layout profile to defaults.";
+                CliCommandHelpers.WriteOutput(
+                    context,
+                    new { reset = true, targets = new[] { singleRes.Value.TargetType }, keys = resetKeys },
+                    summary);
+                return ExitCodes.Success;
             }
 
-            return Task.FromResult(CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Unknown layout subcommand '{sub}'. Use 'get', 'set', or 'edit'.", context.GlobalOptions.Json));
+            if (sub == "edit")
+            {
+                if (context.PositionalArgs.Count > 2)
+                    return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: layout edit [target] [--no-wait]", context.GlobalOptions.Json);
+
+                var targetType = context.PositionalArgs.Count == 2 ? context.PositionalArgs[1] : "article-text";
+                return await previewHost.ServeLayoutEditorAsync(targetType, context.Console, context.HasFlag("no-wait"), context.GlobalOptions.Json, silent: context.GlobalOptions.Quiet, context.CancellationToken);
+            }
+
+            return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Unknown layout subcommand '{sub}'. Use 'get', 'set', 'reset', or 'edit'.", context.GlobalOptions.Json);
         }
     }
 }

@@ -16,23 +16,50 @@ namespace Meloberry.Infrastructure.Web;
 
 public sealed class SlidingWebAppGenerator(
     ICliToolMetadataProvider metadataProvider,
-    ChainTransactionManager? transactionManager = null) : IWebAppGenerator
+    ChainTransactionManager? transactionManager = null,
+    IWorkspaceRepository? workspaceRepository = null) : IWebAppGenerator
 {
     private static readonly MarkdownPipeline MarkdownPipeline = new MarkdownPipelineBuilder().UseAdvancedExtensions().DisableHtml().Build();
     private static readonly Regex MarkdownUrlAttributeRegex = new(@"(?<attr>\b(?:href|src)\s*=\s*)(?<quote>[""'])(?<url>[^""']*)\k<quote>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex HtmlTagStripRegex = new(@"<[^>]+>", RegexOptions.Compiled);
+    private static readonly Regex WhitespaceCollapseRegex = new(@"\s+", RegexOptions.Compiled);
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 
     private static string RenderSafeMarkdownHtml(string markdown) =>
         MarkdownUrlAttributeRegex.Replace(Markdown.ToHtml(markdown, MarkdownPipeline), static match =>
         {
-            var normalized = new string(WebUtility.HtmlDecode(match.Groups["url"].Value).Where(c => !char.IsWhiteSpace(c) && !char.IsControl(c)).ToArray());
+            var rawAttr = match.Groups["attr"].Value;
+            var q = match.Groups["quote"].Value;
+            var decoded = WebUtility.HtmlDecode(match.Groups["url"].Value);
+            var normalized = new string(decoded.Where(c => !char.IsWhiteSpace(c) && !char.IsControl(c)).ToArray());
             if (normalized.StartsWith("javascript:", StringComparison.OrdinalIgnoreCase) ||
                 normalized.StartsWith("vbscript:", StringComparison.OrdinalIgnoreCase) ||
                 normalized.StartsWith("data:text/html", StringComparison.OrdinalIgnoreCase))
             {
-                var q = match.Groups["quote"].Value;
-                return $"{match.Groups["attr"].Value}{q}#{q}";
+                return $"{rawAttr}{q}#{q}";
             }
+
+            if (rawAttr.TrimStart().StartsWith("href", StringComparison.OrdinalIgnoreCase) &&
+                ArticleLinkRules.TryParseMbyUri(decoded, out var mbyTarget))
+            {
+                if (mbyTarget.Kind == "card")
+                {
+                    return $"href={q}#{q} class={q}mby-native-link{q} data-mby-kind={q}card{q} data-mby-target={q}{WebUtility.HtmlEncode(mbyTarget.TargetId)}{q}";
+                }
+                if (mbyTarget.Kind == "article")
+                {
+                    var artHash = $"#article={Uri.EscapeDataString(mbyTarget.TargetId)}";
+                    return $"href={q}{WebUtility.HtmlEncode(artHash)}{q} class={q}mby-native-link{q} data-mby-kind={q}article{q} data-mby-target={q}{WebUtility.HtmlEncode(mbyTarget.TargetId)}{q}";
+                }
+                if (mbyTarget.Kind == "session")
+                {
+                    var resolvedHref = ArticleLinkRules.ResolveSessionHref(mbyTarget);
+                    var previewDir = ArticleLinkRules.ResolveSessionPreviewDir(resolvedHref);
+                    var subAttr = string.IsNullOrWhiteSpace(mbyTarget.SubTargetId) ? string.Empty : $" data-mby-sub={q}{WebUtility.HtmlEncode(mbyTarget.SubTargetId)}{q}";
+                    return $"href={q}{WebUtility.HtmlEncode(resolvedHref)}{q} class={q}mby-native-link{q} data-mby-kind={q}session{q} data-mby-target={q}{WebUtility.HtmlEncode(mbyTarget.TargetId)}{q}{subAttr} data-mby-preview-dir={q}{WebUtility.HtmlEncode(previewDir)}{q}";
+                }
+            }
+
             return match.Value;
         });
 
@@ -43,38 +70,73 @@ public sealed class SlidingWebAppGenerator(
         return string.Join('/', path.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries).Select(Uri.EscapeDataString));
     }
 
-    private static string ResolveDeckGlobalValue(IReadOnlyDictionary<string, LayoutProfile> layouts, string propertyName, string fallbackValue)
-    {
-        string? firstPresent = null;
-        foreach (var target in new[] { "mcq", "article", "flashcard" })
-        {
-            if (!layouts.TryGetValue(target, out var profile)) continue;
-            var value = profile.GetValue(propertyName);
-            firstPresent ??= value;
-            if (!string.Equals(value, fallbackValue, StringComparison.OrdinalIgnoreCase)) return value;
-        }
-        return firstPresent ?? fallbackValue;
-    }
+    private static string ResolveDeckGlobalValue(IReadOnlyDictionary<string, LayoutProfile> layouts, string propertyName, string fallbackValue) =>
+        LayoutBoundsCatalog.ResolveDeckGlobalValue(layouts, propertyName, fallbackValue);
 
-    public Task<Result<string>> GenerateForSessionAsync(
+    public async Task<Result<string>> GenerateForSessionAsync(
         StudySession session, string storageDirectory, IReadOnlyDictionary<string, LayoutProfile> layouts,
         string? outputDirectory, CancellationToken cancellationToken = default)
     {
         var slides = new List<SlideRenderModel>();
+        var linkCards = new Dictionary<string, LinkCardRenderModel>(StringComparer.OrdinalIgnoreCase);
+        var referencedSessionIds = new HashSet<string>(StringComparer.Ordinal);
+
         foreach (var comp in session.Components)
         {
             if (comp.Kind == ComponentKind.Article)
+            {
                 slides.Add(BuildArticleSlide(comp, layouts));
+                foreach (var lc in comp.LinkCards)
+                {
+                    linkCards[lc.Id] = new LinkCardRenderModel(
+                        lc.Id,
+                        lc.Title,
+                        !string.IsNullOrWhiteSpace(lc.Text) ? RenderSafeMarkdownHtml(lc.Text) : null,
+                        EncodeAssetPath(lc.ImagePath));
+                }
+                foreach (var mdStr in Phase3PayloadRules.EnumerateArticleBlockMarkdownStrings(comp))
+                {
+                    foreach (var parsed in ArticleLinkRules.ExtractMbyLinksFromMarkdown(mdStr))
+                    {
+                        if (parsed.Kind == "session")
+                            referencedSessionIds.Add(parsed.TargetId);
+                    }
+                }
+            }
             else if (comp.Quiz is not null && comp.Quiz.Questions.Count > 0)
             {
                 var baseProfile = comp.Quiz.Type == QuizType.Flashcard ? "flashcard" : "mcq";
                 var mergedQuizLayout = MergeProfile(layouts, baseProfile, comp.LayoutOverrides, null);
                 var questionSlides = comp.Quiz.Questions.Select(q => BuildQuestionSlide(q, layouts, comp.LayoutOverrides)).ToList();
-                slides.Add(new SlideRenderModel(comp.Id, "quiz", mergedQuizLayout, null, null, null, questionSlides, comp.Title));
+                slides.Add(new SlideRenderModel(comp.Id, "quiz", mergedQuizLayout, null, null, null, questionSlides, comp.Title, RefKey: comp.RefKey, ComponentIndex: comp.Index));
             }
         }
+
+        var externalPreviews = new Dictionary<string, SessionPreviewSidecarModel>(StringComparer.Ordinal);
+        if (workspaceRepository is not null && referencedSessionIds.Count > 0)
+        {
+            foreach (var extId in referencedSessionIds)
+            {
+                var extLookup = await workspaceRepository.FindSessionAsync(extId, cancellationToken);
+                if (extLookup?.Session is { } extSession)
+                {
+                    var extSlides = extSession.Components
+                        .Where(c => c.Kind == ComponentKind.Article)
+                        .Select(c => BuildArticleSlide(c, layouts))
+                        .ToList();
+                    var extTitle = string.IsNullOrWhiteSpace(extSession.Name) ? extSession.Id : extSession.Name;
+                    externalPreviews[extId] = BuildSessionPreviewSidecar(extSession.Id, extTitle, extSession.Description, extSlides);
+                }
+            }
+        }
+
         var title = string.IsNullOrWhiteSpace(session.Name) ? "Meloberry Session" : session.Name;
-        return WriteWebAppBundleAsync(session.Id, title, session.Description, storageDirectory, slides, layouts, MbypkgExporter.CollectSessionAssets(session), outputDirectory, cancellationToken);
+        return await WriteWebAppBundleAsync(
+            session.Id, title, session.Description, storageDirectory, slides, layouts,
+            MbypkgExporter.CollectSessionAssets(session), outputDirectory,
+            linkCards.Count > 0 ? linkCards : null,
+            externalPreviews.Count > 0 ? externalPreviews : null,
+            cancellationToken);
     }
 
     public Task<Result<string>> GenerateForQuizAsync(
@@ -84,12 +146,12 @@ public sealed class SlidingWebAppGenerator(
         var title = string.IsNullOrWhiteSpace(quiz.Name) ? "Meloberry Quiz" : quiz.Name;
         var desc = string.IsNullOrWhiteSpace(quiz.Description) ? $"Standalone quiz ({quiz.Questions.Count} questions)" : quiz.Description;
         return WriteWebAppBundleAsync(quiz.Id, title, desc, storageDirectory,
-            quiz.Questions.Select(q => BuildQuestionSlide(q, layouts, null)).ToList(), layouts, MbypkgExporter.CollectQuizAssets(quiz), outputDirectory, cancellationToken);
+            quiz.Questions.Select(q => BuildQuestionSlide(q, layouts, null)).ToList(), layouts, MbypkgExporter.CollectQuizAssets(quiz), outputDirectory, null, null, cancellationToken);
     }
 
     private static SlideRenderModel BuildArticleSlide(SessionComponent comp, IReadOnlyDictionary<string, LayoutProfile> layouts) =>
         new(comp.Id, "article", MergeProfile(layouts, "article", comp.LayoutOverrides, null), null, null,
-            comp.ArticleBlocks.Select(BuildArticleBlockRenderModel).ToList(), null, comp.Title);
+            comp.ArticleBlocks.Select(BuildArticleBlockRenderModel).ToList(), null, comp.Title, RefKey: comp.RefKey, ComponentIndex: comp.Index);
 
     private static ArticleBlockRenderModel BuildArticleBlockRenderModel(ArticleBlock b)
     {
@@ -116,6 +178,55 @@ public sealed class SlidingWebAppGenerator(
                 Title: b.CalloutTitle,
                 Table: tableModel,
                 TitleHtml: !string.IsNullOrWhiteSpace(b.CalloutTitle) ? RenderInlineSafeMarkdownHtml(b.CalloutTitle) : null);
+        }
+
+        if (b.Kind == ArticleBlockKind.DiagramExplore)
+        {
+            DiagramExploreRenderModel? diagModel = null;
+            if (Phase1PayloadCodec.TryDeserialize<DiagramExplorePayload>(b.PayloadJson, out var dp) && dp is not null)
+            {
+                var imgPath = EncodeAssetPath(!string.IsNullOrWhiteSpace(dp.ImagePath) ? dp.ImagePath : b.ImagePath) ?? string.Empty;
+                var hotspots = (dp.Hotspots ?? [])
+                    .Where(h => h is not null)
+                    .Select(h => new DiagramHotspotRenderModel(h.Index, h.Label, RenderSafeMarkdownHtml(h.Note), h.X, h.Y, h.W, h.H))
+                    .ToList();
+                diagModel = new DiagramExploreRenderModel(
+                    imgPath,
+                    dp.Title ?? b.CalloutTitle,
+                    !string.IsNullOrWhiteSpace(dp.Title ?? b.CalloutTitle) ? RenderInlineSafeMarkdownHtml((dp.Title ?? b.CalloutTitle)!) : null,
+                    !string.IsNullOrWhiteSpace(dp.Caption ?? b.Caption) ? RenderSafeMarkdownHtml((dp.Caption ?? b.Caption)!) : null,
+                    b.Alt,
+                    hotspots);
+            }
+            return new ArticleBlockRenderModel(
+                b.Id, "diagram-explore", null, EncodeAssetPath(b.ImagePath),
+                CaptionHtml: !string.IsNullOrWhiteSpace(b.Caption) ? RenderSafeMarkdownHtml(b.Caption) : null,
+                Alt: b.Alt,
+                Title: b.CalloutTitle,
+                TitleHtml: !string.IsNullOrWhiteSpace(b.CalloutTitle) ? RenderInlineSafeMarkdownHtml(b.CalloutTitle) : null,
+                DiagramExplore: diagModel);
+        }
+
+        if (b.Kind == ArticleBlockKind.Reveal)
+        {
+            RevealBlockRenderModel? revModel = null;
+            if (Phase1PayloadCodec.TryDeserialize<RevealBlockPayload>(b.PayloadJson, out var rp) && rp is not null)
+            {
+                var steps = (rp.Steps ?? [])
+                    .Where(s => s is not null)
+                    .Select(s => new RevealStepRenderModel(s.Index, RenderInlineSafeMarkdownHtml(s.Heading), RenderSafeMarkdownHtml(s.Body)))
+                    .ToList();
+                revModel = new RevealBlockRenderModel(
+                    rp.Title ?? b.CalloutTitle,
+                    !string.IsNullOrWhiteSpace(rp.Title ?? b.CalloutTitle) ? RenderInlineSafeMarkdownHtml((rp.Title ?? b.CalloutTitle)!) : null,
+                    rp.ShowFirst,
+                    steps);
+            }
+            return new ArticleBlockRenderModel(
+                b.Id, "reveal", null, null,
+                Title: b.CalloutTitle,
+                TitleHtml: !string.IsNullOrWhiteSpace(b.CalloutTitle) ? RenderInlineSafeMarkdownHtml(b.CalloutTitle) : null,
+                Reveal: revModel);
         }
 
         return new ArticleBlockRenderModel(
@@ -181,7 +292,7 @@ public sealed class SlidingWebAppGenerator(
             }).ToList();
             var expHtml = !string.IsNullOrWhiteSpace(fb.Explanation) ? RenderSafeMarkdownHtml(fb.Explanation) : null;
             return new SlideRenderModel(question.Id, "fill-blank", mergedLayout, null, null, null, null,
-                FillBlank: new FillBlankRenderModel(promptHtml, blanks, fb.Fuzzy, fb.CaseSensitive, expHtml));
+                FillBlank: new FillBlankRenderModel(promptHtml, blanks, fb.Fuzzy, fb.CaseSensitive, expHtml, fb.Placeholder));
         }
 
         if (question.Type == QuestionType.AssertionReason && Phase1PayloadCodec.TryDeserialize<AssertionReasonPayload>(question.PayloadJson, out var ar) && ar is not null)
@@ -214,7 +325,7 @@ public sealed class SlidingWebAppGenerator(
             }).ToList();
             var expHtml = !string.IsNullOrWhiteSpace(se.Explanation) ? RenderSafeMarkdownHtml(se.Explanation) : null;
             return new SlideRenderModel(question.Id, "spot-error", mergedLayout, null, null, null, null,
-                SpotError: new SpotErrorRenderModel(segs, se.RequireFix, se.AllowNoError, se.NoError, expHtml));
+                SpotError: new SpotErrorRenderModel(segs, se.RequireFix, se.AllowNoError, se.NoError, expHtml, EncodeAssetPath(se.ImagePath)));
         }
 
         if (question.Type == QuestionType.Differentiation && Phase1PayloadCodec.TryDeserialize<DifferentiationPayload>(question.PayloadJson, out var dp) && dp is not null)
@@ -336,6 +447,110 @@ public sealed class SlidingWebAppGenerator(
                     expHtml));
         }
 
+        if (question.Type == QuestionType.Classify && Phase1PayloadCodec.TryDeserialize<ClassifyPayload>(question.PayloadJson, out var cl) && cl is not null)
+        {
+            var buckets = (cl.Buckets ?? [])
+                .Where(b => b is not null)
+                .Select(b => new ClassifyBucketRenderModel(b.BucketId, b.Name, RenderInlineSafeMarkdownHtml(b.Name)))
+                .ToList();
+            var items = (cl.Items ?? [])
+                .Where(it => it is not null)
+                .Select(it => new ClassifyItemRenderModel(it.ItemId, it.BucketId, RenderInlineSafeMarkdownHtml(it.Text)))
+                .ToList();
+            var expHtml = !string.IsNullOrWhiteSpace(cl.Explanation) ? RenderSafeMarkdownHtml(cl.Explanation) : null;
+            return new SlideRenderModel(question.Id, "classify", mergedLayout, null, null, null, null,
+                Classify: new ClassifyRenderModel(
+                    cl.Title,
+                    !string.IsNullOrWhiteSpace(cl.Title) ? RenderInlineSafeMarkdownHtml(cl.Title) : null,
+                    buckets,
+                    items,
+                    expHtml),
+                RefKey: question.RefKey);
+        }
+
+        if (question.Type == QuestionType.Match && Phase1PayloadCodec.TryDeserialize<MatchPayload>(question.PayloadJson, out var mt) && mt is not null)
+        {
+            var pairs = (mt.Pairs ?? [])
+                .Where(p => p is not null)
+                .Select(p => new MatchPairRenderModel(p.PairId, RenderInlineSafeMarkdownHtml(p.Left), RenderInlineSafeMarkdownHtml(p.Right)))
+                .ToList();
+            var pool = pairs.Select((p, idx) => new MatchBankOptionRenderModel(idx, p.RightHtml, p.PairId)).ToList();
+            int nextOptId = pool.Count;
+            foreach (var dec in (mt.Distractors ?? []).Where(d => !string.IsNullOrWhiteSpace(d)))
+                pool.Add(new MatchBankOptionRenderModel(nextOptId++, RenderInlineSafeMarkdownHtml(dec), null));
+            var expHtml = !string.IsNullOrWhiteSpace(mt.Explanation) ? RenderSafeMarkdownHtml(mt.Explanation) : null;
+            return new SlideRenderModel(question.Id, "match", mergedLayout, null, null, null, null,
+                Match: new MatchRenderModel(
+                    mt.Title,
+                    !string.IsNullOrWhiteSpace(mt.Title) ? RenderInlineSafeMarkdownHtml(mt.Title) : null,
+                    pairs,
+                    pool,
+                    expHtml),
+                RefKey: question.RefKey);
+        }
+
+        if (question.Type == QuestionType.Numeric && Phase1PayloadCodec.TryDeserialize<NumericPayload>(question.PayloadJson, out var nm) && nm is not null)
+        {
+            var expHtml = !string.IsNullOrWhiteSpace(nm.Explanation) ? RenderSafeMarkdownHtml(nm.Explanation) : null;
+            return new SlideRenderModel(question.Id, "numeric", mergedLayout, null, null, null, null,
+                Numeric: new NumericRenderModel(
+                    RenderSafeMarkdownHtml(nm.Prompt),
+                    nm.Answer,
+                    nm.Tolerance,
+                    Phase3PayloadRules.NormalizeToleranceMode(nm.ToleranceMode),
+                    nm.Unit,
+                    nm.Placeholder,
+                    EncodeAssetPath(nm.ImagePath),
+                    expHtml),
+                RefKey: question.RefKey);
+        }
+
+        if (question.Type == QuestionType.CaseGroup && Phase1PayloadCodec.TryDeserialize<CaseGroupPayload>(question.PayloadJson, out var cs) && cs is not null)
+        {
+            var subSlides = new List<SlideRenderModel>();
+            foreach (var sub in cs.Questions ?? [])
+            {
+                if (sub is null || !Quiz.TryParseQuestionType(sub.Type, out var subType) || subType == QuestionType.CaseGroup)
+                    continue;
+                var subId = $"{question.Id}_sub{sub.Index}";
+                Question childDomain = subType switch
+                {
+                    QuestionType.Mcq when sub.Mcq is not null => McqQuestion.Rehydrate(
+                        subId,
+                        question.ContainerId,
+                        sub.Index + 1,
+                        sub.Mcq.Text ?? string.Empty,
+                        Math.Max(2, sub.Mcq.MaxOptions),
+                        sub.Mcq.IsMultiCorrect,
+                        (sub.Mcq.Options ?? []).Select(o => McqOption.Create(o.Index, o.Text, o.ImagePath, o.IsCorrect)),
+                        imagePath: sub.Mcq.ImagePath,
+                        explanation: sub.Mcq.Explanation),
+                    QuestionType.Flashcard when sub.Flashcard is not null => FlashcardQuestion.Rehydrate(
+                        subId,
+                        question.ContainerId,
+                        sub.Index + 1,
+                        FlashcardSide.Rehydrate(sub.Flashcard.Front.Text, sub.Flashcard.Front.ImagePath,
+                            string.Equals(sub.Flashcard.Front.Position, "aboveImage", StringComparison.OrdinalIgnoreCase) ? MediaPosition.TextAboveImage : MediaPosition.TextBelowImage),
+                        FlashcardSide.Rehydrate(sub.Flashcard.Back.Text, sub.Flashcard.Back.ImagePath,
+                            string.Equals(sub.Flashcard.Back.Position, "aboveImage", StringComparison.OrdinalIgnoreCase) ? MediaPosition.TextAboveImage : MediaPosition.TextBelowImage)),
+                    _ => PayloadQuestion.Rehydrate(subId, question.ContainerId, sub.Index + 1, subType, sub.PayloadJson ?? "{}")
+                };
+                subSlides.Add(BuildQuestionSlide(childDomain, layouts, mergedLayout));
+            }
+
+            var expHtml = !string.IsNullOrWhiteSpace(cs.Explanation) ? RenderSafeMarkdownHtml(cs.Explanation) : null;
+            return new SlideRenderModel(question.Id, "case", mergedLayout, null, null, null, null,
+                CaseGroup: new CaseGroupRenderModel(
+                    cs.Title,
+                    !string.IsNullOrWhiteSpace(cs.Title) ? RenderInlineSafeMarkdownHtml(cs.Title) : null,
+                    RenderSafeMarkdownHtml(cs.Stem),
+                    EncodeAssetPath(cs.ImagePath),
+                    !string.IsNullOrWhiteSpace(cs.Caption) ? RenderSafeMarkdownHtml(cs.Caption) : null,
+                    subSlides,
+                    expHtml),
+                RefKey: question.RefKey);
+        }
+
         return new SlideRenderModel(question.Id, Question.ToWireString(question.Type), mergedLayout, null, null, null, null);
     }
 
@@ -403,14 +618,31 @@ public sealed class SlidingWebAppGenerator(
     {
         var baseProfile = layouts.TryGetValue(targetType, out var p) ? p : LayoutProfile.CreateDefault(targetType).Value;
         var result = new Dictionary<string, string>(baseProfile.Values, StringComparer.OrdinalIgnoreCase);
-        if (componentOverrides is not null) foreach (var kv in componentOverrides) result[kv.Key] = kv.Value;
-        if (questionOverrides is not null) foreach (var kv in questionOverrides) result[kv.Key] = kv.Value;
+        if (componentOverrides is not null)
+        {
+            foreach (var kv in componentOverrides)
+            {
+                if (LayoutBoundsCatalog.IsValidPropertyForTarget(targetType, kv.Key) && !LayoutBoundsCatalog.IsGlobalOnlyProperty(kv.Key))
+                    result[LayoutBoundsCatalog.GetCanonicalPropertyName(targetType, kv.Key)] = kv.Value;
+            }
+        }
+        if (questionOverrides is not null)
+        {
+            foreach (var kv in questionOverrides)
+            {
+                if (LayoutBoundsCatalog.IsValidPropertyForTarget(targetType, kv.Key) && !LayoutBoundsCatalog.IsGlobalOnlyProperty(kv.Key))
+                    result[LayoutBoundsCatalog.GetCanonicalPropertyName(targetType, kv.Key)] = kv.Value;
+            }
+        }
         return result;
     }
 
     private async Task<Result<string>> WriteWebAppBundleAsync(
         string id, string title, string? description, string storageDirectory, List<SlideRenderModel> slides,
-        IReadOnlyDictionary<string, LayoutProfile> layouts, IReadOnlyList<string> referencedAssets, string? outputDirectory, CancellationToken cancellationToken)
+        IReadOnlyDictionary<string, LayoutProfile> layouts, IReadOnlyList<string> referencedAssets, string? outputDirectory,
+        Dictionary<string, LinkCardRenderModel>? linkCards,
+        Dictionary<string, SessionPreviewSidecarModel>? externalPreviews,
+        CancellationToken cancellationToken)
     {
         var outDir = !string.IsNullOrWhiteSpace(outputDirectory)
             ? Path.GetFullPath(outputDirectory)
@@ -431,10 +663,11 @@ public sealed class SlidingWebAppGenerator(
         var globalTheme = ResolveDeckGlobalValue(layouts, "themeMode", "berry");
         var slideMs = ResolveDeckGlobalValue(layouts, "slideTransitionMs", "380");
         var toolMeta = metadataProvider.GetMetadata();
-        var generatorInfo = new WebGeneratorInfoModel(toolMeta.ProductName, toolMeta.ExecutableName, toolMeta.Version, toolMeta.Runtime, DateTimeOffset.UtcNow.ToString("O"));
-        var payloadJson = JsonSerializer.Serialize(new WebBundlePayload(id, title, description, globalTheme, slideMs, generatorInfo, slides), JsonOptions);
+        var generatorInfo = new WebGeneratorInfoModel(toolMeta.ProductName, toolMeta.ExecutableName, toolMeta.Version, toolMeta.Runtime, DateTimeOffset.UtcNow.ToString("O"), toolMeta.AppName, toolMeta.RepositoryUrl);
+        var payloadJson = JsonSerializer.Serialize(new WebBundlePayload(id, title, description, globalTheme, slideMs, generatorInfo, slides, linkCards, externalPreviews), JsonOptions);
 
-        bool includeKatex = slides.Any(SlideContainsMath);
+        bool includeKatex = slides.Any(SlideContainsMath) ||
+            (linkCards is not null && linkCards.Values.Any(c => !string.IsNullOrEmpty(c.TextHtml) && c.TextHtml.Contains("class=\"math\"", StringComparison.Ordinal)));
         if (includeKatex)
             await CopyEmbeddedKatexAssetsAsync(outDir, cancellationToken);
 
@@ -442,7 +675,71 @@ public sealed class SlidingWebAppGenerator(
         await File.WriteAllTextAsync(indexPath, BuildHtml(title, description, globalTheme, toolMeta, includeKatex), cancellationToken);
         await File.WriteAllTextAsync(Path.Combine(outDir, "styles.css"), BuildCss(), cancellationToken);
         await File.WriteAllTextAsync(Path.Combine(outDir, "app.js"), BuildJs(payloadJson), cancellationToken);
+
+        var sidecarJson = JsonSerializer.Serialize(BuildSessionPreviewSidecar(id, title, description, slides), JsonOptions);
+        await File.WriteAllTextAsync(Path.Combine(outDir, "preview-index.json"), sidecarJson, cancellationToken);
+        await File.WriteAllTextAsync(Path.Combine(outDir, "preview-index.js"), $"window.__mbyRegisterSessionPreview&&window.__mbyRegisterSessionPreview({sidecarJson});", cancellationToken);
         return indexPath;
+    }
+
+    private static SessionPreviewSidecarModel BuildSessionPreviewSidecar(string sessionId, string title, string? description, List<SlideRenderModel> slides)
+    {
+        var articlePreviews = new List<ArticlePreviewSidecarModel>();
+        int artIndex = 0;
+        foreach (var s in slides)
+        {
+            if (s.Kind != "article") continue;
+            artIndex++;
+            var parts = new List<string>();
+            foreach (var b in s.ArticleBlocks ?? [])
+            {
+                if (!string.IsNullOrWhiteSpace(b.Title)) parts.Add(b.Title);
+                if (!string.IsNullOrWhiteSpace(b.TextHtml)) parts.Add(StripHtmlToPlainText(b.TextHtml));
+                if (b.Table is not null)
+                {
+                    if (!string.IsNullOrWhiteSpace(b.Table.Title)) parts.Add(b.Table.Title);
+                    parts.AddRange(b.Table.HeadersHtml.Select(StripHtmlToPlainText));
+                    foreach (var row in b.Table.RowsHtml)
+                        parts.AddRange(row.Select(StripHtmlToPlainText));
+                }
+                if (b.DiagramExplore is not null)
+                {
+                    if (!string.IsNullOrWhiteSpace(b.DiagramExplore.Title)) parts.Add(b.DiagramExplore.Title);
+                    foreach (var hs in b.DiagramExplore.Hotspots)
+                        parts.Add($"{hs.Label}: {StripHtmlToPlainText(hs.NoteHtml)}");
+                }
+                if (b.Reveal is not null)
+                {
+                    if (!string.IsNullOrWhiteSpace(b.Reveal.Title)) parts.Add(b.Reveal.Title);
+                    foreach (var st in b.Reveal.Steps)
+                        parts.Add($"{StripHtmlToPlainText(st.HeadingHtml)} {StripHtmlToPlainText(st.BodyHtml)}");
+                }
+            }
+            var excerpt = TruncateExcerpt(string.Join(" ", parts.Where(p => !string.IsNullOrWhiteSpace(p))), 650);
+            articlePreviews.Add(new ArticlePreviewSidecarModel(s.Id, s.RefKey, s.ComponentIndex ?? artIndex, s.Title ?? $"Article {artIndex}", excerpt));
+        }
+
+        var sessionExcerpt = TruncateExcerpt(
+            !string.IsNullOrWhiteSpace(description)
+                ? description
+                : string.Join(" • ", articlePreviews.Select(a => string.IsNullOrWhiteSpace(a.Excerpt) ? a.Title : $"{a.Title}: {a.Excerpt}")),
+            650);
+
+        return new SessionPreviewSidecarModel(sessionId, title, sessionExcerpt, articlePreviews);
+    }
+
+    private static string StripHtmlToPlainText(string html)
+    {
+        if (string.IsNullOrWhiteSpace(html)) return string.Empty;
+        var decoded = WebUtility.HtmlDecode(HtmlTagStripRegex.Replace(html, " "));
+        return WhitespaceCollapseRegex.Replace(decoded, " ").Trim();
+    }
+
+    private static string TruncateExcerpt(string text, int maxLen)
+    {
+        var clean = WhitespaceCollapseRegex.Replace(text ?? string.Empty, " ").Trim();
+        if (clean.Length <= maxLen) return clean;
+        return clean[..Math.Max(0, maxLen - 1)].TrimEnd() + "…";
     }
 
     private static bool SlideContainsMath(SlideRenderModel slide)
@@ -458,7 +755,14 @@ public sealed class SlidingWebAppGenerator(
                 HasMath(b.Table.CaptionHtml) ||
                 HasMath(b.Table.FootnoteHtml) ||
                 b.Table.HeadersHtml.Any(HasMath) ||
-                b.Table.RowsHtml.Any(r => r.Any(HasMath)))))) return true;
+                b.Table.RowsHtml.Any(r => r.Any(HasMath)))) ||
+            (b.DiagramExplore is not null && (
+                HasMath(b.DiagramExplore.TitleHtml) ||
+                HasMath(b.DiagramExplore.CaptionHtml) ||
+                b.DiagramExplore.Hotspots.Any(h => HasMath(h.NoteHtml)))) ||
+            (b.Reveal is not null && (
+                HasMath(b.Reveal.TitleHtml) ||
+                b.Reveal.Steps.Any(st => HasMath(st.HeadingHtml) || HasMath(st.BodyHtml)))))) return true;
         if (slide.Mcq is not null && (HasMath(slide.Mcq.PromptHtml) || HasMath(slide.Mcq.ExplanationHtml) || slide.Mcq.Options.Any(o => HasMath(o.TextHtml)))) return true;
         if (slide.Flashcard is not null && (HasMath(slide.Flashcard.Front.TextHtml) || HasMath(slide.Flashcard.Back.TextHtml))) return true;
         if (slide.FillBlank is not null && (HasMath(slide.FillBlank.PromptHtml) || HasMath(slide.FillBlank.ExplanationHtml) || slide.FillBlank.Blanks.Any(b => HasMath(b.PrimaryAnswerHtml)))) return true;
@@ -475,6 +779,23 @@ public sealed class SlidingWebAppGenerator(
             HasMath(slide.Mechanism.ExplanationHtml) ||
             slide.Mechanism.Steps.Any(s => HasMath(s.Html)))) return true;
         if (slide.Relabel is not null && (HasMath(slide.Relabel.PromptHtml) || HasMath(slide.Relabel.ExplanationHtml))) return true;
+        if (slide.Classify is not null && (
+            HasMath(slide.Classify.TitleHtml) ||
+            HasMath(slide.Classify.ExplanationHtml) ||
+            slide.Classify.Buckets.Any(b => HasMath(b.NameHtml)) ||
+            slide.Classify.Items.Any(i => HasMath(i.Html)))) return true;
+        if (slide.Match is not null && (
+            HasMath(slide.Match.TitleHtml) ||
+            HasMath(slide.Match.ExplanationHtml) ||
+            slide.Match.Pairs.Any(p => HasMath(p.LeftHtml) || HasMath(p.RightHtml)) ||
+            slide.Match.RightPool.Any(r => HasMath(r.Html)))) return true;
+        if (slide.Numeric is not null && (HasMath(slide.Numeric.PromptHtml) || HasMath(slide.Numeric.ExplanationHtml))) return true;
+        if (slide.CaseGroup is not null && (
+            HasMath(slide.CaseGroup.TitleHtml) ||
+            HasMath(slide.CaseGroup.StemHtml) ||
+            HasMath(slide.CaseGroup.CaptionHtml) ||
+            HasMath(slide.CaseGroup.ExplanationHtml) ||
+            slide.CaseGroup.Questions.Any(SlideContainsMath))) return true;
         return slide.Questions is not null && slide.Questions.Any(SlideContainsMath);
     }
 
@@ -534,7 +855,9 @@ public sealed class SlidingWebAppGenerator(
     </section>
     <header id="playerTopbar" class="mby-topbar hidden">
       <div class="mby-topbar-left">
-        <button id="backToSlidesBtn" class="mby-icon-btn hidden" type="button" title="Back to slides">←</button>
+        <button id="backToSlidesBtn" class="mby-icon-btn hidden" type="button" title="Back to slides" aria-label="Back to slides">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
+        </button>
         <div class="mby-brand-wrap"><div id="topbarTitle" class="mby-brand">{{WebUtility.HtmlEncode(title)}}</div></div>
       </div>
       <div class="mby-topbar-actions">
@@ -585,13 +908,23 @@ public sealed class SlidingWebAppGenerator(
   <div id="searchModal" class="mby-modal mby-search-modal hidden" role="dialog" aria-modal="true" aria-label="Search study materials">
     <div class="mby-search-card">
       <div class="mby-search-header">
+        <span class="mby-search-icon-wrap" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></span>
         <input id="searchInput" class="mby-search-input" type="search" placeholder="Search concepts, figures, tables, callouts, questions..." autocomplete="off" />
-        <button id="searchCloseBtn" class="mby-icon-btn" type="button" aria-label="Close search">✕</button>
+        <button id="searchClearBtn" class="mby-search-clear-btn hidden" type="button" aria-label="Clear search">Clear</button>
+        <button id="searchCloseBtn" class="mby-icon-btn" type="button" aria-label="Close search"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
       </div>
+      <div id="searchFilters" class="mby-search-filters" role="tablist" aria-label="Search category filters"></div>
       <div id="searchMeta" class="mby-search-meta"></div>
       <div id="searchResults" class="mby-search-results" role="listbox"></div>
+      <div id="searchFooter" class="mby-search-footer">
+        <span><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+        <span><kbd>Enter</kbd> jump</span>
+        <span><kbd>Tab</kbd> filter</span>
+        <span><kbd>Esc</kbd> close</span>
+      </div>
     </div>
   </div>
+  <div id="linkPreviewPopover" class="mby-link-popover hidden" role="dialog" aria-live="polite"></div>
   {{(includeKatex ? "<script src=\"katex/katex.min.js\"></script>\n  " : string.Empty)}}<script src="app.js"></script>
 </body>
 </html>
@@ -616,7 +949,8 @@ html, body { height: 100%; overflow: hidden; }
 .mby-search-trigger kbd { font-family: ui-monospace, Consolas, monospace; font-size: 11px; padding: 1px 6px; border-radius: 5px; border: 1px solid var(--border); background: var(--surface); color: var(--muted); }
 .mby-brand-wrap { display: flex; flex-direction: column; min-width: 0; }
 .mby-brand { font-weight: 800; font-size: 18px; color: var(--accent); letter-spacing: -0.02em; }
-.mby-icon-btn { width: 34px; height: 34px; border-radius: 9px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 16px; font-weight: 700; cursor: pointer; }
+.mby-icon-btn { width: 34px; height: 34px; border-radius: 9px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 16px; font-weight: 700; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; line-height: 1; padding: 0; transition: border-color 140ms ease, color 140ms ease, background 140ms ease; }
+.mby-icon-btn:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
 .mby-mode-hint { font-size: 12px; color: var(--muted); font-weight: 600; }
 .mby-viewport { position: relative; flex: 1; min-height: 0; overflow: hidden; display: flex; }
 .mby-slides-track { display: flex; width: 100%; height: 100%; transition: transform var(--slide-ms) cubic-bezier(0.22, 1, 0.36, 1); }
@@ -653,7 +987,7 @@ html, body { height: 100%; overflow: hidden; }
 .mby-dot.active { background: var(--accent); transform: scale(1.25); }
 .mby-summary-header h2 { margin: 0 0 4px; font-size: 21px; font-weight: 800; }
 .mby-summary-meta { font-size: 12px; color: var(--muted); font-family: ui-monospace, Consolas, monospace; }
-.mby-stats-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 18px 0; }
+.mby-stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 18px 0; }
 .mby-stat-box { border: 1px solid var(--border); border-radius: 12px; padding: 14px; background: var(--bg); }
 .mby-stat-label { font-size: 11px; color: var(--muted); text-transform: uppercase; font-weight: 700; }
 .mby-stat-value { font-size: 22px; font-weight: 800; margin-top: 4px; color: var(--accent); }
@@ -692,20 +1026,36 @@ html, body { height: 100%; overflow: hidden; }
 .mby-zoom-stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; cursor: grab; }
 .mby-zoom-stage:active { cursor: grabbing; }
 .mby-zoom-img { max-width: 90vw; max-height: 82vh; object-fit: contain; user-select: none; transform-origin: center center; }
-.mby-search-modal { align-items: flex-start; padding-top: 9vh; z-index: 55; }
-.mby-search-card { width: 100%; max-width: 660px; background: var(--surface); border: 1px solid var(--border); border-radius: 18px; box-shadow: 0 24px 60px rgba(0, 0, 0, 0.28); overflow: hidden; display: flex; flex-direction: column; max-height: 76vh; }
-.mby-search-header { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--border); background: var(--bg); }
-.mby-search-input { flex: 1; padding: 10px 14px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface); color: var(--text); font-size: 15px; outline: none; }
-.mby-search-input:focus { border-color: var(--accent); }
-.mby-search-meta { padding: 8px 16px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--border); }
-.mby-search-results { overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
-.mby-search-item { width: 100%; text-align: left; padding: 11px 14px; border-radius: 12px; border: 1px solid transparent; background: transparent; color: var(--text); cursor: pointer; display: flex; flex-direction: column; gap: 4px; }
-.mby-search-item:hover, .mby-search-item.active { background: var(--accent-soft); border-color: var(--border); }
-.mby-search-item-title { font-size: 12px; font-weight: 800; color: var(--accent); text-transform: uppercase; letter-spacing: 0.03em; }
-.mby-search-item-snippet { font-size: 13px; line-height: 1.45; color: var(--text); }
-.mby-search-item-snippet mark { background: var(--accent-soft); color: var(--accent); font-weight: 700; padding: 0 2px; border-radius: 3px; }
-.mby-search-empty { padding: 24px 16px; text-align: center; color: var(--muted); font-size: 14px; }
-.mby-search-pulse { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 10px; transition: outline-color 400ms ease; }
+.mby-search-modal { align-items: flex-start; padding-top: 8vh; z-index: 55; backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); }
+.mby-search-card { width: 100%; max-width: 700px; background: var(--surface); border: 1px solid var(--border); border-radius: 18px; box-shadow: 0 26px 68px rgba(0, 0, 0, 0.32); overflow: hidden; display: flex; flex-direction: column; max-height: 78vh; }
+.mby-search-header { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--border); background: var(--bg); }
+.mby-search-icon-wrap { display: inline-flex; align-items: center; justify-content: center; color: var(--muted); flex-shrink: 0; margin-left: 2px; }
+.mby-search-input { flex: 1; padding: 9px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface); color: var(--text); font-size: 15px; outline: none; }
+.mby-search-input:focus { border-color: var(--select); box-shadow: 0 0 0 2px var(--select-soft); }
+.mby-search-clear-btn { padding: 5px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); color: var(--muted); font-size: 12px; font-weight: 700; cursor: pointer; }
+.mby-search-clear-btn:hover { border-color: var(--accent); color: var(--accent); }
+.mby-search-filters { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 14px; border-bottom: 1px solid var(--border); background: var(--surface); }
+.mby-search-filter-pill { display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border); background: var(--bg); color: var(--muted); font-size: 12px; font-weight: 700; cursor: pointer; transition: border-color 120ms ease, background 120ms ease, color 120ms ease; }
+.mby-search-filter-pill:hover { border-color: var(--select); color: var(--select); }
+.mby-search-filter-pill.active { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.mby-search-meta { padding: 7px 14px; font-size: 12px; font-weight: 600; color: var(--muted); border-bottom: 1px solid var(--border); background: var(--bg); }
+.mby-search-results { overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 4px; flex: 1; min-height: 120px; }
+.mby-search-group-hdr { padding: 6px 10px 2px; font-size: 11px; font-weight: 800; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
+.mby-search-item { width: 100%; text-align: left; padding: 10px 12px; border-radius: 11px; border: 1px solid transparent; background: transparent; color: var(--text); cursor: pointer; display: flex; flex-direction: column; gap: 4px; transition: background 120ms ease, border-color 120ms ease; }
+.mby-search-item:hover, .mby-search-item.active { background: var(--select-soft); border-color: var(--select); }
+.mby-search-item-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.mby-search-item-meta { display: flex; align-items: center; gap: 6px; min-width: 0; flex-wrap: wrap; }
+.mby-search-badge { padding: 2px 7px; border-radius: 6px; font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.04em; background: var(--accent-soft); color: var(--accent); flex-shrink: 0; }
+.mby-search-crumb { font-size: 12px; font-weight: 700; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mby-search-status { font-size: 11px; font-weight: 700; color: var(--muted); flex-shrink: 0; }
+.mby-search-status.ok { color: var(--ok); }
+.mby-search-status.bad { color: var(--bad); }
+.mby-search-item-snippet { font-size: 13px; line-height: 1.45; color: var(--muted); }
+.mby-search-item-snippet mark { background: var(--select-soft); color: var(--select); font-weight: 700; padding: 0 3px; border-radius: 3px; }
+.mby-search-footer { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; padding: 8px 14px; border-top: 1px solid var(--border); background: var(--bg); font-size: 11px; color: var(--muted); }
+.mby-search-footer kbd { font-family: ui-monospace, Consolas, monospace; font-size: 10px; padding: 1px 5px; border-radius: 4px; border: 1px solid var(--border); background: var(--surface); color: var(--text); margin-right: 3px; }
+.mby-search-empty { padding: 28px 16px; text-align: center; color: var(--muted); font-size: 14px; }
+.mby-search-pulse { outline: 2px solid var(--select); outline-offset: 4px; border-radius: 10px; transition: outline-color 400ms ease; }
 """;
 
     private static string BuildJs(string payloadJson) => $$"""
@@ -718,12 +1068,21 @@ const startSessionBtn = $('startSessionBtn'), playerTopbar = $('playerTopbar'), 
 const backToSlidesBtn = $('backToSlidesBtn'), topbarModeHint = $('topbarModeHint'), prevBtn = $('prevBtn'), prevCompMenu = $('prevCompMenu'), prevCompMenuItem = $('prevCompMenuItem');
 const nextBtn = $('nextBtn'), finishBtn = $('finishBtn'), continueSessionBtn = $('continueSessionBtn'), earlyFinishModal = $('earlyFinishModal'), dotsNav = $('dotsNav');
 const imageZoomModal = $('imageZoomModal'), zoomTargetImg = $('zoomTargetImg'), zoomStage = $('zoomStage'), zoomPercentBadge = $('zoomPercentBadge');
-const searchModal = $('searchModal'), searchInput = $('searchInput'), searchResultsEl = $('searchResults'), searchMetaEl = $('searchMeta'), topbarSearchBtn = $('topbarSearchBtn'), greetingSearchBtn = $('greetingSearchBtn'), searchCloseBtn = $('searchCloseBtn');
+const searchModal = $('searchModal'), searchInput = $('searchInput'), searchClearBtn = $('searchClearBtn'), searchFiltersEl = $('searchFilters'), searchResultsEl = $('searchResults'), searchMetaEl = $('searchMeta'), topbarSearchBtn = $('topbarSearchBtn'), greetingSearchBtn = $('greetingSearchBtn'), searchCloseBtn = $('searchCloseBtn'), linkPreviewPopover = $('linkPreviewPopover');
 const SAVE_ICON_SVG = '<svg class="mby-save-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm-5 16c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3zm3-10H5V5h10v4z"/></svg>';
+const GITHUB_ICON_SVG = '<svg class="mby-github-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.56 0-.28-.01-1.02-.02-2-3.2.7-3.87-1.54-3.87-1.54-.52-1.33-1.28-1.68-1.28-1.68-1.05-.71.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.68 0-1.26.45-2.29 1.19-3.09-.12-.29-.52-1.47.11-3.06 0 0 .97-.31 3.17 1.18a11.1 11.1 0 0 1 5.78 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.77.11 3.06.74.8 1.19 1.83 1.19 3.09 0 4.41-2.69 5.39-5.25 5.67.41.36.78 1.07.78 2.15 0 1.55-.01 2.8-.01 3.18 0 .31.21.67.8.56A11.51 11.51 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/></svg>';
+const TABLE_EYE_SVG = '<svg class="mby-th-eye-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+const TABLE_EYE_OFF_SVG = '<svg class="mby-th-eye-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
+function createRetryBtn(onRetry, visible, label = 'Retry', compact = false) {
+  const btn = mk('button', 'mby-retry-btn' + (compact ? ' is-compact' : '') + (visible ? '' : ' hidden'), label);
+  btn.type = 'button';
+  btn.addEventListener('click', () => { if (onRetry) onRetry(); });
+  return btn;
+}
 
 let currentIndex = 0, isFinished = false, sessionStartedAt = new Date(), activeLeafEnterMs = null, lastVisitedLeafId = null, autoSaveSent = false;
 const activeQuizQuestionIdx = new Map(), quizControllers = new Map(), mcqStateMap = new Map(), flashcardStateMap = new Map(), gradedStateMap = new Map();
-const isGradedKind = k => k === 'mcq' || k === 'fill-blank' || k === 'assertion-reason' || k === 'spot-error' || k === 'diff' || k === 'mechanism' || k === 'relabel';
+const isGradedKind = k => k === 'mcq' || k === 'fill-blank' || k === 'assertion-reason' || k === 'spot-error' || k === 'diff' || k === 'mechanism' || k === 'relabel' || k === 'classify' || k === 'match' || k === 'numeric' || k === 'case';
 const leafSlides = DATA.slides.flatMap(s => (s.kind === 'quiz' && Array.isArray(s.questions)) ? s.questions : [s]);
 const slideTelemetry = leafSlides.map((s, idx) => ({
   slideIndex: idx + 1, id: s.id, kind: s.kind, timeSpentMs: 0, visitedCount: 0,
@@ -759,9 +1118,18 @@ function flushActiveLeafTime() {
 function populateGeneratorFooter(footerEl, includeTimestamp) {
   if (!footerEl || !DATA.generator) return;
   const g = DATA.generator;
+  const appName = g.appName || 'Meloberry';
+  const rawVer = String(g.version || '2.0.0').trim();
+  const ver = rawVer.startsWith('v') ? rawVer : ('v' + rawVer);
+  const repoUrl = g.repositoryUrl || 'https://github.com/doc-shashank/meloberry-cli/';
   footerEl.innerHTML = '';
-  footerEl.appendChild(mk('span', 'mby-generator-badge', `Generated by ${g.executable} v${g.version}`));
-  footerEl.appendChild(mk('span', 'mby-generator-meta', `${g.toolName}${includeTimestamp && g.generatedAtUtc ? ` • Built ${g.generatedAtUtc.slice(0, 10)}` : ''}`));
+  const ghLink = mk('a', 'mby-generator-link');
+  ghLink.href = repoUrl;
+  ghLink.target = '_blank';
+  ghLink.rel = 'noopener noreferrer';
+  ghLink.innerHTML = `${GITHUB_ICON_SVG}<span>GitHub</span>`;
+  footerEl.appendChild(ghLink);
+  footerEl.appendChild(mk('span', 'mby-generator-meta', `Generator: ${appName} ${ver}${includeTimestamp && g.generatedAtUtc ? ` • Built ${g.generatedAtUtc.slice(0, 10)}` : ''}`));
 }
 
 let zoomScale = 1, zoomTx = 0, zoomTy = 0, isDraggingZoom = false, dragStartX = 0, dragStartY = 0;
@@ -821,8 +1189,8 @@ function buildMcqCard(slide, onAnswered) {
     if (st.selected.has(opt.index)) btn.classList.add('selected');
     if (st.checked) btn.classList.add(opt.isCorrect ? 'correct' : (st.selected.has(opt.index) ? 'wrong' : 'x'));
     btn.classList.remove('x');
-    if (opt.imagePath) btn.appendChild(makeZoomImg(opt.imagePath));
-    if (opt.textHtml) { const t = mk('div'); t.innerHTML = opt.textHtml; renderMathIn(t); btn.appendChild(t); }
+    if (opt.imagePath) btn.appendChild(mk('div', 'mby-option-media', null, [makeZoomImg(opt.imagePath)]));
+    if (opt.textHtml) { const t = mk('div', 'mby-option-text'); t.innerHTML = opt.textHtml; renderMathIn(t); btn.appendChild(t); }
     btn.addEventListener('click', () => {
       if (!mcq.isMultiCorrect) { st.selected.clear(); optionBtns.forEach(b => b.classList.remove('selected')); }
       if (st.selected.has(opt.index)) { st.selected.delete(opt.index); btn.classList.remove('selected'); }
@@ -838,6 +1206,19 @@ function buildMcqCard(slide, onAnswered) {
     const expContent = mk('div'); expContent.innerHTML = mcq.explanationHtml; renderMathIn(expContent);
     explanationBox = mk('div', 'mby-explanation-box' + (st.checked ? '' : ' hidden'), null, [mk('div', 'mby-explanation-title', 'Explanation'), expContent]);
   }
+  const retryBtn = createRetryBtn(() => {
+    st.selected.clear();
+    st.checked = false;
+    st.isCorrect = null;
+    optionBtns.forEach(b => b.classList.remove('selected', 'correct', 'wrong'));
+    feedback.textContent = '';
+    if (explanationBox) explanationBox.classList.add('hidden');
+    retryBtn.classList.add('hidden');
+    if (m) m.isCorrect = null;
+    if (onAnswered) onAnswered();
+    requestAnimationFrame(updateScrollDownHint);
+  }, st.checked);
+
   checkBtn.addEventListener('click', () => {
     let allCorrect = true;
     optionBtns.forEach((btn, i) => {
@@ -854,12 +1235,13 @@ function buildMcqCard(slide, onAnswered) {
       m.isCorrect = allCorrect;
     }
     renderMcqFeedback(feedback, allCorrect);
+    retryBtn.classList.remove('hidden');
     if (explanationBox) explanationBox.classList.remove('hidden');
     if (onAnswered) onAnswered();
     requestAnimationFrame(updateScrollDownHint);
   });
 
-  card.appendChild(mk('div', 'mby-card-body', null, [prompt, promptMedia, grid, mk('div', 'mby-action-row', null, [checkBtn, feedback]), explanationBox]));
+  card.appendChild(mk('div', 'mby-card-body', null, [prompt, promptMedia, grid, mk('div', 'mby-action-row', null, [checkBtn, retryBtn, feedback]), explanationBox]));
   return card;
 }
 
@@ -925,38 +1307,12 @@ function buildNativeTableBlock(b) {
   const hideableSet = new Set(t.hideableCols || []);
   const tdByCol = new Map();
 
-  if (t.title || t.titleHtml || hideableSet.size > 0) {
+  if (t.title || t.titleHtml) {
     const toolbar = mk('div', 'mby-table-toolbar');
     const titleEl = mk('div', 'mby-table-title');
     if (t.titleHtml) { titleEl.innerHTML = t.titleHtml; renderMathIn(titleEl); }
     else { titleEl.textContent = t.title || 'Table'; }
     toolbar.appendChild(titleEl);
-    if (hideableSet.size > 0) {
-      const controls = mk('div', 'mby-table-controls');
-      Array.from(hideableSet).sort((a, c) => a - c).forEach(colIdx => {
-        const hdrHtml = t.headersHtml[colIdx - 1] || ('Col ' + colIdx);
-        const btn = mk('button', 'mby-table-toggle-btn');
-        btn.type = 'button';
-        const setToggleLabel = nowHidden => {
-          btn.innerHTML = (nowHidden ? 'Show ' : 'Hide ') + hdrHtml;
-          renderMathIn(btn);
-        };
-        setToggleLabel(false);
-        btn.addEventListener('click', () => {
-          const isHidden = hiddenCols.has(colIdx);
-          if (isHidden) hiddenCols.delete(colIdx); else hiddenCols.add(colIdx);
-          const nowHidden = hiddenCols.has(colIdx);
-          btn.classList.toggle('active', nowHidden);
-          setToggleLabel(nowHidden);
-          (tdByCol.get(colIdx) || []).forEach(td => {
-            td.classList.toggle('mby-cell-masked', nowHidden);
-            td.classList.remove('peek');
-          });
-        });
-        controls.appendChild(btn);
-      });
-      toolbar.appendChild(controls);
-    }
     wrap.appendChild(toolbar);
   }
 
@@ -965,10 +1321,47 @@ function buildNativeTableBlock(b) {
   const thead = mk('thead');
   const headTr = mk('tr');
   (t.headersHtml || []).forEach((hHtml, idx) => {
+    const colNum = idx + 1;
     const th = mk('th');
     if (t.alignments?.[idx]) th.style.textAlign = t.alignments[idx];
-    th.innerHTML = hHtml;
-    renderMathIn(th);
+    if (hideableSet.has(colNum)) {
+      th.classList.add('mby-th-hideable');
+      th.tabIndex = 0;
+      th.setAttribute('role', 'button');
+      th.setAttribute('aria-pressed', 'false');
+      th.title = 'Click to hide or show column';
+      const inner = mk('span', 'mby-th-hideable-inner');
+      const lbl = mk('span');
+      lbl.innerHTML = hHtml;
+      renderMathIn(lbl);
+      const eyeWrap = mk('span');
+      eyeWrap.innerHTML = TABLE_EYE_SVG;
+      inner.appendChild(lbl);
+      inner.appendChild(eyeWrap);
+      th.appendChild(inner);
+      const toggleColumn = () => {
+        const isHidden = hiddenCols.has(colNum);
+        if (isHidden) hiddenCols.delete(colNum); else hiddenCols.add(colNum);
+        const nowHidden = hiddenCols.has(colNum);
+        th.classList.toggle('is-col-hidden', nowHidden);
+        th.setAttribute('aria-pressed', nowHidden ? 'true' : 'false');
+        eyeWrap.innerHTML = nowHidden ? TABLE_EYE_OFF_SVG : TABLE_EYE_SVG;
+        (tdByCol.get(colNum) || []).forEach(td => {
+          td.classList.toggle('mby-cell-masked', nowHidden);
+          td.classList.remove('peek');
+        });
+      };
+      th.addEventListener('click', toggleColumn);
+      th.addEventListener('keydown', e => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          toggleColumn();
+        }
+      });
+    } else {
+      th.innerHTML = hHtml;
+      renderMathIn(th);
+    }
     headTr.appendChild(th);
   });
   thead.appendChild(headTr);
@@ -1021,8 +1414,9 @@ function buildFillBlankCard(slide, onAnswered) {
   const st = gradedStateMap.get(slide.id);
 
   let html = fb.promptHtml || '';
+  const placeholderAttr = fb.placeholder ? ` placeholder="${escapeHtml(fb.placeholder)}"` : '';
   (fb.blanks || []).forEach((b, idx) => {
-    html = html.replace('MBYBLANKSLOT' + idx + 'END', `<span class="mby-blank-wrap" data-slot="${idx}"><input type="text" class="mby-blank-input" data-slot="${idx}" autocomplete="off" spellcheck="false" placeholder="Blank ${idx + 1}" /><span class="mby-blank-expected hidden" data-expected="${idx}"></span></span>`);
+    html = html.replace('MBYBLANKSLOT' + idx + 'END', `<span class="mby-blank-wrap" data-slot="${idx}"><input type="text" class="mby-blank-input" data-slot="${idx}" autocomplete="off" spellcheck="false"${placeholderAttr} /><span class="mby-blank-expected hidden" data-expected="${idx}"></span></span>`);
   });
 
   const promptEl = mk('div', 'mby-blank-prompt');
@@ -1045,12 +1439,31 @@ function buildFillBlankCard(slide, onAnswered) {
     const expContent = mk('div'); expContent.innerHTML = fb.explanationHtml; renderMathIn(expContent);
     explanationBox = mk('div', 'mby-explanation-box' + (st.checked ? '' : ' hidden'), null, [mk('div', 'mby-explanation-title', 'Explanation'), expContent]);
   }
+  const retryBtn = createRetryBtn(() => {
+    st.values = [];
+    st.checked = false;
+    st.isCorrect = null;
+    st.overridden = false;
+    inputs.forEach((inp, idx) => {
+      inp.value = '';
+      inp.classList.remove('correct', 'fuzzy-ok', 'wrong');
+      if (expectedEls[idx]) { expectedEls[idx].innerHTML = ''; expectedEls[idx].classList.add('hidden'); }
+    });
+    feedback.textContent = '';
+    overrideBtn.classList.add('hidden');
+    if (explanationBox) explanationBox.classList.add('hidden');
+    retryBtn.classList.add('hidden');
+    if (m) m.isCorrect = null;
+    if (onAnswered) onAnswered();
+    requestAnimationFrame(updateScrollDownHint);
+  }, st.checked);
 
   function applyGradeUi(allOk, anyFuzzy) {
-    feedback.textContent = allOk ? (anyFuzzy ? 'Correct (minor typo accepted)!' : 'Correct!') : 'Review highlighted blanks.';
+    feedback.textContent = allOk ? (anyFuzzy ? 'Almost Correct!' : 'Correct!') : 'Review highlighted blanks.';
     feedback.style.color = allOk ? 'var(--ok)' : 'var(--bad)';
     feedback.style.fontWeight = '600';
     overrideBtn.classList.toggle('hidden', allOk);
+    retryBtn.classList.remove('hidden');
     if (explanationBox) explanationBox.classList.remove('hidden');
   }
 
@@ -1083,10 +1496,11 @@ function buildFillBlankCard(slide, onAnswered) {
     feedback.textContent = 'Marked correct (self-override).';
     feedback.style.color = 'var(--ok)';
     overrideBtn.classList.add('hidden');
+    retryBtn.classList.remove('hidden');
     if (onAnswered) onAnswered();
   });
 
-  card.appendChild(mk('div', 'mby-card-body', null, [promptEl, mk('div', 'mby-action-row', null, [checkBtn, overrideBtn, feedback]), explanationBox]));
+  card.appendChild(mk('div', 'mby-card-body', null, [promptEl, mk('div', 'mby-action-row', null, [checkBtn, overrideBtn, retryBtn, feedback]), explanationBox]));
   return card;
 }
 
@@ -1124,6 +1538,18 @@ function buildAssertionReasonCard(slide, onAnswered) {
     const expContent = mk('div'); expContent.innerHTML = ar.explanationHtml; renderMathIn(expContent);
     explanationBox = mk('div', 'mby-explanation-box' + (st.checked ? '' : ' hidden'), null, [mk('div', 'mby-explanation-title', 'Explanation'), expContent]);
   }
+  const retryBtn = createRetryBtn(() => {
+    st.selectedCode = null;
+    st.checked = false;
+    st.isCorrect = null;
+    optBtns.forEach(b => b.classList.remove('selected', 'correct', 'wrong'));
+    feedback.textContent = '';
+    if (explanationBox) explanationBox.classList.add('hidden');
+    retryBtn.classList.add('hidden');
+    if (m) m.isCorrect = null;
+    if (onAnswered) onAnswered();
+    requestAnimationFrame(updateScrollDownHint);
+  }, st.checked);
 
   checkBtn.addEventListener('click', () => {
     const isCorrect = st.selectedCode === ar.answer;
@@ -1140,12 +1566,13 @@ function buildAssertionReasonCard(slide, onAnswered) {
       m.isCorrect = isCorrect;
     }
     renderMcqFeedback(feedback, isCorrect);
+    retryBtn.classList.remove('hidden');
     if (explanationBox) explanationBox.classList.remove('hidden');
     if (onAnswered) onAnswered();
     requestAnimationFrame(updateScrollDownHint);
   });
 
-  card.appendChild(mk('div', 'mby-card-body', null, [stack, grid, mk('div', 'mby-action-row', null, [checkBtn, feedback]), explanationBox]));
+  card.appendChild(mk('div', 'mby-card-body', null, [stack, grid, mk('div', 'mby-action-row', null, [checkBtn, retryBtn, feedback]), explanationBox]));
   return card;
 }
 
@@ -1156,6 +1583,7 @@ function buildSpotErrorCard(slide, onAnswered) {
   if (!gradedStateMap.has(slide.id)) gradedStateMap.set(slide.id, { selectedSpans: new Set(), pickedNoError: false, fixes: {}, checked: false, isCorrect: null });
   const st = gradedStateMap.get(slide.id);
 
+  const promptMedia = se.imagePath ? mk('div', 'mby-prompt-media', null, [makeZoomImg(se.imagePath)]) : null;
   const stmtEl = mk('div', 'mby-spot-statement');
   const chipByIdx = new Map();
   const fixRow = mk('div', 'mby-fix-input-row hidden');
@@ -1185,6 +1613,7 @@ function buildSpotErrorCard(slide, onAnswered) {
       stmtEl.appendChild(sp);
       return;
     }
+    const chipWrap = mk('span', 'mby-error-chip-wrap');
     const chip = mk('button', 'mby-error-chip'); chip.type = 'button';
     chip.innerHTML = seg.html; renderMathIn(chip);
     if (st.selectedSpans.has(seg.spanIndex)) chip.classList.add('selected');
@@ -1195,11 +1624,11 @@ function buildSpotErrorCard(slide, onAnswered) {
       else { st.selectedSpans.add(seg.spanIndex); chip.classList.add('selected'); }
       rebuildFixInputs();
     });
+    chipWrap.appendChild(chip);
     chipByIdx.set(seg.spanIndex, { chip, seg });
-    stmtEl.appendChild(chip);
+    stmtEl.appendChild(chipWrap);
   });
 
-  let noErrorRow = null;
   if (se.allowNoError || se.noError) {
     noErrorBtn = mk('button', 'mby-no-error-btn' + (st.pickedNoError ? ' selected' : ''), 'No error in this statement');
     noErrorBtn.type = 'button';
@@ -1212,7 +1641,6 @@ function buildSpotErrorCard(slide, onAnswered) {
       }
       rebuildFixInputs();
     });
-    noErrorRow = mk('div', 'mby-no-error-row', null, [noErrorBtn]);
   }
 
   rebuildFixInputs();
@@ -1222,6 +1650,23 @@ function buildSpotErrorCard(slide, onAnswered) {
     const expContent = mk('div'); expContent.innerHTML = se.explanationHtml; renderMathIn(expContent);
     explanationBox = mk('div', 'mby-explanation-box' + (st.checked ? '' : ' hidden'), null, [mk('div', 'mby-explanation-title', 'Explanation'), expContent]);
   }
+  const retryBtn = createRetryBtn(() => {
+    st.selectedSpans.clear();
+    st.pickedNoError = false;
+    st.fixes = {};
+    st.checked = false;
+    st.isCorrect = null;
+    stmtEl.querySelectorAll('.mby-error-fix-badge').forEach(el => el.remove());
+    chipByIdx.forEach(({ chip }) => chip.classList.remove('selected', 'correct', 'wrong', 'missed-error'));
+    if (noErrorBtn) noErrorBtn.classList.remove('selected', 'correct', 'wrong');
+    rebuildFixInputs();
+    feedback.textContent = '';
+    if (explanationBox) explanationBox.classList.add('hidden');
+    retryBtn.classList.add('hidden');
+    if (m) m.isCorrect = null;
+    if (onAnswered) onAnswered();
+    requestAnimationFrame(updateScrollDownHint);
+  }, st.checked);
 
   checkBtn.addEventListener('click', () => {
     let allOk = true;
@@ -1254,7 +1699,7 @@ function buildSpotErrorCard(slide, onAnswered) {
             const badge = mk('span', 'mby-error-fix-badge');
             badge.innerHTML = '→ ' + (seg.primaryCorrectionHtml || '');
             renderMathIn(badge);
-            chip.insertAdjacentElement('afterend', badge);
+            chip.insertAdjacentElement('beforebegin', badge);
           }
         } else if (picked) {
           chip.classList.add('wrong');
@@ -1272,12 +1717,14 @@ function buildSpotErrorCard(slide, onAnswered) {
     feedback.textContent = allOk ? 'Correct!' : 'Review highlighted segments.';
     feedback.style.color = allOk ? 'var(--ok)' : 'var(--bad)';
     feedback.style.fontWeight = '600';
+    retryBtn.classList.remove('hidden');
     if (explanationBox) explanationBox.classList.remove('hidden');
     if (onAnswered) onAnswered();
     requestAnimationFrame(updateScrollDownHint);
   });
 
-  card.appendChild(mk('div', 'mby-card-body', null, [stmtEl, noErrorRow, fixRow, mk('div', 'mby-action-row', null, [checkBtn, feedback]), explanationBox]));
+  const actionRowItems = noErrorBtn ? [noErrorBtn, checkBtn, retryBtn, feedback] : [checkBtn, retryBtn, feedback];
+  card.appendChild(mk('div', 'mby-card-body', null, [promptMedia, stmtEl, fixRow, mk('div', 'mby-action-row', null, actionRowItems), explanationBox]));
   return card;
 }
 
@@ -1343,21 +1790,42 @@ function buildDiffCard(slide, onAnswered) {
   const spotButtons = new Map();
   let noErrorBtn = null;
   const rearrButtons = new Map();
+  const correctionsBox = mk('div', 'mby-diff-corrections hidden');
+
+  const blankSpecs = (d.specialCells || []).filter(sc => sc.isBlank && sc.answers?.length);
+  const bankItems = blankSpecs.map((sc, idx) => ({
+    idx,
+    label: sc.answers[0],
+    answers: sc.answers,
+    html: sc.primaryAnswerHtml || escapeHtml(sc.answers[0])
+  }));
+  const itemMatchesNorm = (bankItem, rawVal) => {
+    const normVal = normalizeRecallAnswer(rawVal, d.caseSensitive);
+    if (!normVal) return false;
+    return (bankItem?.answers || []).some(ans => normalizeRecallAnswer(ans, d.caseSensitive) === normVal);
+  };
 
   if (d.mode === 'fill' && d.bank) {
-    const bankItems = (d.specialCells || [])
-      .filter(sc => sc.isBlank && sc.answers?.length)
-      .map((sc, idx) => ({ idx, label: sc.answers[0], html: sc.primaryAnswerHtml || escapeHtml(sc.answers[0]) }));
     const shuffledBank = deterministicShuffle(bankItems, `${slide.id}:bank`, x => x.label);
     const bankRow = mk('div', 'mby-diff-bank');
     shuffledBank.forEach(item => {
-      const chip = mk('button', 'mby-diff-bank-chip'); chip.type = 'button';
+      const chip = mk('button', 'mby-diff-bank-chip mby-draggable'); chip.type = 'button';
+      chip.draggable = true;
       chip.innerHTML = item.html; renderMathIn(chip);
       chip.dataset.chipIdx = String(item.idx);
       chip.addEventListener('click', () => {
         st.bankPickedChipIdx = (st.bankPickedChipIdx === item.idx) ? null : item.idx;
         bankChips.forEach(c => c.classList.toggle('selected', Number(c.dataset.chipIdx) === st.bankPickedChipIdx));
       });
+      chip.addEventListener('dragstart', e => {
+        if (e.dataTransfer) {
+          e.dataTransfer.setData('application/x-mby-diff-bank', String(item.idx));
+          e.dataTransfer.setData('text/plain', item.label);
+          e.dataTransfer.effectAllowed = 'copyMove';
+        }
+        chip.classList.add('is-dragging');
+      });
+      chip.addEventListener('dragend', () => chip.classList.remove('is-dragging'));
       bankChips.push(chip);
       bankRow.appendChild(chip);
     });
@@ -1365,8 +1833,48 @@ function buildDiffCard(slide, onAnswered) {
   }
 
   const refreshBankUsed = () => {
-    const used = new Set(Object.values(st.chipBySlot).filter(v => v !== null && v !== undefined));
-    bankChips.forEach(c => c.classList.toggle('used', used.has(Number(c.dataset.chipIdx))));
+    if (!(d.mode === 'fill' && d.bank)) return;
+    const usedChips = new Set();
+    const claimedSlots = new Set();
+    blankSpecs.forEach(sc => {
+      const sIdx = sc.slotIndex;
+      const cid = st.chipBySlot[sIdx];
+      if (cid === undefined || cid === null || usedChips.has(cid)) return;
+      const item = bankItems[cid];
+      if (item && itemMatchesNorm(item, st.values[sIdx] || '')) {
+        usedChips.add(cid);
+        claimedSlots.add(sIdx);
+      } else {
+        delete st.chipBySlot[sIdx];
+      }
+    });
+    blankSpecs.forEach(sc => {
+      const sIdx = sc.slotIndex;
+      if (claimedSlots.has(sIdx)) return;
+      const val = st.values[sIdx] || '';
+      if (!val.trim()) return;
+      const matchItem = bankItems.find(it => !usedChips.has(it.idx) && itemMatchesNorm(it, val));
+      if (matchItem) {
+        usedChips.add(matchItem.idx);
+        st.chipBySlot[sIdx] = matchItem.idx;
+        claimedSlots.add(sIdx);
+      }
+    });
+    bankChips.forEach(c => c.classList.toggle('used', usedChips.has(Number(c.dataset.chipIdx))));
+  };
+
+  const applyBankChipToSlot = (chipIdx, sIdx, inp) => {
+    const bankItem = bankItems[chipIdx];
+    if (!bankItem || !inp) return;
+    for (const [k, v] of Object.entries(st.chipBySlot)) {
+      if (v === chipIdx) delete st.chipBySlot[k];
+    }
+    inp.value = bankItem.label;
+    st.values[sIdx] = inp.value;
+    st.chipBySlot[sIdx] = chipIdx;
+    st.bankPickedChipIdx = null;
+    bankChips.forEach(ch => ch.classList.remove('selected'));
+    refreshBankUsed();
   };
 
   const scroll = mk('div', 'mby-diff-scroll');
@@ -1387,6 +1895,7 @@ function buildDiffCard(slide, onAnswered) {
     tbody.innerHTML = '';
     blankInputs.clear(); expectedEls.clear(); spotButtons.clear(); rearrButtons.clear();
     const rowCount = (d.rowsHtml || []).length;
+    const fillPlaceholderAttr = d.placeholder ? ` placeholder="${escapeHtml(d.placeholder)}"` : '';
     for (let r = 0; r < rowCount; r++) {
       const tr = mk('tr');
       const cols = d.mode === 'rearrange' ? st.rearrRows[r] : (d.rowsHtml[r] || []).map((html, c) => ({ colIdx: c, html }));
@@ -1397,7 +1906,7 @@ function buildDiffCard(slide, onAnswered) {
 
         if (d.mode === 'fill' && spec && spec.isBlank) {
           const sIdx = spec.slotIndex;
-          const cellHtml = (cols[c].html || '').replace(`MBYDIFFSLOT${sIdx}END`, `<span class="mby-blank-wrap"><input type="text" class="mby-blank-input" data-diff-slot="${sIdx}" autocomplete="off" spellcheck="false" placeholder="${d.bank ? 'Pick or type' : 'Blank'}" /><span class="mby-blank-expected hidden" data-diff-exp="${sIdx}"></span></span>`);
+          const cellHtml = (cols[c].html || '').replace(`MBYDIFFSLOT${sIdx}END`, `<span class="mby-blank-wrap"><input type="text" class="mby-blank-input" data-diff-slot="${sIdx}" autocomplete="off" spellcheck="false"${fillPlaceholderAttr} /><span class="mby-blank-expected hidden" data-diff-exp="${sIdx}"></span></span>`);
           const host = mk('div'); host.innerHTML = cellHtml; renderMathIn(host);
           const inp = host.querySelector('.mby-blank-input');
           const expEl = host.querySelector('.mby-blank-expected');
@@ -1410,21 +1919,34 @@ function buildDiffCard(slide, onAnswered) {
             });
             inp.addEventListener('click', () => {
               if (d.bank && st.bankPickedChipIdx !== null) {
-                const pickedChip = bankChips.find(ch => Number(ch.dataset.chipIdx) === st.bankPickedChipIdx);
-                const bankSpec = (d.specialCells || []).filter(x => x.isBlank)[st.bankPickedChipIdx];
-                if (bankSpec?.answers?.length) {
-                  inp.value = bankSpec.answers[0];
-                  st.values[sIdx] = inp.value;
-                  st.chipBySlot[sIdx] = st.bankPickedChipIdx;
-                  st.bankPickedChipIdx = null;
-                  bankChips.forEach(ch => ch.classList.remove('selected'));
-                  refreshBankUsed();
-                } else if (pickedChip) {
-                  inp.value = pickedChip.textContent || '';
-                  st.values[sIdx] = inp.value;
-                }
+                applyBankChipToSlot(st.bankPickedChipIdx, sIdx, inp);
               }
             });
+            if (d.bank) {
+              inp.addEventListener('dragover', e => {
+                if (e.dataTransfer && (e.dataTransfer.types.includes('application/x-mby-diff-bank') || e.dataTransfer.types.includes('text/plain'))) {
+                  e.preventDefault();
+                  inp.classList.add('mby-drop-over');
+                }
+              });
+              inp.addEventListener('dragleave', () => inp.classList.remove('mby-drop-over'));
+              inp.addEventListener('drop', e => {
+                e.preventDefault();
+                inp.classList.remove('mby-drop-over');
+                const rawChipId = e.dataTransfer?.getData('application/x-mby-diff-bank');
+                if (rawChipId !== undefined && rawChipId !== '') {
+                  const chipIdx = Number(rawChipId);
+                  if (!Number.isNaN(chipIdx)) { applyBankChipToSlot(chipIdx, sIdx, inp); return; }
+                }
+                const droppedText = e.dataTransfer?.getData('text/plain');
+                if (droppedText) {
+                  inp.value = droppedText;
+                  st.values[sIdx] = inp.value;
+                  delete st.chipBySlot[sIdx];
+                  refreshBankUsed();
+                }
+              });
+            }
             inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); checkBtn.click(); } });
             blankInputs.set(sIdx, inp);
           }
@@ -1446,9 +1968,38 @@ function buildDiffCard(slide, onAnswered) {
         } else if (d.mode === 'rearrange' && c > 0) {
           const key = `${r}:${c}`;
           const isSrc = st.swapSrc && st.swapSrc.r === r && st.swapSrc.c === c;
-          const btn = mk('button', 'mby-diff-cell-btn' + (isSrc ? ' swap-selected' : ''));
+          const btn = mk('button', 'mby-diff-cell-btn mby-draggable' + (isSrc ? ' swap-selected' : ''));
           btn.type = 'button';
+          btn.draggable = true;
           btn.innerHTML = cols[c].html; renderMathIn(btn);
+          btn.addEventListener('dragstart', e => {
+            if (e.dataTransfer) {
+              e.dataTransfer.setData('application/x-mby-diff-rearr', JSON.stringify({ r, c }));
+              e.dataTransfer.effectAllowed = 'move';
+            }
+            btn.classList.add('is-dragging');
+          });
+          btn.addEventListener('dragend', () => btn.classList.remove('is-dragging'));
+          btn.addEventListener('dragover', e => {
+            if (e.dataTransfer?.types.includes('application/x-mby-diff-rearr')) {
+              e.preventDefault();
+              btn.classList.add('mby-drop-over');
+            }
+          });
+          btn.addEventListener('dragleave', () => btn.classList.remove('mby-drop-over'));
+          btn.addEventListener('drop', e => {
+            e.preventDefault();
+            btn.classList.remove('mby-drop-over');
+            try {
+              const src = JSON.parse(e.dataTransfer?.getData('application/x-mby-diff-rearr') || 'null');
+              if (src && src.r === r && src.c !== c) {
+                const rowArr = st.rearrRows[r];
+                const tmp = rowArr[src.c]; rowArr[src.c] = rowArr[c]; rowArr[c] = tmp;
+                st.swapSrc = null;
+                renderTableBody();
+              }
+            } catch {}
+          });
           btn.addEventListener('click', () => {
             if (!st.swapSrc || st.swapSrc.r !== r) {
               st.swapSrc = { r, c };
@@ -1478,6 +2029,7 @@ function buildDiffCard(slide, onAnswered) {
   tableEl.appendChild(tbody);
   scroll.appendChild(tableEl);
   wrap.appendChild(scroll);
+  wrap.appendChild(correctionsBox);
 
   if (d.mode === 'spot-wrong' && d.allowNoError) {
     noErrorBtn = mk('button', 'mby-no-error-btn' + (st.pickedNoError ? ' selected' : ''), 'No error in this table');
@@ -1490,12 +2042,43 @@ function buildDiffCard(slide, onAnswered) {
         spotButtons.forEach(b => b.classList.remove('selected'));
       }
     });
-    wrap.appendChild(mk('div', 'mby-no-error-row', null, [noErrorBtn]));
   }
+
+  const retryBtn = createRetryBtn(() => {
+    st.values = {};
+    st.bankPickedChipIdx = null;
+    st.chipBySlot = {};
+    st.selectedCells.clear();
+    st.pickedNoError = false;
+    st.swapSrc = null;
+    st.rearrRows = (d.rowsHtml || []).map((row, rIdx) => {
+      const cols = row.slice(1).map((html, offset) => ({ colIdx: offset + 1, html, raw: d.rowsRaw?.[rIdx]?.[offset + 1] ?? '' }));
+      const shuffled = d.mode === 'rearrange' ? deterministicShuffle(cols, `${slide.id}:r${rIdx}`, x => x.raw) : cols;
+      return [{ colIdx: 0, html: row[0], raw: d.rowsRaw?.[rIdx]?.[0] ?? '' }, ...shuffled];
+    });
+    st.checked = false;
+    st.isCorrect = null;
+    st.overridden = false;
+    wrap.querySelectorAll('.mby-diff-fix-badge').forEach(el => el.remove());
+    correctionsBox.innerHTML = '';
+    correctionsBox.classList.add('hidden');
+    if (noErrorBtn) noErrorBtn.classList.remove('selected', 'correct', 'wrong');
+    bankChips.forEach(c => c.classList.remove('selected', 'used'));
+    overrideBtn.classList.add('hidden');
+    feedback.textContent = '';
+    if (explanationBox) explanationBox.classList.add('hidden');
+    retryBtn.classList.add('hidden');
+    renderTableBody();
+    if (m) m.isCorrect = null;
+    if (onAnswered) onAnswered();
+    requestAnimationFrame(updateScrollDownHint);
+  }, st.checked);
 
   checkBtn.addEventListener('click', () => {
     let allOk = true, anyFuzzy = false;
     wrap.querySelectorAll('.mby-diff-fix-badge').forEach(el => el.remove());
+    correctionsBox.innerHTML = '';
+    correctionsBox.classList.add('hidden');
 
     if (d.mode === 'fill') {
       (d.specialCells || []).filter(sc => sc.isBlank).forEach(sc => {
@@ -1509,9 +2092,10 @@ function buildDiffCard(slide, onAnswered) {
         else { inp?.classList.add('wrong'); allOk = false; if (expEl) { expEl.innerHTML = 'Answer: ' + (sc.primaryAnswerHtml || ''); renderMathIn(expEl); expEl.classList.remove('hidden'); } }
       });
       overrideBtn.classList.toggle('hidden', allOk);
-      feedback.textContent = allOk ? (anyFuzzy ? 'Correct (minor typo accepted)!' : 'Correct!') : 'Review highlighted cells.';
+      feedback.textContent = allOk ? (anyFuzzy ? 'Almost Correct!' : 'Correct!') : 'Review highlighted cells.';
     } else if (d.mode === 'spot-wrong') {
       const errorCells = (d.specialCells || []).filter(sc => sc.isError);
+      const fixItems = [];
       if (errorCells.length === 0) {
         allOk = st.pickedNoError && st.selectedCells.size === 0;
         if (noErrorBtn) { noErrorBtn.classList.remove('correct', 'wrong'); noErrorBtn.classList.add('correct'); }
@@ -1529,16 +2113,33 @@ function buildDiffCard(slide, onAnswered) {
           if (sc && sc.isError) {
             if (picked) btn.classList.add('correct');
             else { btn.classList.add('missed-error'); allOk = false; }
-            if (sc.primaryCorrectionHtml) {
-              const badge = mk('div', 'mby-diff-fix-badge');
-              badge.innerHTML = '→ ' + sc.primaryCorrectionHtml; renderMathIn(badge);
-              btn.insertAdjacentElement('afterend', badge);
-            }
+            if (sc.primaryCorrectionHtml) fixItems.push(sc);
           } else if (picked) {
             btn.classList.add('wrong');
             allOk = false;
           }
         });
+      }
+      if (fixItems.length > 0) {
+        correctionsBox.appendChild(mk('div', 'mby-diff-corrections-title', 'Corrections'));
+        const ul = mk('ul', 'mby-diff-correction-list');
+        fixItems.forEach(sc => {
+          const li = mk('li', 'mby-diff-correction-item');
+          const rowLabel = htmlToPlainText(d.rowsHtml[sc.rowIndex]?.[0] || `Row ${sc.rowIndex + 1}`);
+          const colLabel = htmlToPlainText(d.headersHtml[sc.colIndex] || `Col ${sc.colIndex + 1}`);
+          li.appendChild(mk('span', 'mby-diff-correction-loc', `${rowLabel} • ${colLabel}:`));
+          const wrongSpan = mk('span', 'mby-diff-wrong-strike');
+          wrongSpan.innerHTML = d.rowsHtml[sc.rowIndex]?.[sc.colIndex] || '';
+          renderMathIn(wrongSpan);
+          const rightSpan = mk('span', 'mby-diff-right-text');
+          rightSpan.innerHTML = '→ ' + sc.primaryCorrectionHtml;
+          renderMathIn(rightSpan);
+          li.appendChild(wrongSpan);
+          li.appendChild(rightSpan);
+          ul.appendChild(li);
+        });
+        correctionsBox.appendChild(ul);
+        correctionsBox.classList.remove('hidden');
       }
       feedback.textContent = allOk ? 'Correct!' : 'Review highlighted cells.';
     } else if (d.mode === 'rearrange') {
@@ -1564,6 +2165,7 @@ function buildDiffCard(slide, onAnswered) {
     feedback.style.color = allOk ? 'var(--ok)' : 'var(--bad)';
     feedback.style.fontWeight = '600';
     st.checked = true; st.isCorrect = allOk; st.overridden = false;
+    retryBtn.classList.remove('hidden');
     if (m) {
       m.checkAttempts = (m.checkAttempts || 0) + 1;
       if (m.firstTryCorrect === null) m.firstTryCorrect = allOk;
@@ -1581,10 +2183,12 @@ function buildDiffCard(slide, onAnswered) {
     feedback.textContent = 'Marked correct (self-override).';
     feedback.style.color = 'var(--ok)';
     overrideBtn.classList.add('hidden');
+    retryBtn.classList.remove('hidden');
     if (onAnswered) onAnswered();
   });
 
-  card.appendChild(mk('div', 'mby-card-body', null, [wrap, mk('div', 'mby-action-row', null, [checkBtn, overrideBtn, feedback]), explanationBox]));
+  const actionRowItems = noErrorBtn ? [noErrorBtn, checkBtn, overrideBtn, retryBtn, feedback] : [checkBtn, overrideBtn, retryBtn, feedback];
+  card.appendChild(mk('div', 'mby-card-body', null, [wrap, mk('div', 'mby-action-row', null, actionRowItems), explanationBox]));
   return card;
 }
 
@@ -1618,6 +2222,83 @@ function buildMechanismCard(slide, onAnswered) {
     explanationBox = mk('div', 'mby-explanation-box' + (st.checked ? '' : ' hidden'), null, [mk('div', 'mby-explanation-title', 'Explanation'), expContent]);
   }
 
+  const animateSeqUpdate = mutateFn => {
+    const firstRects = new Map();
+    seqEl.querySelectorAll('.mby-mech-slot[data-step-id]').forEach(el => {
+      firstRects.set(el.dataset.stepId, el.getBoundingClientRect());
+    });
+    mutateFn();
+    renderZones();
+    requestAnimationFrame(() => {
+      seqEl.querySelectorAll('.mby-mech-slot[data-step-id]').forEach(el => {
+        const first = firstRects.get(el.dataset.stepId);
+        if (!first) return;
+        const last = el.getBoundingClientRect();
+        const dy = first.top - last.top;
+        if (Math.abs(dy) < 1) return;
+        el.style.transition = 'none';
+        el.style.transform = `translateY(${dy}px)`;
+        el.classList.add('is-moving');
+        el.getBoundingClientRect();
+        el.style.transition = 'transform 220ms cubic-bezier(0.22, 1, 0.36, 1)';
+        el.style.transform = 'translateY(0)';
+        setTimeout(() => {
+          el.style.transition = '';
+          el.style.transform = '';
+          el.classList.remove('is-moving');
+        }, 240);
+      });
+      updateScrollDownHint();
+    });
+  };
+
+  bankEl.addEventListener('dragover', e => {
+    if (e.dataTransfer?.types.includes('application/x-mby-mech-step')) {
+      e.preventDefault();
+      bankEl.classList.add('mby-drop-over');
+    }
+  });
+  bankEl.addEventListener('dragleave', e => { if (!bankEl.contains(e.relatedTarget)) bankEl.classList.remove('mby-drop-over'); });
+  bankEl.addEventListener('drop', e => {
+    e.preventDefault();
+    bankEl.classList.remove('mby-drop-over');
+    try {
+      const payload = JSON.parse(e.dataTransfer?.getData('application/x-mby-mech-step') || 'null');
+      if (payload && payload.source === 'seq' && st.placedIds.includes(payload.sid)) {
+        animateSeqUpdate(() => {
+          st.placedIds = st.placedIds.filter(x => x !== payload.sid);
+          if (!st.bankIds.includes(payload.sid)) st.bankIds.push(payload.sid);
+        });
+      }
+    } catch {}
+  });
+
+  seqEl.addEventListener('dragover', e => {
+    if (e.dataTransfer?.types.includes('application/x-mby-mech-step')) {
+      e.preventDefault();
+      seqEl.classList.add('mby-drop-over');
+    }
+  });
+  seqEl.addEventListener('dragleave', e => { if (!seqEl.contains(e.relatedTarget)) seqEl.classList.remove('mby-drop-over'); });
+  seqEl.addEventListener('drop', e => {
+    if (e.target.closest('.mby-mech-slot')) return;
+    e.preventDefault();
+    seqEl.classList.remove('mby-drop-over');
+    try {
+      const payload = JSON.parse(e.dataTransfer?.getData('application/x-mby-mech-step') || 'null');
+      if (!payload) return;
+      animateSeqUpdate(() => {
+        if (payload.source === 'bank') {
+          st.bankIds = st.bankIds.filter(x => x !== payload.sid);
+          if (!st.placedIds.includes(payload.sid)) st.placedIds.push(payload.sid);
+        } else if (payload.source === 'seq') {
+          st.placedIds = st.placedIds.filter(x => x !== payload.sid);
+          st.placedIds.push(payload.sid);
+        }
+      });
+    } catch {}
+  });
+
   const renderZones = () => {
     bankEl.innerHTML = '';
     if (st.bankIds.length === 0) {
@@ -1625,13 +2306,22 @@ function buildMechanismCard(slide, onAnswered) {
     } else {
       st.bankIds.forEach(sid => {
         const s = stepById.get(sid); if (!s) return;
-        const chip = mk('button', 'mby-mech-chip'); chip.type = 'button';
+        const chip = mk('button', 'mby-mech-chip mby-draggable'); chip.type = 'button';
+        chip.draggable = true;
         chip.innerHTML = s.html; renderMathIn(chip);
+        chip.addEventListener('dragstart', e => {
+          if (e.dataTransfer) {
+            e.dataTransfer.setData('application/x-mby-mech-step', JSON.stringify({ source: 'bank', sid }));
+            e.dataTransfer.effectAllowed = 'move';
+          }
+          chip.classList.add('is-dragging');
+        });
+        chip.addEventListener('dragend', () => chip.classList.remove('is-dragging'));
         chip.addEventListener('click', () => {
-          st.bankIds = st.bankIds.filter(x => x !== sid);
-          st.placedIds.push(sid);
-          renderZones();
-          requestAnimationFrame(updateScrollDownHint);
+          animateSeqUpdate(() => {
+            st.bankIds = st.bankIds.filter(x => x !== sid);
+            st.placedIds.push(sid);
+          });
         });
         bankEl.appendChild(chip);
       });
@@ -1639,30 +2329,70 @@ function buildMechanismCard(slide, onAnswered) {
 
     seqEl.innerHTML = '';
     if (st.placedIds.length === 0) {
-      seqEl.appendChild(mk('div', 'mby-mech-empty', 'Click steps above in causal order (exclude distractors).'));
+      seqEl.appendChild(mk('div', 'mby-mech-empty', 'Click or drag steps above in causal order (exclude distractors).'));
     } else {
       st.placedIds.forEach((sid, idx) => {
         const s = stepById.get(sid); if (!s) return;
-        const slot = mk('div', 'mby-mech-slot');
+        const slot = mk('div', 'mby-mech-slot mby-draggable');
+        slot.draggable = true;
+        slot.dataset.stepId = String(sid);
+        slot.addEventListener('dragstart', e => {
+          if (e.dataTransfer) {
+            e.dataTransfer.setData('application/x-mby-mech-step', JSON.stringify({ source: 'seq', sid }));
+            e.dataTransfer.effectAllowed = 'move';
+          }
+          slot.classList.add('is-dragging');
+        });
+        slot.addEventListener('dragend', () => slot.classList.remove('is-dragging'));
+        slot.addEventListener('dragover', e => {
+          if (e.dataTransfer?.types.includes('application/x-mby-mech-step')) {
+            e.preventDefault();
+            e.stopPropagation();
+            slot.classList.add('mby-drop-over');
+          }
+        });
+        slot.addEventListener('dragleave', () => slot.classList.remove('mby-drop-over'));
+        slot.addEventListener('drop', e => {
+          e.preventDefault();
+          e.stopPropagation();
+          slot.classList.remove('mby-drop-over');
+          seqEl.classList.remove('mby-drop-over');
+          try {
+            const payload = JSON.parse(e.dataTransfer?.getData('application/x-mby-mech-step') || 'null');
+            if (!payload || payload.sid === sid) return;
+            const rect = slot.getBoundingClientRect();
+            const insertAfter = e.clientY > rect.top + (rect.height / 2);
+            animateSeqUpdate(() => {
+              st.bankIds = st.bankIds.filter(x => x !== payload.sid);
+              st.placedIds = st.placedIds.filter(x => x !== payload.sid);
+              const targetIdx = st.placedIds.indexOf(sid);
+              const destIdx = targetIdx < 0 ? st.placedIds.length : (insertAfter ? targetIdx + 1 : targetIdx);
+              st.placedIds.splice(destIdx, 0, payload.sid);
+            });
+          } catch {}
+        });
         const badge = mk('span', 'mby-mech-badge', String(idx + 1));
         const txt = mk('div', 'mby-mech-slot-text'); txt.innerHTML = s.html; renderMathIn(txt);
         const upBtn = mk('button', 'mby-mech-ctrl-btn', '↑'); upBtn.type = 'button'; upBtn.title = 'Move step up'; upBtn.disabled = idx === 0;
         upBtn.addEventListener('click', () => {
           if (idx <= 0) return;
-          const tmp = st.placedIds[idx - 1]; st.placedIds[idx - 1] = st.placedIds[idx]; st.placedIds[idx] = tmp;
-          renderZones();
+          animateSeqUpdate(() => {
+            const tmp = st.placedIds[idx - 1]; st.placedIds[idx - 1] = st.placedIds[idx]; st.placedIds[idx] = tmp;
+          });
         });
         const dnBtn = mk('button', 'mby-mech-ctrl-btn', '↓'); dnBtn.type = 'button'; dnBtn.title = 'Move step down'; dnBtn.disabled = idx === st.placedIds.length - 1;
         dnBtn.addEventListener('click', () => {
           if (idx >= st.placedIds.length - 1) return;
-          const tmp = st.placedIds[idx + 1]; st.placedIds[idx + 1] = st.placedIds[idx]; st.placedIds[idx] = tmp;
-          renderZones();
+          animateSeqUpdate(() => {
+            const tmp = st.placedIds[idx + 1]; st.placedIds[idx + 1] = st.placedIds[idx]; st.placedIds[idx] = tmp;
+          });
         });
         const rmBtn = mk('button', 'mby-mech-ctrl-btn', '✕'); rmBtn.type = 'button'; rmBtn.title = 'Return step to bank';
         rmBtn.addEventListener('click', () => {
-          st.placedIds = st.placedIds.filter(x => x !== sid);
-          st.bankIds.push(sid);
-          renderZones();
+          animateSeqUpdate(() => {
+            st.placedIds = st.placedIds.filter(x => x !== sid);
+            st.bankIds.push(sid);
+          });
         });
         slot.appendChild(badge); slot.appendChild(txt);
         slot.appendChild(mk('div', 'mby-mech-slot-actions', null, [upBtn, dnBtn, rmBtn]));
@@ -1677,6 +2407,23 @@ function buildMechanismCard(slide, onAnswered) {
   layout.appendChild(mk('div', 'mby-mech-section-label', 'Your Sequence'));
   layout.appendChild(seqEl);
   layout.appendChild(canonicalBox);
+
+  const retryBtn = createRetryBtn(() => {
+    const reshuffled = deterministicShuffle(mech.steps || [], `${slide.id}:mech`, s => String(s.stepId));
+    st.bankIds = reshuffled.map(s => s.stepId);
+    st.placedIds = [];
+    st.checked = false;
+    st.isCorrect = null;
+    canonicalBox.innerHTML = '';
+    canonicalBox.classList.add('hidden');
+    feedback.textContent = '';
+    if (explanationBox) explanationBox.classList.add('hidden');
+    retryBtn.classList.add('hidden');
+    renderZones();
+    if (m) m.isCorrect = null;
+    if (onAnswered) onAnswered();
+    requestAnimationFrame(updateScrollDownHint);
+  }, st.checked);
 
   checkBtn.addEventListener('click', () => {
     const canonicalSteps = (mech.steps || []).filter(s => !s.isDistractor).slice().sort((a, b) => a.orderGroup - b.orderGroup);
@@ -1718,12 +2465,13 @@ function buildMechanismCard(slide, onAnswered) {
     feedback.textContent = allOk ? 'Sequence correct!' : 'Review highlighted steps.';
     feedback.style.color = allOk ? 'var(--ok)' : 'var(--bad)';
     feedback.style.fontWeight = '600';
+    retryBtn.classList.remove('hidden');
     if (explanationBox) explanationBox.classList.remove('hidden');
     if (onAnswered) onAnswered();
     requestAnimationFrame(updateScrollDownHint);
   });
 
-  card.appendChild(mk('div', 'mby-card-body', null, [layout, mk('div', 'mby-action-row', null, [checkBtn, feedback]), explanationBox]));
+  card.appendChild(mk('div', 'mby-card-body', null, [layout, mk('div', 'mby-action-row', null, [checkBtn, retryBtn, feedback]), explanationBox]));
   return card;
 }
 
@@ -1794,6 +2542,10 @@ function buildRelabelCard(slide, onAnswered) {
     });
   };
 
+  let renderBankUi = null;
+  let assignChipToBox = null;
+  let actionRow = null;
+
   boxes.forEach(b => {
     const btn = mk('button', 'mby-mask-box ' + styleCls);
     btn.type = 'button';
@@ -1819,6 +2571,24 @@ function buildRelabelCard(slide, onAnswered) {
         recallInputMap.get(b.index)?.focus();
       }
     });
+    if (mode === 'bank') {
+      btn.addEventListener('dragover', e => {
+        if (e.dataTransfer?.types.includes('application/x-mby-relabel-chip')) {
+          e.preventDefault();
+          btn.classList.add('mby-drop-over');
+        }
+      });
+      btn.addEventListener('dragleave', () => btn.classList.remove('mby-drop-over'));
+      btn.addEventListener('drop', e => {
+        e.preventDefault();
+        btn.classList.remove('mby-drop-over');
+        const raw = e.dataTransfer?.getData('application/x-mby-relabel-chip');
+        if (raw !== undefined && raw !== '' && assignChipToBox) {
+          const cid = Number(raw);
+          if (!Number.isNaN(cid)) assignChipToBox(cid, b.index);
+        }
+      });
+    }
     boxBtnMap.set(b.index, btn);
     stage.appendChild(btn);
   });
@@ -1843,13 +2613,24 @@ function buildRelabelCard(slide, onAnswered) {
   layout.appendChild(toolbar);
   layout.appendChild(mk('div', 'mby-relabel-stage-wrap', null, [stage]));
 
-  let renderBankUi = null;
-  let actionRow = null;
-
   if (mode === 'reveal') {
     const knownBtn = mk('button', 'mby-rate-btn' + (st.rating === 'known' ? ' active-known' : ''), 'Got It'); knownBtn.type = 'button';
     const reviewBtn = mk('button', 'mby-rate-btn' + (st.rating === 'needsReview' ? ' active-review' : ''), 'Needs Review'); reviewBtn.type = 'button';
     const feedback = mk('span');
+    const retryBtn = createRetryBtn(() => {
+      st.rating = null; st.checked = false; st.isCorrect = null;
+      st.revealed.clear();
+      knownBtn.classList.remove('active-known');
+      reviewBtn.classList.remove('active-review');
+      boxBtnMap.forEach(btn => btn.classList.remove('revealed', 'correct', 'wrong'));
+      syncBoxVisuals();
+      feedback.textContent = '';
+      if (explanationBox) explanationBox.classList.add('hidden');
+      retryBtn.classList.add('hidden');
+      if (m) { m.isCorrect = null; m.flashcardRating = null; }
+      if (onAnswered) onAnswered();
+      requestAnimationFrame(updateScrollDownHint);
+    }, !!st.rating);
     const rate = r => {
       const ok = r === 'known';
       st.rating = r; st.checked = true; st.isCorrect = ok;
@@ -1865,19 +2646,54 @@ function buildRelabelCard(slide, onAnswered) {
       feedback.textContent = ok ? 'Marked as known!' : 'Flagged for review.';
       feedback.style.color = ok ? 'var(--ok)' : 'var(--bad)';
       feedback.style.fontWeight = '600';
+      retryBtn.classList.remove('hidden');
       if (explanationBox) explanationBox.classList.remove('hidden');
       if (onAnswered) onAnswered();
       requestAnimationFrame(updateScrollDownHint);
     };
     knownBtn.addEventListener('click', () => rate('known'));
     reviewBtn.addEventListener('click', () => rate('needsReview'));
-    actionRow = mk('div', 'mby-action-row', null, [knownBtn, reviewBtn, feedback]);
+    actionRow = mk('div', 'mby-action-row', null, [knownBtn, reviewBtn, retryBtn, feedback]);
   } else if (mode === 'bank') {
     assignListEl = mk('div', 'mby-relabel-assignments');
     bankEl = mk('div', 'mby-relabel-bank');
     const chipById = new Map(st.bankPool.map(it => [it.chipId, it]));
     const checkBtn = mk('button', 'mby-check-btn', 'Check Answer'); checkBtn.type = 'button';
     const feedback = mk('span');
+
+    assignChipToBox = (chipId, targetBoxIdx) => {
+      const destIdx = targetBoxIdx ?? st.activeBoxIdx ?? boxes[0]?.index ?? null;
+      if (destIdx === null) return;
+      for (const [k, v] of Object.entries(st.assignedChipByBox)) {
+        if (v === chipId) delete st.assignedChipByBox[k];
+      }
+      st.assignedChipByBox[destIdx] = chipId;
+      st.checked = false;
+      st.isCorrect = null;
+      boxBtnMap.forEach(btn => btn.classList.remove('correct', 'wrong'));
+      feedback.textContent = '';
+      if (explanationBox) explanationBox.classList.add('hidden');
+      const nextEmpty = boxes.find(b => st.assignedChipByBox[b.index] === undefined);
+      if (nextEmpty) st.activeBoxIdx = nextEmpty.index;
+      syncBoxVisuals();
+      renderBankUi();
+    };
+
+    const retryBtn = createRetryBtn(() => {
+      st.assignedChipByBox = {};
+      st.activeBoxIdx = boxes[0]?.index ?? null;
+      st.checked = false;
+      st.isCorrect = null;
+      boxBtnMap.forEach(btn => btn.classList.remove('correct', 'wrong', 'revealed'));
+      feedback.textContent = '';
+      if (explanationBox) explanationBox.classList.add('hidden');
+      retryBtn.classList.add('hidden');
+      syncBoxVisuals();
+      renderBankUi();
+      if (m) m.isCorrect = null;
+      if (onAnswered) onAnswered();
+      requestAnimationFrame(updateScrollDownHint);
+    }, st.checked);
 
     renderBankUi = () => {
       assignListEl.innerHTML = '';
@@ -1886,7 +2702,7 @@ function buildRelabelCard(slide, onAnswered) {
         const assignedItem = assignedId !== undefined ? chipById.get(assignedId) : null;
         const row = mk('div', 'mby-relabel-assign-row' + (st.activeBoxIdx === b.index ? ' active' : ''));
         row.appendChild(mk('span', 'mby-mech-badge', String(b.index)));
-        row.appendChild(mk('span', null, assignedItem ? assignedItem.label : '(Select a label below)'));
+        row.appendChild(mk('span', null, assignedItem ? assignedItem.label : '(Click or drag a label below)'));
         if (st.checked) {
           const ok = assignedItem && evaluateRecallMatch(assignedItem.label, [b.label, ...(b.aliases || [])], false, rel.caseSensitive) !== 'wrong';
           row.classList.add(ok ? 'correct' : 'wrong');
@@ -1897,26 +2713,40 @@ function buildRelabelCard(slide, onAnswered) {
           syncBoxVisuals();
           renderBankUi();
         });
+        row.addEventListener('dragover', e => {
+          if (e.dataTransfer?.types.includes('application/x-mby-relabel-chip')) {
+            e.preventDefault();
+            row.classList.add('mby-drop-over');
+          }
+        });
+        row.addEventListener('dragleave', () => row.classList.remove('mby-drop-over'));
+        row.addEventListener('drop', e => {
+          e.preventDefault();
+          row.classList.remove('mby-drop-over');
+          const raw = e.dataTransfer?.getData('application/x-mby-relabel-chip');
+          if (raw !== undefined && raw !== '') {
+            const cid = Number(raw);
+            if (!Number.isNaN(cid)) assignChipToBox(cid, b.index);
+          }
+        });
         assignListEl.appendChild(row);
       });
 
       const usedIds = new Set(Object.values(st.assignedChipByBox).filter(v => v !== undefined && v !== null));
       bankEl.innerHTML = '';
       st.bankPool.forEach(item => {
-        const chip = mk('button', 'mby-relabel-bank-chip' + (usedIds.has(item.chipId) ? ' used' : ''), item.label);
+        const chip = mk('button', 'mby-relabel-bank-chip mby-draggable' + (usedIds.has(item.chipId) ? ' used' : ''), item.label);
         chip.type = 'button';
-        chip.addEventListener('click', () => {
-          if (st.activeBoxIdx === null && boxes.length > 0) st.activeBoxIdx = boxes[0].index;
-          if (st.activeBoxIdx === null) return;
-          for (const [k, v] of Object.entries(st.assignedChipByBox)) {
-            if (v === item.chipId) delete st.assignedChipByBox[k];
+        chip.draggable = true;
+        chip.addEventListener('dragstart', e => {
+          if (e.dataTransfer) {
+            e.dataTransfer.setData('application/x-mby-relabel-chip', String(item.chipId));
+            e.dataTransfer.effectAllowed = 'copyMove';
           }
-          st.assignedChipByBox[st.activeBoxIdx] = item.chipId;
-          const nextEmpty = boxes.find(b => st.assignedChipByBox[b.index] === undefined);
-          if (nextEmpty) st.activeBoxIdx = nextEmpty.index;
-          syncBoxVisuals();
-          renderBankUi();
+          chip.classList.add('is-dragging');
         });
+        chip.addEventListener('dragend', () => chip.classList.remove('is-dragging'));
+        chip.addEventListener('click', () => assignChipToBox(item.chipId, null));
         bankEl.appendChild(chip);
       });
     };
@@ -1943,6 +2773,7 @@ function buildRelabelCard(slide, onAnswered) {
       feedback.textContent = allOk ? 'All labels correct!' : 'Review highlighted boxes.';
       feedback.style.color = allOk ? 'var(--ok)' : 'var(--bad)';
       feedback.style.fontWeight = '600';
+      retryBtn.classList.remove('hidden');
       if (explanationBox) explanationBox.classList.remove('hidden');
       if (onAnswered) onAnswered();
       requestAnimationFrame(updateScrollDownHint);
@@ -1951,7 +2782,7 @@ function buildRelabelCard(slide, onAnswered) {
     renderBankUi();
     layout.appendChild(assignListEl);
     layout.appendChild(bankEl);
-    actionRow = mk('div', 'mby-action-row', null, [checkBtn, feedback]);
+    actionRow = mk('div', 'mby-action-row', null, [checkBtn, retryBtn, feedback]);
   } else {
     // recall mode
     const recallPanel = mk('div', 'mby-relabel-recall-panel');
@@ -1975,6 +2806,27 @@ function buildRelabelCard(slide, onAnswered) {
       row.appendChild(expEl);
       recallPanel.appendChild(row);
     });
+
+    const retryBtn = createRetryBtn(() => {
+      st.recallValues = {};
+      st.activeBoxIdx = boxes[0]?.index ?? null;
+      st.checked = false;
+      st.isCorrect = null;
+      boxes.forEach(b => {
+        const inp = recallInputMap.get(b.index), expEl = recallExpectedMap.get(b.index), btn = boxBtnMap.get(b.index);
+        if (inp) { inp.value = ''; inp.classList.remove('correct', 'fuzzy-ok', 'wrong'); }
+        if (expEl) { expEl.textContent = ''; expEl.classList.add('hidden'); }
+        btn?.classList.remove('correct', 'wrong', 'revealed');
+      });
+      syncBoxVisuals();
+      overrideBtn.classList.add('hidden');
+      feedback.textContent = '';
+      if (explanationBox) explanationBox.classList.add('hidden');
+      retryBtn.classList.add('hidden');
+      if (m) m.isCorrect = null;
+      if (onAnswered) onAnswered();
+      requestAnimationFrame(updateScrollDownHint);
+    }, st.checked);
 
     checkBtn.addEventListener('click', () => {
       let allOk = true, anyFuzzy = false;
@@ -2002,10 +2854,11 @@ function buildRelabelCard(slide, onAnswered) {
         if (m.firstTryCorrect === null) m.firstTryCorrect = allOk;
         m.isCorrect = allOk;
       }
-      feedback.textContent = allOk ? (anyFuzzy ? 'Correct (minor typo accepted)!' : 'All labels correct!') : 'Review highlighted labels.';
+      feedback.textContent = allOk ? (anyFuzzy ? 'Almost Correct!' : 'All labels correct!') : 'Review highlighted labels.';
       feedback.style.color = allOk ? 'var(--ok)' : 'var(--bad)';
       feedback.style.fontWeight = '600';
       overrideBtn.classList.toggle('hidden', allOk);
+      retryBtn.classList.remove('hidden');
       if (explanationBox) explanationBox.classList.remove('hidden');
       if (onAnswered) onAnswered();
       requestAnimationFrame(updateScrollDownHint);
@@ -2023,11 +2876,12 @@ function buildRelabelCard(slide, onAnswered) {
       feedback.textContent = 'Marked correct (self-override).';
       feedback.style.color = 'var(--ok)';
       overrideBtn.classList.add('hidden');
+      retryBtn.classList.remove('hidden');
       if (onAnswered) onAnswered();
     });
 
     layout.appendChild(recallPanel);
-    actionRow = mk('div', 'mby-action-row', null, [checkBtn, overrideBtn, feedback]);
+    actionRow = mk('div', 'mby-action-row', null, [checkBtn, overrideBtn, retryBtn, feedback]);
   }
 
   syncBoxVisuals();
@@ -2045,19 +2899,716 @@ function renderFlashcardSide(side, faceLabel, slideMetric, fcState, onRated) {
   if (faceLabel === 'Back') {
     const knownBtn = mk('button', 'mby-rate-btn' + (fcState.rating === 'known' ? ' active-known' : ''), 'Got It'); knownBtn.type = 'button';
     const reviewBtn = mk('button', 'mby-rate-btn' + (fcState.rating === 'needsReview' ? ' active-review' : ''), 'Needs Review'); reviewBtn.type = 'button';
+    const resetBtn = createRetryBtn(() => {
+      fcState.rating = null;
+      if (slideMetric) slideMetric.flashcardRating = null;
+      knownBtn.classList.remove('active-known');
+      reviewBtn.classList.remove('active-review');
+      resetBtn.classList.add('hidden');
+      if (onRated) onRated();
+    }, !!fcState.rating, 'Reset', true);
     const rate = r => {
       fcState.rating = r; if (slideMetric) slideMetric.flashcardRating = r;
       knownBtn.classList.toggle('active-known', r === 'known');
       reviewBtn.classList.toggle('active-review', r === 'needsReview');
+      resetBtn.classList.remove('hidden');
       if (onRated) onRated();
     };
     knownBtn.addEventListener('click', e => { e.stopPropagation(); rate('known'); });
     reviewBtn.addEventListener('click', e => { e.stopPropagation(); rate('needsReview'); });
-    body.appendChild(mk('div', 'mby-rating-row', null, [knownBtn, reviewBtn]));
+    resetBtn.addEventListener('click', e => e.stopPropagation());
+    body.appendChild(mk('div', 'mby-rating-row', null, [knownBtn, reviewBtn, resetBtn]));
   }
 
   return mk('div', 'mby-flashcard-face ' + (faceLabel === 'Back' ? 'mby-flashcard-back' : ''), null,
     [createUpperTab('FLASHCARD'), body, mk('div', 'mby-flashcard-side-label', faceLabel)]);
+}
+
+function buildDiagramExploreBlock(b) {
+  const diag = b.diagramExplore;
+  const wrap = mk('div', 'mby-diagram-wrap');
+  wrap.dataset.blockId = b.id;
+  if (!diag) return wrap;
+
+  const hotspots = diag.hotspots || [];
+  let activeIdx = 0;
+  let showAll = false;
+
+  const head = mk('div', 'mby-diagram-head');
+  if (diag.titleHtml || diag.title) {
+    const tEl = mk('div', 'mby-diagram-title');
+    if (diag.titleHtml) { tEl.innerHTML = diag.titleHtml; renderMathIn(tEl); }
+    else tEl.textContent = diag.title;
+    head.appendChild(tEl);
+  }
+  const nav = mk('div', 'mby-diagram-nav');
+  const prevSpotBtn = mk('button', 'mby-retry-btn is-compact', 'Prev'); prevSpotBtn.type = 'button';
+  const nextSpotBtn = mk('button', 'mby-retry-btn is-compact', 'Next'); nextSpotBtn.type = 'button';
+  const showAllBtn = mk('button', 'mby-retry-btn is-compact', 'Show All'); showAllBtn.type = 'button';
+  const zoomBtn = mk('button', 'mby-retry-btn is-compact', 'Zoom'); zoomBtn.type = 'button';
+  zoomBtn.addEventListener('click', () => openLightbox(diag.imagePath, diag.alt || diag.title || 'Diagram'));
+  nav.appendChild(prevSpotBtn); nav.appendChild(nextSpotBtn); nav.appendChild(showAllBtn); nav.appendChild(zoomBtn);
+  head.appendChild(nav);
+  wrap.appendChild(head);
+
+  const stage = mk('div', 'mby-diagram-stage');
+  const img = mk('img', 'mby-diagram-img');
+  img.src = diag.imagePath;
+  if (diag.alt) img.alt = diag.alt;
+  stage.appendChild(img);
+
+  const spotBtns = hotspots.map((hs, idx) => {
+    const pin = mk('button', 'mby-diagram-hotspot');
+    pin.type = 'button';
+    pin.title = hs.label;
+    pin.style.left = (hs.x * 100).toFixed(4) + '%';
+    pin.style.top = (hs.y * 100).toFixed(4) + '%';
+    pin.style.width = (hs.w * 100).toFixed(4) + '%';
+    pin.style.height = (hs.h * 100).toFixed(4) + '%';
+    pin.appendChild(mk('span', 'mby-diagram-pin', String(idx + 1)));
+    pin.addEventListener('click', () => { activeIdx = idx; showAll = false; syncView(); });
+    stage.appendChild(pin);
+    return pin;
+  });
+  wrap.appendChild(stage);
+
+  if (diag.captionHtml) {
+    const cap = mk('div', 'mby-figcaption');
+    cap.innerHTML = diag.captionHtml;
+    renderMathIn(cap);
+    wrap.appendChild(cap);
+  }
+
+  const cardHost = mk('div');
+  wrap.appendChild(cardHost);
+
+  function syncView() {
+    spotBtns.forEach((btn, idx) => btn.classList.toggle('active', !showAll && idx === activeIdx));
+    showAllBtn.textContent = showAll ? 'Active Only' : 'Show All';
+    cardHost.innerHTML = '';
+    if (hotspots.length === 0) return;
+
+    if (showAll) {
+      const list = mk('div', 'mby-diagram-all-list');
+      hotspots.forEach((hs, idx) => {
+        const c = mk('div', 'mby-diagram-card');
+        c.appendChild(mk('div', 'mby-diagram-card-title', `${idx + 1}. ${hs.label}`));
+        const body = mk('div', 'mby-callout-body');
+        body.innerHTML = hs.noteHtml || '';
+        renderMathIn(body);
+        c.appendChild(body);
+        list.appendChild(c);
+      });
+      cardHost.appendChild(list);
+    } else {
+      const hs = hotspots[Math.max(0, Math.min(activeIdx, hotspots.length - 1))];
+      const c = mk('div', 'mby-diagram-card');
+      c.appendChild(mk('div', 'mby-diagram-card-title', `${activeIdx + 1} / ${hotspots.length} • ${hs.label}`));
+      const body = mk('div', 'mby-callout-body');
+      body.innerHTML = hs.noteHtml || '';
+      renderMathIn(body);
+      c.appendChild(body);
+      cardHost.appendChild(c);
+    }
+    requestAnimationFrame(updateScrollDownHint);
+  }
+
+  prevSpotBtn.addEventListener('click', () => { if (hotspots.length) { showAll = false; activeIdx = (activeIdx - 1 + hotspots.length) % hotspots.length; syncView(); } });
+  nextSpotBtn.addEventListener('click', () => { if (hotspots.length) { showAll = false; activeIdx = (activeIdx + 1) % hotspots.length; syncView(); } });
+  showAllBtn.addEventListener('click', () => { showAll = !showAll; syncView(); });
+  syncView();
+  return wrap;
+}
+
+function buildRevealBlock(b) {
+  const rev = b.reveal;
+  const wrap = mk('div', 'mby-reveal-block');
+  wrap.dataset.blockId = b.id;
+  if (!rev) return wrap;
+
+  const steps = rev.steps || [];
+  let unlocked = rev.showFirst ? Math.min(1, steps.length) : 0;
+
+  const header = mk('div', 'mby-reveal-header');
+  const titleEl = mk('div', 'mby-reveal-title');
+  if (rev.titleHtml) { titleEl.innerHTML = rev.titleHtml; renderMathIn(titleEl); }
+  else titleEl.textContent = rev.title || 'Step-by-Step Reveal';
+  header.appendChild(titleEl);
+
+  const actions = mk('div', 'mby-reveal-actions');
+  const revAllBtn = mk('button', 'mby-retry-btn is-compact', 'Reveal All'); revAllBtn.type = 'button';
+  const resetBtn = mk('button', 'mby-retry-btn is-compact', 'Reset'); resetBtn.type = 'button';
+  actions.appendChild(revAllBtn); actions.appendChild(resetBtn);
+  header.appendChild(actions);
+  wrap.appendChild(header);
+
+  const listEl = mk('div', 'mby-reveal-steps');
+  wrap.appendChild(listEl);
+
+  function renderSteps() {
+    listEl.innerHTML = '';
+    steps.forEach((st, idx) => {
+      const isUnlocked = idx < unlocked;
+      const isNext = idx === unlocked;
+      const row = mk('div', 'mby-reveal-step ' + (isUnlocked ? 'is-unlocked' : (isNext ? 'is-next' : 'is-locked')));
+      const sHead = mk('div', 'mby-reveal-step-head');
+      const titleSpan = mk('span');
+      titleSpan.innerHTML = st.headingHtml || `Step ${idx + 1}`;
+      renderMathIn(titleSpan);
+      sHead.appendChild(titleSpan);
+      sHead.appendChild(mk('span', 'mby-step-counter', `${idx + 1}/${steps.length}`));
+      row.appendChild(sHead);
+
+      if (isUnlocked) {
+        const sBody = mk('div', 'mby-reveal-step-body');
+        sBody.innerHTML = st.bodyHtml || '';
+        renderMathIn(sBody);
+        row.appendChild(sBody);
+      } else if (isNext) {
+        const unlockBtn = mk('button', 'mby-reveal-unlock-btn', `Reveal Step ${idx + 1}`);
+        unlockBtn.type = 'button';
+        unlockBtn.addEventListener('click', () => { unlocked = Math.min(steps.length, unlocked + 1); renderSteps(); });
+        row.appendChild(unlockBtn);
+      }
+      listEl.appendChild(row);
+    });
+    requestAnimationFrame(updateScrollDownHint);
+  }
+
+  revAllBtn.addEventListener('click', () => { unlocked = steps.length; renderSteps(); });
+  resetBtn.addEventListener('click', () => { unlocked = rev.showFirst ? Math.min(1, steps.length) : 0; renderSteps(); });
+  renderSteps();
+  return wrap;
+}
+
+function buildClassifyCard(slide, onAnswered) {
+  const cl = slide.classify;
+  const card = mk('div', 'mby-card', null, [createUpperTab('CLASSIFICATION')]); applySlideLayoutVars(card, slide.layout);
+  const st = gradedStateMap.get(slide.id) || {
+    placements: {},
+    selectedItemId: null,
+    checked: false,
+    isCorrect: null,
+    order: cl.items.map(it => it.itemId).sort(() => Math.random() - 0.5)
+  };
+  gradedStateMap.set(slide.id, st);
+
+  const itemsById = new Map(cl.items.map(it => [it.itemId, it]));
+  const bucketNameById = new Map(cl.buckets.map(b => [b.bucketId, b.name]));
+
+  const body = mk('div', 'mby-card-body');
+  if (cl.titleHtml || cl.title) {
+    const titleEl = mk('div', 'mby-diff-title');
+    if (cl.titleHtml) { titleEl.innerHTML = cl.titleHtml; renderMathIn(titleEl); }
+    else titleEl.textContent = cl.title;
+    body.appendChild(titleEl);
+  }
+
+  const poolEl = mk('div', 'mby-classify-pool');
+  const bucketsEl = mk('div', 'mby-classify-buckets');
+  body.appendChild(poolEl);
+  body.appendChild(bucketsEl);
+
+  const checkBtn = mk('button', 'mby-check-btn', 'Check Answer'); checkBtn.type = 'button';
+  const feedback = mk('span');
+  const explanationBox = createExplanationBox(cl.explanationHtml);
+
+  function assignItem(itemId, bucketId) {
+    if (bucketId === null || bucketId === undefined) delete st.placements[itemId];
+    else st.placements[itemId] = bucketId;
+    st.selectedItemId = null;
+    st.checked = false;
+    st.isCorrect = null;
+    feedback.textContent = '';
+    if (explanationBox) explanationBox.classList.add('hidden');
+    renderClassifyUi();
+  }
+
+  const retryBtn = createRetryBtn(() => {
+    st.placements = {};
+    st.selectedItemId = null;
+    st.checked = false;
+    st.isCorrect = null;
+    feedback.textContent = '';
+    if (explanationBox) explanationBox.classList.add('hidden');
+    retryBtn.classList.add('hidden');
+    renderClassifyUi();
+    const m = metricById.get(slide.id); if (m) m.isCorrect = null;
+    if (onAnswered) onAnswered();
+  }, st.checked);
+
+  function createChipNode(it) {
+    const chip = mk('button', 'mby-classify-chip' + (st.selectedItemId === it.itemId ? ' selected' : ''));
+    chip.type = 'button';
+    chip.draggable = true;
+    const span = mk('span');
+    span.innerHTML = it.html;
+    renderMathIn(span);
+    chip.appendChild(span);
+    if (st.checked) {
+      const placed = st.placements[it.itemId];
+      const ok = placed === it.bucketId;
+      chip.classList.add(ok ? 'correct' : 'wrong');
+      if (!ok) chip.appendChild(mk('span', 'mby-classify-fix', '→ ' + (bucketNameById.get(it.bucketId) || '')));
+    }
+    chip.addEventListener('dragstart', e => {
+      if (e.dataTransfer) { e.dataTransfer.setData('application/x-mby-classify-item', String(it.itemId)); e.dataTransfer.effectAllowed = 'move'; }
+    });
+    chip.addEventListener('click', e => {
+      e.stopPropagation();
+      st.selectedItemId = st.selectedItemId === it.itemId ? null : it.itemId;
+      renderClassifyUi();
+    });
+    return chip;
+  }
+
+  poolEl.addEventListener('dragover', e => { if (e.dataTransfer?.types.includes('application/x-mby-classify-item')) e.preventDefault(); });
+  poolEl.addEventListener('drop', e => {
+    e.preventDefault();
+    const raw = e.dataTransfer?.getData('application/x-mby-classify-item');
+    if (raw !== undefined && raw !== '') assignItem(Number(raw), null);
+  });
+  poolEl.addEventListener('click', () => { if (st.selectedItemId !== null) assignItem(st.selectedItemId, null); });
+
+  function renderClassifyUi() {
+    poolEl.innerHTML = '';
+    const unplaced = st.order.filter(id => st.placements[id] === undefined).map(id => itemsById.get(id)).filter(Boolean);
+    if (unplaced.length === 0) poolEl.appendChild(mk('span', 'mby-diff-subnote', 'All items sorted — click a chip or bucket to adjust.'));
+    else unplaced.forEach(it => poolEl.appendChild(createChipNode(it)));
+
+    bucketsEl.innerHTML = '';
+    cl.buckets.forEach(b => {
+      const box = mk('div', 'mby-classify-bucket' + (st.selectedItemId !== null ? ' target-ready' : ''));
+      const bTitle = mk('div', 'mby-classify-bucket-title');
+      bTitle.innerHTML = b.nameHtml || b.name;
+      renderMathIn(bTitle);
+      box.appendChild(bTitle);
+
+      const itemsRow = mk('div', 'mby-classify-bucket-items');
+      st.order.filter(id => st.placements[id] === b.bucketId).map(id => itemsById.get(id)).filter(Boolean).forEach(it => itemsRow.appendChild(createChipNode(it)));
+      box.appendChild(itemsRow);
+
+      box.addEventListener('dragover', e => { if (e.dataTransfer?.types.includes('application/x-mby-classify-item')) e.preventDefault(); });
+      box.addEventListener('drop', e => {
+        e.preventDefault();
+        const raw = e.dataTransfer?.getData('application/x-mby-classify-item');
+        if (raw !== undefined && raw !== '') assignItem(Number(raw), b.bucketId);
+      });
+      box.addEventListener('click', () => { if (st.selectedItemId !== null) assignItem(st.selectedItemId, b.bucketId); });
+      bucketsEl.appendChild(box);
+    });
+    retryBtn.classList.toggle('hidden', !st.checked);
+  }
+
+  checkBtn.addEventListener('click', () => {
+    const placedCount = cl.items.filter(it => st.placements[it.itemId] !== undefined).length;
+    const ok = placedCount === cl.items.length && cl.items.every(it => st.placements[it.itemId] === it.bucketId);
+    st.checked = true;
+    st.isCorrect = ok;
+    const m = metricById.get(slide.id);
+    if (m) { m.checkAttempts = (m.checkAttempts || 0) + 1; if (m.firstTryCorrect === null) m.firstTryCorrect = ok; m.isCorrect = ok; }
+    feedback.textContent = ok ? `Correct! All ${cl.items.length} items sorted.` : `${cl.items.filter(it => st.placements[it.itemId] === it.bucketId).length} / ${cl.items.length} correct.`;
+    feedback.style.color = ok ? 'var(--ok)' : 'var(--bad)';
+    feedback.style.fontWeight = '600';
+    if (explanationBox) explanationBox.classList.remove('hidden');
+    renderClassifyUi();
+    if (onAnswered) onAnswered();
+  });
+
+  renderClassifyUi();
+  const actionRow = mk('div', 'mby-action-row', null, [checkBtn, retryBtn, feedback]);
+  body.appendChild(actionRow);
+  if (explanationBox) {
+    if (st.checked) explanationBox.classList.remove('hidden');
+    body.appendChild(explanationBox);
+  }
+  card.appendChild(body);
+  return card;
+}
+
+function buildMatchCard(slide, onAnswered) {
+  const mt = slide.match;
+  const card = mk('div', 'mby-card', null, [createUpperTab('MATCHING')]); applySlideLayoutVars(card, slide.layout);
+  const st = gradedStateMap.get(slide.id) || {
+    assignments: {},
+    selectedOptId: null,
+    checked: false,
+    isCorrect: null,
+    poolOrder: mt.rightPool.map(o => o.optionId).sort(() => Math.random() - 0.5)
+  };
+  gradedStateMap.set(slide.id, st);
+
+  const optById = new Map(mt.rightPool.map(o => [o.optionId, o]));
+  const body = mk('div', 'mby-card-body');
+  if (mt.titleHtml || mt.title) {
+    const tEl = mk('div', 'mby-diff-title');
+    if (mt.titleHtml) { tEl.innerHTML = mt.titleHtml; renderMathIn(tEl); }
+    else tEl.textContent = mt.title;
+    body.appendChild(tEl);
+  }
+
+  const wrap = mk('div', 'mby-match-wrap');
+  const rowsEl = mk('div', 'mby-match-rows');
+  const bankEl = mk('div', 'mby-match-bank');
+  wrap.appendChild(rowsEl);
+  wrap.appendChild(bankEl);
+  body.appendChild(wrap);
+
+  const checkBtn = mk('button', 'mby-check-btn', 'Check Answer'); checkBtn.type = 'button';
+  const feedback = mk('span');
+  const explanationBox = createExplanationBox(mt.explanationHtml);
+
+  function assignOption(pairId, optId) {
+    if (optId !== null && optId !== undefined) {
+      for (const [k, v] of Object.entries(st.assignments)) {
+        if (v === optId) delete st.assignments[k];
+      }
+      st.assignments[pairId] = optId;
+    } else {
+      delete st.assignments[pairId];
+    }
+    st.selectedOptId = null;
+    st.checked = false;
+    st.isCorrect = null;
+    feedback.textContent = '';
+    if (explanationBox) explanationBox.classList.add('hidden');
+    renderMatchUi();
+  }
+
+  const retryBtn = createRetryBtn(() => {
+    st.assignments = {};
+    st.selectedOptId = null;
+    st.checked = false;
+    st.isCorrect = null;
+    feedback.textContent = '';
+    if (explanationBox) explanationBox.classList.add('hidden');
+    retryBtn.classList.add('hidden');
+    renderMatchUi();
+    const m = metricById.get(slide.id); if (m) m.isCorrect = null;
+    if (onAnswered) onAnswered();
+  }, st.checked);
+
+  function renderMatchUi() {
+    rowsEl.innerHTML = '';
+    mt.pairs.forEach(pair => {
+      const row = mk('div', 'mby-match-row');
+      const left = mk('div', 'mby-match-left');
+      left.innerHTML = pair.leftHtml;
+      renderMathIn(left);
+      row.appendChild(left);
+
+      const optId = st.assignments[pair.pairId];
+      const assigned = optId !== undefined ? optById.get(optId) : null;
+      const slot = mk('button', 'mby-match-slot' + (assigned ? ' filled' : '') + (st.selectedOptId !== null ? ' target-ready' : ''));
+      slot.type = 'button';
+      if (assigned) {
+        const val = mk('span'); val.innerHTML = assigned.html; renderMathIn(val);
+        slot.appendChild(val);
+        const clr = mk('span', 'mby-diff-subnote', '✕');
+        clr.addEventListener('click', e => { e.stopPropagation(); assignOption(pair.pairId, null); });
+        slot.appendChild(clr);
+      } else {
+        slot.appendChild(mk('span', 'mby-diff-subnote', '(Click or drop match)'));
+      }
+
+      if (st.checked) {
+        const ok = assigned && assigned.correctPairId === pair.pairId;
+        slot.classList.add(ok ? 'correct' : 'wrong');
+        if (!ok) {
+          const expSpan = mk('span', 'mby-diff-fix-badge');
+          expSpan.innerHTML = '→ ' + pair.rightHtml;
+          renderMathIn(expSpan);
+          slot.appendChild(expSpan);
+        }
+      }
+
+      slot.addEventListener('dragover', e => { if (e.dataTransfer?.types.includes('application/x-mby-match-opt')) e.preventDefault(); });
+      slot.addEventListener('drop', e => {
+        e.preventDefault();
+        const raw = e.dataTransfer?.getData('application/x-mby-match-opt');
+        if (raw !== undefined && raw !== '') assignOption(pair.pairId, Number(raw));
+      });
+      slot.addEventListener('click', () => {
+        if (st.selectedOptId !== null) assignOption(pair.pairId, st.selectedOptId);
+        else if (assigned) assignOption(pair.pairId, null);
+      });
+      row.appendChild(slot);
+      rowsEl.appendChild(row);
+    });
+
+    const usedOptIds = new Set(Object.values(st.assignments).filter(v => v !== undefined && v !== null));
+    bankEl.innerHTML = '';
+    st.poolOrder.map(id => optById.get(id)).filter(Boolean).forEach(opt => {
+      const chip = mk('button', 'mby-match-chip' + (usedOptIds.has(opt.optionId) ? ' used' : '') + (st.selectedOptId === opt.optionId ? ' selected' : ''));
+      chip.type = 'button';
+      chip.draggable = true;
+      chip.innerHTML = opt.html;
+      renderMathIn(chip);
+      chip.addEventListener('dragstart', e => {
+        if (e.dataTransfer) { e.dataTransfer.setData('application/x-mby-match-opt', String(opt.optionId)); e.dataTransfer.effectAllowed = 'move'; }
+      });
+      chip.addEventListener('click', () => {
+        st.selectedOptId = st.selectedOptId === opt.optionId ? null : opt.optionId;
+        renderMatchUi();
+      });
+      bankEl.appendChild(chip);
+    });
+    retryBtn.classList.toggle('hidden', !st.checked);
+  }
+
+  checkBtn.addEventListener('click', () => {
+    const okCount = mt.pairs.filter(p => {
+      const oid = st.assignments[p.pairId];
+      return oid !== undefined && optById.get(oid)?.correctPairId === p.pairId;
+    }).length;
+    const ok = okCount === mt.pairs.length;
+    st.checked = true;
+    st.isCorrect = ok;
+    const m = metricById.get(slide.id);
+    if (m) { m.checkAttempts = (m.checkAttempts || 0) + 1; if (m.firstTryCorrect === null) m.firstTryCorrect = ok; m.isCorrect = ok; }
+    feedback.textContent = ok ? 'Correct!' : `${okCount} / ${mt.pairs.length} pairs correct.`;
+    feedback.style.color = ok ? 'var(--ok)' : 'var(--bad)';
+    feedback.style.fontWeight = '600';
+    if (explanationBox) explanationBox.classList.remove('hidden');
+    renderMatchUi();
+    if (onAnswered) onAnswered();
+  });
+
+  renderMatchUi();
+  body.appendChild(mk('div', 'mby-action-row', null, [checkBtn, retryBtn, feedback]));
+  if (explanationBox) {
+    if (st.checked) explanationBox.classList.remove('hidden');
+    body.appendChild(explanationBox);
+  }
+  card.appendChild(body);
+  return card;
+}
+
+function buildNumericCard(slide, onAnswered) {
+  const num = slide.numeric;
+  const card = mk('div', 'mby-card', null, [createUpperTab('NUMERIC')]); applySlideLayoutVars(card, slide.layout);
+  const st = gradedStateMap.get(slide.id) || { value: '', checked: false, isCorrect: null };
+  gradedStateMap.set(slide.id, st);
+
+  const body = mk('div', 'mby-card-body');
+  if (num.imagePath) body.appendChild(makeZoomImg(num.imagePath, 'Question diagram'));
+  const promptEl = mk('div', 'mby-prompt');
+  promptEl.innerHTML = num.promptHtml || '';
+  renderMathIn(promptEl);
+  body.appendChild(promptEl);
+
+  const input = mk('input', 'mby-numeric-input');
+  input.type = 'text';
+  input.inputMode = 'decimal';
+  input.placeholder = num.placeholder || 'Enter numeric value...';
+  input.value = st.value || '';
+
+  const rowChildren = [input];
+  if (num.unit) rowChildren.push(mk('span', 'mby-numeric-unit', num.unit));
+  const rangeEl = mk('span', 'mby-numeric-range');
+  rowChildren.push(rangeEl);
+  body.appendChild(mk('div', 'mby-numeric-row', null, rowChildren));
+
+  const checkBtn = mk('button', 'mby-check-btn', 'Check Answer'); checkBtn.type = 'button';
+  const feedback = mk('span');
+  const explanationBox = createExplanationBox(num.explanationHtml);
+
+  const tolRadius = num.toleranceMode === 'percent' ? Math.abs(num.answer * (num.tolerance / 100)) : Math.abs(num.tolerance);
+
+  function syncVisual() {
+    input.classList.remove('correct', 'wrong');
+    rangeEl.textContent = '';
+    if (st.checked) {
+      input.classList.add(st.isCorrect ? 'correct' : 'wrong');
+      const unitTxt = num.unit ? ` ${num.unit}` : '';
+      if (tolRadius > 0) rangeEl.textContent = `Accepted: ${(num.answer - tolRadius).toPrecision(4)} .. ${(num.answer + tolRadius).toPrecision(4)}${unitTxt}`;
+      else rangeEl.textContent = `Exact answer: ${num.answer}${unitTxt}`;
+      feedback.textContent = st.isCorrect ? 'Correct!' : 'Out of accepted range.';
+      feedback.style.color = st.isCorrect ? 'var(--ok)' : 'var(--bad)';
+      feedback.style.fontWeight = '600';
+      if (explanationBox) explanationBox.classList.remove('hidden');
+    } else {
+      feedback.textContent = '';
+      if (explanationBox) explanationBox.classList.add('hidden');
+    }
+    retryBtn.classList.toggle('hidden', !st.checked);
+  }
+
+  const retryBtn = createRetryBtn(() => {
+    st.value = ''; st.checked = false; st.isCorrect = null;
+    input.value = '';
+    syncVisual();
+    const m = metricById.get(slide.id); if (m) m.isCorrect = null;
+    if (onAnswered) onAnswered();
+  }, st.checked);
+
+  input.addEventListener('input', () => {
+    st.value = input.value;
+    if (st.checked) { st.checked = false; st.isCorrect = null; syncVisual(); }
+  });
+  function gradeNumeric() {
+    const cleaned = (st.value || '').trim().replace(/,/g, '');
+    const parsed = cleaned === '' ? NaN : Number(cleaned);
+    const ok = Number.isFinite(parsed) && Math.abs(parsed - num.answer) <= tolRadius + 1e-9;
+    st.checked = true;
+    st.isCorrect = ok;
+    const m = metricById.get(slide.id);
+    if (m) { m.checkAttempts = (m.checkAttempts || 0) + 1; if (m.firstTryCorrect === null) m.firstTryCorrect = ok; m.isCorrect = ok; }
+    syncVisual();
+    if (onAnswered) onAnswered();
+  }
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); gradeNumeric(); } });
+  checkBtn.addEventListener('click', gradeNumeric);
+
+  syncVisual();
+  body.appendChild(mk('div', 'mby-action-row', null, [checkBtn, retryBtn, feedback]));
+  if (explanationBox) body.appendChild(explanationBox);
+  card.appendChild(body);
+  return card;
+}
+
+function renderSingleQuestionWidget(q, onChanged, onFlipStart, onFlipEnd) {
+  if (q.kind === 'mcq') return buildMcqCard(q, onChanged);
+  if (q.kind === 'flashcard') return buildFlashcardPanel(q, onChanged, onFlipStart, onFlipEnd);
+  if (q.kind === 'fill-blank') return buildFillBlankCard(q, onChanged);
+  if (q.kind === 'assertion-reason') return buildAssertionReasonCard(q, onChanged);
+  if (q.kind === 'spot-error') return buildSpotErrorCard(q, onChanged);
+  if (q.kind === 'diff') return buildDiffCard(q, onChanged);
+  if (q.kind === 'mechanism') return buildMechanismCard(q, onChanged);
+  if (q.kind === 'relabel') return buildRelabelCard(q, onChanged);
+  if (q.kind === 'classify') return buildClassifyCard(q, onChanged);
+  if (q.kind === 'match') return buildMatchCard(q, onChanged);
+  if (q.kind === 'numeric') return buildNumericCard(q, onChanged);
+  if (q.kind === 'case') return buildCaseGroupCard(q, onChanged);
+  return mk('div', 'mby-card', 'Unsupported question type: ' + q.kind);
+}
+
+function buildCaseGroupCard(slide, onAnswered) {
+  const cs = slide.caseGroup;
+  const subQuestions = cs.questions || [];
+  const card = mk('div', 'mby-card', null, [createUpperTab(cs.title ? 'CASE STUDY • ' + cs.title : 'CASE STUDY')]);
+  applySlideLayoutVars(card, slide.layout);
+
+  const st = gradedStateMap.get(slide.id) || { activePartIdx: 0, checked: false, isCorrect: null };
+  gradedStateMap.set(slide.id, st);
+
+  subQuestions.forEach((sq, idx) => {
+    if (!metricById.has(sq.id)) {
+      metricById.set(sq.id, {
+        slideIndex: idx + 1, id: sq.id, kind: sq.kind, timeSpentMs: 0, visitedCount: 0,
+        checkAttempts: isGradedKind(sq.kind) ? 0 : null,
+        selectedOptionIndices: sq.kind === 'mcq' ? [] : null,
+        correctOptionIndices: sq.kind === 'mcq' ? (sq.mcq?.options || []).filter(o => o.isCorrect).map(o => o.index) : null,
+        firstTryCorrect: null, isCorrect: null, flipCount: sq.kind === 'flashcard' ? 0 : null, flashcardRating: null
+      });
+    }
+  });
+
+  const body = mk('div', 'mby-card-body');
+  const useSplit = !!cs.imagePath || stripHtmlToText(cs.stemHtml).length > 160;
+  const layout = mk('div', 'mby-case-layout' + (useSplit ? ' has-split' : ''));
+
+  const stemBox = mk('div', 'mby-case-stem');
+  const stemHeader = mk('div', 'mby-link-popover-head');
+  stemHeader.appendChild(mk('span', 'mby-case-stem-badge', 'Case Stem'));
+  const scoreBadge = mk('span', 'mby-step-counter');
+  stemHeader.appendChild(scoreBadge);
+  stemBox.appendChild(stemHeader);
+
+  const stemContent = mk('div');
+  stemContent.innerHTML = cs.stemHtml || '';
+  renderMathIn(stemContent);
+  stemBox.appendChild(stemContent);
+
+  if (cs.imagePath) {
+    const imgWrap = makeZoomImg(cs.imagePath, cs.title || 'Case figure');
+    stemBox.appendChild(imgWrap);
+    if (cs.captionHtml) {
+      const capEl = mk('div', 'mby-figcaption');
+      capEl.innerHTML = cs.captionHtml;
+      renderMathIn(capEl);
+      stemBox.appendChild(capEl);
+    }
+  }
+  layout.appendChild(stemBox);
+
+  const mainCol = mk('div', 'mby-case-main');
+  const tabsRow = mk('div', 'mby-case-tabs');
+  const subHost = mk('div', 'mby-case-subhost');
+  const explanationBox = createExplanationBox(cs.explanationHtml);
+  mainCol.appendChild(tabsRow);
+  mainCol.appendChild(subHost);
+  layout.appendChild(mainCol);
+  body.appendChild(layout);
+  if (explanationBox) body.appendChild(explanationBox);
+  card.appendChild(body);
+
+  function recomputeAggregate() {
+    const gradedSubs = subQuestions.filter(sq => isGradedKind(sq.kind));
+    const gradedMetrics = gradedSubs.map(sq => metricById.get(sq.id));
+    const correctCount = gradedMetrics.filter(sm => sm?.isCorrect === true).length;
+    const attemptsSum = gradedMetrics.reduce((acc, sm) => acc + (sm?.checkAttempts || 0), 0);
+    const allChecked = gradedMetrics.length > 0 && gradedMetrics.every(sm => (sm?.checkAttempts || 0) > 0);
+    const allCorrect = allChecked && gradedMetrics.every(sm => sm?.isCorrect === true);
+    const allFirstTry = allChecked && gradedMetrics.every(sm => sm?.firstTryCorrect === true);
+
+    scoreBadge.textContent = gradedSubs.length > 0
+      ? `${correctCount} / ${gradedSubs.length} parts correct`
+      : `${subQuestions.length} parts`;
+
+    st.checked = allChecked;
+    st.isCorrect = allChecked ? allCorrect : null;
+    const parentMetric = metricById.get(slide.id);
+    if (parentMetric) {
+      parentMetric.checkAttempts = attemptsSum;
+      parentMetric.isCorrect = allChecked ? allCorrect : null;
+      parentMetric.firstTryCorrect = allChecked ? allFirstTry : null;
+    }
+    if (explanationBox && allChecked) explanationBox.classList.remove('hidden');
+  }
+
+  function renderTabsAndActiveSub() {
+    recomputeAggregate();
+    tabsRow.innerHTML = '';
+    subQuestions.forEach((sq, idx) => {
+      const sm = metricById.get(sq.id);
+      const cls = ['mby-case-tab'];
+      if (idx === st.activePartIdx) cls.push('active');
+      if (sm && sm.isCorrect === true) cls.push('correct');
+      else if (sm && sm.isCorrect === false) cls.push('wrong');
+      else if (sm && sm.flashcardRating) cls.push('correct');
+      const tab = mk('button', cls.join(' '), `Part ${idx + 1}`);
+      tab.type = 'button';
+      tab.addEventListener('click', () => { st.activePartIdx = idx; renderTabsAndActiveSub(); });
+      tabsRow.appendChild(tab);
+    });
+
+    subHost.innerHTML = '';
+    const activeSq = subQuestions[Math.max(0, Math.min(st.activePartIdx, subQuestions.length - 1))];
+    if (activeSq) {
+      subHost.appendChild(renderSingleQuestionWidget(activeSq, () => {
+        recomputeAggregate();
+        renderTabsOnly();
+        if (onAnswered) onAnswered();
+      }));
+    }
+    requestAnimationFrame(updateScrollDownHint);
+  }
+
+  function renderTabsOnly() {
+    Array.from(tabsRow.children).forEach((tab, idx) => {
+      const sq = subQuestions[idx];
+      const sm = sq ? metricById.get(sq.id) : null;
+      tab.classList.toggle('active', idx === st.activePartIdx);
+      tab.classList.toggle('correct', !!(sm && (sm.isCorrect === true || sm.flashcardRating)));
+      tab.classList.toggle('wrong', !!(sm && sm.isCorrect === false));
+    });
+  }
+
+  function stripHtmlToText(html) { return htmlToPlainText(html || ''); }
+
+  renderTabsAndActiveSub();
+  return card;
 }
 
 function buildFlashcardPanel(slide, onRated, onFlipStart, onFlipEnd) {
@@ -2114,14 +3665,7 @@ function buildBundledQuiz(quizSlide) {
     };
     const onFlipStart = (h, ms) => { qViewport.style.transition = 'height ' + ms + 'ms cubic-bezier(0.4, 0, 0.2, 1)'; if (h > 0) qViewport.style.height = h + 'px'; };
     const onFlipEnd = () => { qViewport.style.transition = ''; syncQuizViewportHeight(activeQuizQuestionIdx.get(quizSlide.id) || 0); };
-    if (q.kind === 'mcq') qSlide.appendChild(buildMcqCard(q, onItemChanged));
-    else if (q.kind === 'flashcard') qSlide.appendChild(buildFlashcardPanel(q, onItemChanged, onFlipStart, onFlipEnd));
-    else if (q.kind === 'fill-blank') qSlide.appendChild(buildFillBlankCard(q, onItemChanged));
-    else if (q.kind === 'assertion-reason') qSlide.appendChild(buildAssertionReasonCard(q, onItemChanged));
-    else if (q.kind === 'spot-error') qSlide.appendChild(buildSpotErrorCard(q, onItemChanged));
-    else if (q.kind === 'diff') qSlide.appendChild(buildDiffCard(q, onItemChanged));
-    else if (q.kind === 'mechanism') qSlide.appendChild(buildMechanismCard(q, onItemChanged));
-    else if (q.kind === 'relabel') qSlide.appendChild(buildRelabelCard(q, onItemChanged));
+    if (q) qSlide.appendChild(renderSingleQuestionWidget(q, onItemChanged, onFlipStart, onFlipEnd));
     qSlides.push(qSlide); qTrack.appendChild(qSlide);
   });
 
@@ -2226,6 +3770,10 @@ function updateScrollDownHint() {
   scrollDownBtn.classList.remove('hidden');
 }
 
+function getHumanKindLabel(kind) {
+  return ({ article: 'Article', quiz: 'Quiz', mcq: 'MCQ', flashcard: 'Flashcard', 'fill-blank': 'Fill in the Blank', 'assertion-reason': 'Assertion–Reason', 'spot-error': 'Spot the Error', diff: 'Differentiation', mechanism: 'Mechanism', relabel: 'Relabel the Image', classify: 'Classification', match: 'Matching', numeric: 'Numeric', case: 'Case Study' })[kind] || String(kind || 'Item').toUpperCase();
+}
+
 function openFinishScreen(triggerSave) {
   isFinished = true;
   if (scrollDownBtn) scrollDownBtn.classList.add('hidden');
@@ -2237,20 +3785,48 @@ function openFinishScreen(triggerSave) {
   activeLeafEnterMs = null;
   finishScreen.innerHTML = '';
   const body = mk('div', 'mby-card-body');
-  body.appendChild(mk('div', 'mby-summary-header', null, [mk('h2', null, report.title || report.workspaceId), mk('div', 'mby-summary-meta', `${report.workspaceId}  •  Completed in ${(report.totalDurationMs / 1000).toFixed(1)}s`)]));
+  body.dataset.workspaceId = report.workspaceId;
+  body.appendChild(mk('div', 'mby-summary-header', null, [
+    mk('h2', null, report.title || 'Session Summary'),
+    mk('div', 'mby-summary-meta', `Completed in ${(report.totalDurationMs / 1000).toFixed(1)}s`)
+  ]));
 
-  const grid = mk('div', 'mby-stats-grid', null, [
-    ['Graded Score', `${report.summary.mcqCorrectFinal} / ${report.summary.mcqTotal}`],
-    ['Accuracy', `${report.summary.mcqAccuracyPercent.toFixed(1)}%`],
-    ['Flashcards Known', `${report.summary.flashcardKnown} / ${report.summary.flashcardTotal}`],
-    ['Articles Viewed', `${report.summary.articleSlidesViewed}`]
-  ].map(([l, v]) => mk('div', 'mby-stat-box', null, [mk('div', 'mby-stat-label', l), mk('div', 'mby-stat-value', v)])));
-  body.appendChild(grid);
+  const statItems = [];
+  if (report.summary.mcqTotal > 0) {
+    statItems.push(['Graded Score', `${report.summary.mcqCorrectFinal} / ${report.summary.mcqTotal}`]);
+    statItems.push(['Accuracy', `${report.summary.mcqAccuracyPercent.toFixed(1)}%`]);
+  }
+  if (report.summary.flashcardTotal > 0) {
+    statItems.push(['Flashcards Known', `${report.summary.flashcardKnown} / ${report.summary.flashcardTotal}`]);
+  }
+  const articleTotal = report.slides.filter(s => s.kind === 'article').length;
+  if (articleTotal > 0) {
+    statItems.push(['Articles Viewed', `${report.summary.articleSlidesViewed} / ${articleTotal}`]);
+  }
+  if (statItems.length > 0) {
+    const grid = mk('div', 'mby-stats-grid', null, statItems.map(([l, v]) => mk('div', 'mby-stat-box', null, [mk('div', 'mby-stat-label', l), mk('div', 'mby-stat-value', v)])));
+    body.appendChild(grid);
+  }
 
-  if (report.weakItemIds.length === 0) {
-    body.appendChild(mk('div', 'mby-review-box ok', 'All graded questions & flashcards look solid — no review flags raised.'));
+  if (report.summary.mcqTotal === 0 && report.summary.flashcardTotal === 0) {
+    body.appendChild(mk('div', 'mby-review-box ok', `Reading session complete — ${report.summary.articleSlidesViewed} of ${articleTotal} article(s) viewed.`));
+  } else if (report.weakItemIds.length === 0) {
+    const okMsg = report.summary.flashcardTotal === 0
+      ? 'All graded questions look solid — no review flags raised.'
+      : (report.summary.mcqTotal === 0 ? 'All flashcards rated known — no review flags raised.' : 'All graded questions & flashcards look solid — no review flags raised.');
+    body.appendChild(mk('div', 'mby-review-box ok', okMsg));
   } else {
-    const chips = mk('div', 'mby-weak-chips', null, report.weakItemIds.map(id => { const s = metricBySlideId.get(id); return mk('span', 'mby-weak-chip', s ? `#${s.slideIndex} ${s.kind.toUpperCase()} • ${id}` : id); }));
+    const chips = mk('div', 'mby-weak-chips', null, report.weakItemIds.map(id => {
+      const s = metricBySlideId.get(id);
+      const chip = mk('button', 'mby-weak-chip', s ? `#${s.slideIndex} ${getHumanKindLabel(s.kind)}` : 'Review Item');
+      chip.type = 'button';
+      chip.dataset.questionId = id;
+      chip.addEventListener('click', () => {
+        const entry = SEARCH_INDEX.find(e => e.leafId === id);
+        if (entry) jumpToSearchEntry(entry);
+      });
+      return chip;
+    }));
     body.appendChild(mk('div', 'mby-review-box warn', null, [mk('div', 'mby-review-title', `Needs Review (${report.weakItemIds.length})`), chips]));
   }
 
@@ -2260,9 +3836,12 @@ function openFinishScreen(triggerSave) {
     if (isGradedKind(s.kind)) { statusText = s.isCorrect === true ? 'Correct' : 'Missed'; statusCls = s.isCorrect === true ? 'ok' : 'bad'; activity = `Checks: ${s.checkAttempts || 0} • Visits: ${s.visitedCount}`; }
     else if (s.kind === 'flashcard') { statusText = s.flashcardRating === 'known' ? 'Known' : (s.flashcardRating === 'needsReview' ? 'Review' : 'Unrated'); statusCls = s.flashcardRating === 'known' ? 'ok' : (s.flashcardRating === 'needsReview' ? 'bad' : 'muted'); activity = `Flips: ${s.flipCount || 0} • Visits: ${s.visitedCount}`; }
     const left = mk('div', 'mby-breakdown-left'), right = mk('div', 'mby-breakdown-right');
-    left.innerHTML = `<span class="mby-idx-badge">#${s.slideIndex}</span><div><div class="mby-item-kind">${escapeHtml(s.kind.toUpperCase())}</div><div class="mby-item-sub">${escapeHtml(activity)} • <code>${escapeHtml(s.id)}</code></div></div>`;
+    left.innerHTML = `<span class="mby-idx-badge">#${s.slideIndex}</span><div><div class="mby-item-kind">${escapeHtml(getHumanKindLabel(s.kind))}</div><div class="mby-item-sub">${escapeHtml(activity)}</div></div>`;
     right.innerHTML = `<span class="mby-status-pill ${statusCls}">${statusText}</span><span class="mby-item-sub">${(s.timeSpentMs / 1000).toFixed(1)}s</span>`;
-    return mk('div', 'mby-breakdown-item', null, [left, right]);
+    const rowEl = mk('div', 'mby-breakdown-item', null, [left, right]);
+    rowEl.dataset.componentId = s.id;
+    rowEl.dataset.slideKind = s.kind;
+    return rowEl;
   }));
   body.appendChild(list); body.appendChild(mk('hr', 'mby-divider'));
 
@@ -2358,7 +3937,12 @@ function navigateNext() {
 
 function renderSlides() {
   document.documentElement.style.setProperty('--slide-ms', (DATA.slideTransitionMs || '380') + 'ms');
-  greetingMeta.textContent = `${DATA.slides.length} component(s)  •  ${leafSlides.length} item(s)`;
+  const articleCount = DATA.slides.filter(s => s.kind === 'article').length;
+  const questionCount = leafSlides.filter(s => s.kind !== 'article').length;
+  const greetingParts = [];
+  if (articleCount > 0) greetingParts.push(`${articleCount} Article${articleCount === 1 ? '' : 's'}`);
+  if (questionCount > 0) greetingParts.push(`${questionCount} Question${questionCount === 1 ? '' : 's'}`);
+  greetingMeta.textContent = greetingParts.join('  •  ');
   populateGeneratorFooter(greetingGeneratorFooter, false);
 
   DATA.slides.forEach((slide, idx) => {
@@ -2389,6 +3973,12 @@ function renderSlides() {
         if (b.kind === 'table' && b.table) {
           return buildNativeTableBlock(b);
         }
+        if (b.kind === 'diagram-explore' && b.diagramExplore) {
+          return buildDiagramExploreBlock(b);
+        }
+        if (b.kind === 'reveal' && b.reveal) {
+          return buildRevealBlock(b);
+        }
         if (b.imagePath) {
           const plainCap = htmlToPlainText(b.captionHtml);
           const figChildren = [makeZoomImg(b.imagePath, b.alt || plainCap)];
@@ -2407,14 +3997,7 @@ function renderSlides() {
       card.appendChild(mk('div', 'mby-card-body', null, [stack]));
       slideEl.appendChild(card);
     } else if (slide.kind === 'quiz') slideEl.appendChild(buildBundledQuiz(slide));
-    else if (slide.kind === 'mcq') slideEl.appendChild(buildMcqCard(slide, null));
-    else if (slide.kind === 'flashcard') slideEl.appendChild(buildFlashcardPanel(slide, null));
-    else if (slide.kind === 'fill-blank') slideEl.appendChild(buildFillBlankCard(slide, null));
-    else if (slide.kind === 'assertion-reason') slideEl.appendChild(buildAssertionReasonCard(slide, null));
-    else if (slide.kind === 'spot-error') slideEl.appendChild(buildSpotErrorCard(slide, null));
-    else if (slide.kind === 'diff') slideEl.appendChild(buildDiffCard(slide, null));
-    else if (slide.kind === 'mechanism') slideEl.appendChild(buildMechanismCard(slide, null));
-    else if (slide.kind === 'relabel') slideEl.appendChild(buildRelabelCard(slide, null));
+    else slideEl.appendChild(renderSingleQuestionWidget(slide, null));
 
     slideEl.addEventListener('scroll', updateScrollDownHint, { passive: true });
     track.appendChild(slideEl);
@@ -2424,6 +4007,8 @@ function renderSlides() {
   track.addEventListener('transitionend', e => { if (e.target === track && e.propertyName === 'transform') requestAnimationFrame(updateScrollDownHint); });
   window.addEventListener('resize', () => requestAnimationFrame(updateScrollDownHint));
   if (scrollDownBtn) scrollDownBtn.addEventListener('click', () => track.children[currentIndex]?.scrollBy({ top: 180, behavior: 'smooth' }));
+  initLinkPreviewCache();
+  applyInitialArticleHashRoute();
 }
 
 startSessionBtn.addEventListener('click', () => {
@@ -2487,6 +4072,24 @@ const SEARCH_INDEX = (() => {
       if (q.relabel.promptHtml) parts.push(htmlToPlainText(q.relabel.promptHtml));
       (q.relabel.boxes || []).forEach(b => { parts.push(b.label); if (b.aliases) parts.push(b.aliases.join(' ')); });
       if (q.relabel.explanationHtml) parts.push(htmlToPlainText(q.relabel.explanationHtml));
+    } else if (q.classify) {
+      if (q.classify.titleHtml) parts.push(htmlToPlainText(q.classify.titleHtml));
+      (q.classify.buckets || []).forEach(b => parts.push(b.name));
+      (q.classify.items || []).forEach(it => parts.push(htmlToPlainText(it.html)));
+      if (q.classify.explanationHtml) parts.push(htmlToPlainText(q.classify.explanationHtml));
+    } else if (q.match) {
+      if (q.match.titleHtml) parts.push(htmlToPlainText(q.match.titleHtml));
+      (q.match.pairs || []).forEach(p => { parts.push(htmlToPlainText(p.leftHtml)); parts.push(htmlToPlainText(p.rightHtml)); });
+      if (q.match.explanationHtml) parts.push(htmlToPlainText(q.match.explanationHtml));
+    } else if (q.numeric) {
+      parts.push(htmlToPlainText(q.numeric.promptHtml));
+      if (q.numeric.unit) parts.push(q.numeric.unit);
+      if (q.numeric.explanationHtml) parts.push(htmlToPlainText(q.numeric.explanationHtml));
+    } else if (q.caseGroup) {
+      if (q.caseGroup.titleHtml) parts.push(htmlToPlainText(q.caseGroup.titleHtml));
+      parts.push(htmlToPlainText(q.caseGroup.stemHtml));
+      (q.caseGroup.questions || []).forEach(sq => collectQuestionSearchText(sq, parts));
+      if (q.caseGroup.explanationHtml) parts.push(htmlToPlainText(q.caseGroup.explanationHtml));
     }
   };
   DATA.slides.forEach((slide, slideIdx) => {
@@ -2506,28 +4109,345 @@ const SEARCH_INDEX = (() => {
           if (b.table.captionHtml) parts.push(htmlToPlainText(b.table.captionHtml));
           if (b.table.footnoteHtml) parts.push(htmlToPlainText(b.table.footnoteHtml));
         }
+        if (b.diagramExplore) {
+          if (b.diagramExplore.title) parts.push(b.diagramExplore.title);
+          (b.diagramExplore.hotspots || []).forEach(hs => parts.push(hs.label + ' ' + htmlToPlainText(hs.noteHtml)));
+        }
+        if (b.reveal) {
+          if (b.reveal.title) parts.push(b.reveal.title);
+          (b.reveal.steps || []).forEach(st => parts.push(htmlToPlainText(st.headingHtml) + ' ' + htmlToPlainText(st.bodyHtml)));
+        }
         const rawText = parts.join(' ').replace(/\s+/g, ' ').trim();
-        if (rawText) entries.push({ slideIdx, qIdx: null, blockId: b.id, title: `${slideName} • ${b.kind.toUpperCase()}`, rawText, lower: rawText.toLowerCase() });
+        if (rawText) {
+          const badge = b.kind === 'table' ? 'TABLE' : (b.kind === 'callout' ? 'CALLOUT' : (b.kind === 'diagram-explore' ? 'DIAGRAM' : (b.kind === 'reveal' ? 'REVEAL' : (b.kind === 'image' ? 'FIGURE' : 'ARTICLE'))));
+          entries.push({
+            slideIdx, qIdx: null, blockId: b.id, leafId: slide.id, kind: 'article', badge,
+            componentTitle: slideName, title: b.title || b.table?.title || b.diagramExplore?.title || b.reveal?.title || slideName,
+            refKey: slide.refKey || '', titleLower: (slideName + ' ' + (b.title || '')).toLowerCase(),
+            rawText, lower: rawText.toLowerCase()
+          });
+        }
       });
     } else if (slide.kind === 'quiz' && Array.isArray(slide.questions)) {
       slide.questions.forEach((q, qIdx) => {
         const parts = [slideName];
         collectQuestionSearchText(q, parts);
         const rawText = parts.join(' ').replace(/\s+/g, ' ').trim();
-        if (rawText) entries.push({ slideIdx, qIdx, blockId: null, title: `${slideName} • Q${qIdx + 1}`, rawText, lower: rawText.toLowerCase() });
+        if (rawText) {
+          entries.push({
+            slideIdx, qIdx, blockId: null, leafId: q.id, kind: 'question', badge: `Q${qIdx + 1} • ${getHumanKindLabel(q.kind).toUpperCase()}`,
+            componentTitle: slideName, title: `${slideName} • Q${qIdx + 1}`,
+            refKey: q.refKey || '', titleLower: (slideName + ' q' + (qIdx + 1) + ' ' + getHumanKindLabel(q.kind)).toLowerCase(),
+            rawText, lower: rawText.toLowerCase()
+          });
+        }
       });
-    } else if (slide.mcq || slide.flashcard || slide.fillBlank || slide.assertionReason || slide.spotError || slide.differentiation || slide.mechanism || slide.relabel) {
+    } else if (slide.mcq || slide.flashcard || slide.fillBlank || slide.assertionReason || slide.spotError || slide.differentiation || slide.mechanism || slide.relabel || slide.classify || slide.match || slide.numeric || slide.caseGroup) {
       const parts = [slideName];
       collectQuestionSearchText(slide, parts);
       const rawText = parts.join(' ').replace(/\s+/g, ' ').trim();
-      if (rawText) entries.push({ slideIdx, qIdx: null, blockId: null, title: slideName, rawText, lower: rawText.toLowerCase() });
+      if (rawText) {
+        entries.push({
+          slideIdx, qIdx: null, blockId: null, leafId: slide.id, kind: 'question', badge: getHumanKindLabel(slide.kind).toUpperCase(),
+          componentTitle: slideName, title: slideName,
+          refKey: slide.refKey || '', titleLower: (slideName + ' ' + getHumanKindLabel(slide.kind)).toLowerCase(),
+          rawText, lower: rawText.toLowerCase()
+        });
+      }
     }
   });
   return entries;
 })();
 
+const linkCardCache = new Map();
+const inSessionArticleCache = new Map();
+const externalSessionPreviewCache = new Map();
+const loadedPreviewDirs = new Set();
+
+window.__mbyRegisterSessionPreview = function(payload) {
+  if (!payload || !payload.sessionId) return;
+  externalSessionPreviewCache.set(payload.sessionId, payload);
+};
+
+function findArticleSlideIndex(target) {
+  if (!target) return -1;
+  const t = String(target).trim().toLowerCase();
+  for (let i = 0; i < DATA.slides.length; i++) {
+    const s = DATA.slides[i];
+    if (s.kind !== 'article') continue;
+    if (s.id && s.id.toLowerCase() === t) return i;
+    if (s.refKey && s.refKey.toLowerCase() === t) return i;
+    if (`c${s.componentIndex || (i + 1)}` === t) return i;
+  }
+  return -1;
+}
+
+function initLinkPreviewCache() {
+  Object.values(DATA.linkCards || {}).forEach(c => {
+    if (c && c.id) linkCardCache.set(String(c.id).toLowerCase(), c);
+  });
+
+  DATA.slides.forEach((s, slideIdx) => {
+    if (s.kind !== 'article') return;
+    const parts = [];
+    (s.articleBlocks || []).forEach(b => {
+      if (b.title) parts.push(b.title);
+      if (b.textHtml) parts.push(htmlToPlainText(b.textHtml));
+      if (b.table) {
+        if (b.table.title) parts.push(b.table.title);
+        (b.table.headersHtml || []).forEach(h => parts.push(htmlToPlainText(h)));
+        (b.table.rowsHtml || []).forEach(r => r.forEach(c => parts.push(htmlToPlainText(c))));
+      }
+      if (b.diagramExplore) {
+        if (b.diagramExplore.title) parts.push(b.diagramExplore.title);
+        (b.diagramExplore.hotspots || []).forEach(hs => parts.push(hs.label + ': ' + htmlToPlainText(hs.noteHtml)));
+      }
+      if (b.reveal) {
+        if (b.reveal.title) parts.push(b.reveal.title);
+        (b.reveal.steps || []).forEach(st => parts.push(htmlToPlainText(st.headingHtml) + ' ' + htmlToPlainText(st.bodyHtml)));
+      }
+    });
+    const rawExcerpt = parts.join(' ').replace(/\s+/g, ' ').trim();
+    const excerpt = rawExcerpt.length > 520 ? (rawExcerpt.slice(0, 519).trimEnd() + '…') : rawExcerpt;
+    const cIdx = s.componentIndex || (slideIdx + 1);
+    const entry = { slideIdx, title: s.title || `Article ${cIdx}`, excerpt };
+    if (s.id) inSessionArticleCache.set(String(s.id).toLowerCase(), entry);
+    if (s.refKey) inSessionArticleCache.set(String(s.refKey).toLowerCase(), entry);
+    inSessionArticleCache.set(`c${cIdx}`, entry);
+  });
+
+  Object.entries(DATA.externalPreviews || {}).forEach(([sid, payload]) => {
+    if (payload) externalSessionPreviewCache.set(sid, payload);
+  });
+
+  document.querySelectorAll('.mby-native-link[data-mby-kind="session"]').forEach(anchor => {
+    const dir = anchor.dataset.mbyPreviewDir;
+    if (!dir || loadedPreviewDirs.has(dir)) return;
+    loadedPreviewDirs.add(dir);
+    const sc = document.createElement('script');
+    sc.async = true;
+    sc.src = dir.replace(/\/+$/, '') + '/preview-index.js';
+    sc.onerror = () => {};
+    document.head.appendChild(sc);
+  });
+}
+
+function applyInitialArticleHashRoute() {
+  const hash = window.location.hash || '';
+  const m = hash.match(/article=([^&]+)/i);
+  if (!m) return;
+  let target = m[1];
+  try { target = decodeURIComponent(target); } catch {}
+  const idx = findArticleSlideIndex(target);
+  if (idx >= 0) {
+    greetingScreen.classList.add('hidden');
+    playerTopbar.classList.remove('hidden');
+    playerViewport.classList.remove('hidden');
+    playerControls.classList.remove('hidden');
+    sessionStartedAt = new Date();
+    activeLeafEnterMs = null;
+    lastVisitedLeafId = null;
+    goToSlide(idx);
+  }
+}
+
+let activePopoverAnchor = null, popoverHideTimer = null;
+function hideLinkPopoverImmediate() {
+  if (popoverHideTimer) { clearTimeout(popoverHideTimer); popoverHideTimer = null; }
+  activePopoverAnchor = null;
+  if (linkPreviewPopover) linkPreviewPopover.classList.add('hidden');
+}
+function scheduleHideLinkPopover() {
+  if (popoverHideTimer) clearTimeout(popoverHideTimer);
+  popoverHideTimer = setTimeout(hideLinkPopoverImmediate, 160);
+}
+function positionLinkPopover(anchor) {
+  if (!linkPreviewPopover || !anchor) return;
+  const r = anchor.getBoundingClientRect();
+  const pw = Math.min(370, window.innerWidth - 24);
+  const ph = Math.max(120, linkPreviewPopover.offsetHeight || 200);
+  let left = Math.max(12, Math.min(r.left, window.innerWidth - pw - 12));
+  let top = r.bottom + 8;
+  if (top + ph > window.innerHeight - 12 && r.top - ph - 8 > 12) {
+    top = r.top - ph - 8;
+  }
+  linkPreviewPopover.style.left = left + 'px';
+  linkPreviewPopover.style.top = Math.max(12, top) + 'px';
+}
+function showLinkPopover(anchor) {
+  if (!linkPreviewPopover || !anchor) return;
+  if (popoverHideTimer) { clearTimeout(popoverHideTimer); popoverHideTimer = null; }
+  activePopoverAnchor = anchor;
+  const kind = anchor.dataset.mbyKind;
+  const target = anchor.dataset.mbyTarget || '';
+  const sub = anchor.dataset.mbySub || '';
+  linkPreviewPopover.innerHTML = '';
+
+  const head = mk('div', 'mby-link-popover-head');
+  if (kind === 'card') {
+    const card = linkCardCache.get(target.toLowerCase());
+    head.appendChild(mk('span', 'mby-link-popover-badge', 'Reference Card'));
+    linkPreviewPopover.appendChild(head);
+    linkPreviewPopover.appendChild(mk('div', 'mby-link-popover-title', card?.title || anchor.textContent || target));
+    if (card?.imagePath) {
+      const img = mk('img', 'mby-link-popover-img');
+      img.src = card.imagePath;
+      img.alt = card.title || anchor.textContent || 'Reference image';
+      img.addEventListener('click', () => openZoomLightbox(card.imagePath, card.title || img.alt));
+      linkPreviewPopover.appendChild(img);
+    }
+    if (card?.textHtml) {
+      const bodyEl = mk('div', 'mby-link-popover-body');
+      bodyEl.innerHTML = card.textHtml;
+      renderMathIn(bodyEl);
+      linkPreviewPopover.appendChild(bodyEl);
+    }
+  } else if (kind === 'article') {
+    const art = inSessionArticleCache.get(target.toLowerCase());
+    head.appendChild(mk('span', 'mby-link-popover-badge', 'Article Preview'));
+    linkPreviewPopover.appendChild(head);
+    linkPreviewPopover.appendChild(mk('div', 'mby-link-popover-title', art?.title || anchor.textContent || target));
+    const ex = mk('div', 'mby-link-popover-excerpt', art?.excerpt || 'In-session article reference.');
+    linkPreviewPopover.appendChild(ex);
+    linkPreviewPopover.appendChild(mk('div', 'mby-link-popover-footer', null, [mk('span', null, 'Click link to open article in deck')]));
+  } else if (kind === 'session') {
+    const ext = externalSessionPreviewCache.get(target);
+    head.appendChild(mk('span', 'mby-link-popover-badge', 'External Session'));
+    linkPreviewPopover.appendChild(head);
+    let previewTitle = ext?.title || (anchor.textContent || target);
+    let previewText = ext?.description || 'Cross-session study reference. Preview loads automatically once the target session is built.';
+    if (ext && sub) {
+      const subLower = sub.toLowerCase();
+      const matchedArt = (ext.articles || []).find(a =>
+        (a.refKey && a.refKey.toLowerCase() === subLower) ||
+        (a.id && a.id.toLowerCase() === subLower) ||
+        `c${a.index}` === subLower);
+      if (matchedArt) {
+        previewTitle = `${ext.title} — ${matchedArt.title}`;
+        previewText = matchedArt.excerpt || previewText;
+      }
+    } else if (ext && !previewText && ext.articles?.length) {
+      previewText = ext.articles.map(a => a.title + (a.excerpt ? ': ' + a.excerpt : '')).join(' • ');
+    }
+    linkPreviewPopover.appendChild(mk('div', 'mby-link-popover-title', previewTitle));
+    linkPreviewPopover.appendChild(mk('div', 'mby-link-popover-excerpt', previewText));
+    linkPreviewPopover.appendChild(mk('div', 'mby-link-popover-footer', null, [mk('span', null, ext ? 'Click link to open session' : 'Target session link ready (not yet built)')]));
+  }
+
+  linkPreviewPopover.classList.remove('hidden');
+  requestAnimationFrame(() => positionLinkPopover(anchor));
+}
+
+document.addEventListener('mouseover', e => {
+  const link = e.target?.closest?.('.mby-native-link');
+  if (link) { showLinkPopover(link); return; }
+  if (linkPreviewPopover && linkPreviewPopover.contains(e.target) && popoverHideTimer) {
+    clearTimeout(popoverHideTimer);
+    popoverHideTimer = null;
+  }
+});
+document.addEventListener('mouseout', e => {
+  const link = e.target?.closest?.('.mby-native-link');
+  const inPop = linkPreviewPopover && linkPreviewPopover.contains(e.target);
+  if ((link || inPop) && !e.relatedTarget?.closest?.('.mby-native-link') && !linkPreviewPopover?.contains(e.relatedTarget)) {
+    scheduleHideLinkPopover();
+  }
+});
+document.addEventListener('focusin', e => {
+  const link = e.target?.closest?.('.mby-native-link');
+  if (link) showLinkPopover(link);
+});
+document.addEventListener('focusout', e => {
+  if (activePopoverAnchor && !linkPreviewPopover?.contains(e.relatedTarget) && !e.relatedTarget?.closest?.('.mby-native-link')) {
+    scheduleHideLinkPopover();
+  }
+});
+document.addEventListener('click', e => {
+  const link = e.target?.closest?.('.mby-native-link');
+  if (!link) return;
+  const kind = link.dataset.mbyKind;
+  if (kind === 'card') {
+    e.preventDefault();
+    showLinkPopover(link);
+  } else if (kind === 'article') {
+    e.preventDefault();
+    const idx = findArticleSlideIndex(link.dataset.mbyTarget || '');
+    hideLinkPopoverImmediate();
+    if (idx >= 0) goToSlide(idx);
+  }
+});
+
 let activeSearchIdx = 0;
+let activeSearchFilter = 'all';
 let currentSearchMatches = [];
+const SEARCH_FILTERS = [
+  { id: 'all', label: 'All' },
+  { id: 'article', label: 'Articles' },
+  { id: 'question', label: 'Questions' },
+  { id: 'unanswered', label: 'Unanswered' },
+  { id: 'weak', label: 'Needs Review' }
+];
+
+function getEntryStatus(item) {
+  const m = metricById.get(item.leafId);
+  if (!m) return { key: 'unanswered', text: '', cls: '' };
+  if (item.kind === 'article') {
+    return m.visitedCount > 0 ? { key: 'viewed', text: 'Viewed', cls: 'ok' } : { key: 'unanswered', text: 'Unread', cls: '' };
+  }
+  if (m.kind === 'flashcard') {
+    if (m.flashcardRating === 'known') return { key: 'correct', text: 'Known', cls: 'ok' };
+    if (m.flashcardRating === 'needsReview') return { key: 'weak', text: 'Needs Review', cls: 'bad' };
+    return { key: 'unanswered', text: 'Unrated', cls: '' };
+  }
+  if (m.isCorrect === true) return { key: 'correct', text: 'Correct', cls: 'ok' };
+  if (m.isCorrect === false) return { key: 'weak', text: 'Needs Review', cls: 'bad' };
+  return { key: 'unanswered', text: 'Unanswered', cls: '' };
+}
+
+function matchesSearchFilter(item, filterId) {
+  if (filterId === 'all') return true;
+  if (filterId === 'article') return item.kind === 'article';
+  if (filterId === 'question') return item.kind === 'question';
+  const st = getEntryStatus(item);
+  if (filterId === 'unanswered') return st.key === 'unanswered';
+  if (filterId === 'weak') return st.key === 'weak';
+  return true;
+}
+
+function renderSearchFilters(tokens) {
+  if (!searchFiltersEl) return;
+  const textMatched = tokens.length === 0
+    ? SEARCH_INDEX
+    : SEARCH_INDEX.filter(item => tokens.every(t => item.lower.includes(t)));
+  searchFiltersEl.innerHTML = '';
+  SEARCH_FILTERS.forEach(f => {
+    const count = textMatched.filter(it => matchesSearchFilter(it, f.id)).length;
+    const pill = mk('button', 'mby-search-filter-pill' + (activeSearchFilter === f.id ? ' active' : ''));
+    pill.type = 'button';
+    pill.setAttribute('role', 'tab');
+    pill.setAttribute('aria-selected', activeSearchFilter === f.id ? 'true' : 'false');
+    pill.textContent = `${f.label} (${count})`;
+    pill.addEventListener('click', () => {
+      activeSearchFilter = f.id;
+      activeSearchIdx = 0;
+      renderSearchResults();
+      searchInput?.focus();
+    });
+    searchFiltersEl.appendChild(pill);
+  });
+}
+
+function scoreSearchEntry(item, tokens, fullQuery) {
+  let score = 0;
+  if (fullQuery && item.titleLower.includes(fullQuery)) score += 45;
+  if (fullQuery && item.lower.includes(fullQuery)) score += 25;
+  tokens.forEach(t => {
+    if (item.titleLower.includes(t)) score += 20;
+    if (item.refKey && item.refKey.toLowerCase().includes(t)) score += 15;
+    if (item.lower.includes(t)) score += 8;
+  });
+  return score;
+}
 
 function highlightMatchSnippet(rawText, tokens) {
   let center = 0;
@@ -2554,33 +4474,78 @@ function highlightMatchSnippet(rawText, tokens) {
   return out;
 }
 
+function buildSearchItemButton(item, idx, tokens) {
+  const btn = mk('button', 'mby-search-item' + (idx === activeSearchIdx ? ' active' : ''));
+  btn.type = 'button';
+  btn.setAttribute('role', 'option');
+  const row = mk('div', 'mby-search-item-row');
+  const meta = mk('div', 'mby-search-item-meta');
+  meta.appendChild(mk('span', 'mby-search-badge', item.badge));
+  meta.appendChild(mk('span', 'mby-search-crumb', item.title));
+  row.appendChild(meta);
+  const st = getEntryStatus(item);
+  if (st.text) row.appendChild(mk('span', 'mby-search-status' + (st.cls ? ' ' + st.cls : ''), st.text));
+  btn.appendChild(row);
+  const snip = mk('div', 'mby-search-item-snippet');
+  snip.innerHTML = highlightMatchSnippet(item.rawText, tokens);
+  btn.appendChild(snip);
+  btn.addEventListener('click', () => jumpToSearchEntry(item));
+  return btn;
+}
+
+function renderSessionOutline(items) {
+  let lastComp = null;
+  items.forEach((item, idx) => {
+    if (item.componentTitle !== lastComp) {
+      lastComp = item.componentTitle;
+      searchResultsEl.appendChild(mk('div', 'mby-search-group-hdr', item.componentTitle));
+    }
+    searchResultsEl.appendChild(buildSearchItemButton(item, idx, []));
+  });
+}
+
 function renderSearchResults() {
-  const q = (searchInput?.value || '').trim().toLowerCase();
+  const rawQ = (searchInput?.value || '').trim();
+  if (searchClearBtn) searchClearBtn.classList.toggle('hidden', rawQ.length === 0);
+  const q = rawQ.toLowerCase();
   const tokens = q.split(/\s+/).filter(Boolean);
+  renderSearchFilters(tokens);
+
+  const filtered = SEARCH_INDEX.filter(item =>
+    matchesSearchFilter(item, activeSearchFilter) &&
+    (tokens.length === 0 || tokens.every(t => item.lower.includes(t))));
+
   currentSearchMatches = tokens.length === 0
-    ? SEARCH_INDEX.slice(0, 20)
-    : SEARCH_INDEX.filter(item => tokens.every(t => item.lower.includes(t))).slice(0, 40);
+    ? filtered.slice(0, 40)
+    : filtered
+        .map(item => ({ item, score: scoreSearchEntry(item, tokens, q) }))
+        .sort((a, b) => b.score - a.score || a.item.slideIdx - b.item.slideIdx)
+        .map(x => x.item)
+        .slice(0, 40);
+
   if (activeSearchIdx >= currentSearchMatches.length) activeSearchIdx = Math.max(0, currentSearchMatches.length - 1);
-  if (searchMetaEl) searchMetaEl.textContent = tokens.length === 0 ? `Showing ${currentSearchMatches.length} of ${SEARCH_INDEX.length} indexed item(s)` : `${currentSearchMatches.length} match(es) for "${searchInput.value.trim()}"`;
+  if (searchMetaEl) {
+    searchMetaEl.textContent = tokens.length === 0
+      ? `Session outline • ${currentSearchMatches.length} of ${filtered.length} item(s)`
+      : `${filtered.length} match(es) for "${rawQ}"`;
+  }
   searchResultsEl.innerHTML = '';
   if (currentSearchMatches.length === 0) {
-    searchResultsEl.appendChild(mk('div', 'mby-search-empty', 'No matching study blocks or questions found.'));
+    searchResultsEl.appendChild(mk('div', 'mby-search-empty', 'No matching study blocks or questions found for this filter.'));
+    return;
+  }
+  if (tokens.length === 0) {
+    renderSessionOutline(currentSearchMatches);
     return;
   }
   currentSearchMatches.forEach((item, idx) => {
-    const btn = mk('button', 'mby-search-item' + (idx === activeSearchIdx ? ' active' : ''));
-    btn.type = 'button';
-    btn.appendChild(mk('div', 'mby-search-item-title', item.title));
-    const snip = mk('div', 'mby-search-item-snippet');
-    snip.innerHTML = highlightMatchSnippet(item.rawText, tokens);
-    btn.appendChild(snip);
-    btn.addEventListener('click', () => jumpToSearchEntry(item));
-    searchResultsEl.appendChild(btn);
+    searchResultsEl.appendChild(buildSearchItemButton(item, idx, tokens));
   });
 }
 
 function openSearchModal() {
   if (!searchModal) return;
+  hideLinkPopoverImmediate();
   searchModal.classList.remove('hidden');
   activeSearchIdx = 0;
   renderSearchResults();
@@ -2613,6 +4578,11 @@ function jumpToSearchEntry(item) {
 topbarSearchBtn?.addEventListener('click', openSearchModal);
 greetingSearchBtn?.addEventListener('click', openSearchModal);
 searchCloseBtn?.addEventListener('click', closeSearchModal);
+searchClearBtn?.addEventListener('click', () => {
+  if (searchInput) { searchInput.value = ''; searchInput.focus(); }
+  activeSearchIdx = 0;
+  renderSearchResults();
+});
 searchModal?.addEventListener('click', e => { if (e.target === searchModal) closeSearchModal(); });
 searchInput?.addEventListener('input', () => { activeSearchIdx = 0; renderSearchResults(); });
 
@@ -2625,18 +4595,28 @@ document.addEventListener('keydown', e => {
   }
   if (!searchModal?.classList.contains('hidden')) {
     if (e.key === 'Escape') { e.preventDefault(); closeSearchModal(); return; }
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      const idx = SEARCH_FILTERS.findIndex(f => f.id === activeSearchFilter);
+      const next = SEARCH_FILTERS[(idx + (e.shiftKey ? SEARCH_FILTERS.length - 1 : 1)) % SEARCH_FILTERS.length];
+      activeSearchFilter = next.id;
+      activeSearchIdx = 0;
+      renderSearchResults();
+      return;
+    }
+    const optionEls = Array.from(searchResultsEl.querySelectorAll('.mby-search-item'));
     if (e.key === 'ArrowDown' && currentSearchMatches.length > 0) {
       e.preventDefault();
       activeSearchIdx = Math.min(currentSearchMatches.length - 1, activeSearchIdx + 1);
-      Array.from(searchResultsEl.children).forEach((el, i) => el.classList.toggle('active', i === activeSearchIdx));
-      searchResultsEl.children[activeSearchIdx]?.scrollIntoView({ block: 'nearest' });
+      optionEls.forEach((el, i) => el.classList.toggle('active', i === activeSearchIdx));
+      optionEls[activeSearchIdx]?.scrollIntoView({ block: 'nearest' });
       return;
     }
     if (e.key === 'ArrowUp' && currentSearchMatches.length > 0) {
       e.preventDefault();
       activeSearchIdx = Math.max(0, activeSearchIdx - 1);
-      Array.from(searchResultsEl.children).forEach((el, i) => el.classList.toggle('active', i === activeSearchIdx));
-      searchResultsEl.children[activeSearchIdx]?.scrollIntoView({ block: 'nearest' });
+      optionEls.forEach((el, i) => el.classList.toggle('active', i === activeSearchIdx));
+      optionEls[activeSearchIdx]?.scrollIntoView({ block: 'nearest' });
       return;
     }
     if (e.key === 'Enter' && currentSearchMatches[activeSearchIdx]) {
@@ -2644,6 +4624,10 @@ document.addEventListener('keydown', e => {
       jumpToSearchEntry(currentSearchMatches[activeSearchIdx]);
       return;
     }
+    return;
+  }
+  if (e.key === 'Escape' && linkPreviewPopover && !linkPreviewPopover.classList.contains('hidden')) {
+    hideLinkPopoverImmediate();
     return;
   }
   const tag = (e.target?.tagName || '').toLowerCase();
@@ -2661,8 +4645,20 @@ document.addEventListener('keydown', e => {
 renderSlides();
 """;
 
-    private sealed record WebBundlePayload(string Id, string Title, string? Description, string ThemeMode, string SlideTransitionMs, WebGeneratorInfoModel Generator, List<SlideRenderModel> Slides);
-    private sealed record WebGeneratorInfoModel(string ToolName, string Executable, string Version, string Runtime, string GeneratedAtUtc);
+    private sealed record WebBundlePayload(
+        string Id,
+        string Title,
+        string? Description,
+        string ThemeMode,
+        string SlideTransitionMs,
+        WebGeneratorInfoModel Generator,
+        List<SlideRenderModel> Slides,
+        Dictionary<string, LinkCardRenderModel>? LinkCards = null,
+        Dictionary<string, SessionPreviewSidecarModel>? ExternalPreviews = null);
+    private sealed record WebGeneratorInfoModel(string ToolName, string Executable, string Version, string Runtime, string GeneratedAtUtc, string AppName = "Meloberry", string RepositoryUrl = "https://github.com/doc-shashank/meloberry-cli/");
+    private sealed record LinkCardRenderModel(string Id, string? Title, string? TextHtml, string? ImagePath);
+    private sealed record ArticlePreviewSidecarModel(string Id, string? RefKey, int Index, string Title, string Excerpt);
+    private sealed record SessionPreviewSidecarModel(string SessionId, string Title, string Description, List<ArticlePreviewSidecarModel> Articles);
     private sealed record SlideRenderModel(
         string Id,
         string Kind,
@@ -2677,7 +4673,13 @@ renderSlides();
         SpotErrorRenderModel? SpotError = null,
         DifferentiationRenderModel? Differentiation = null,
         MechanismRenderModel? Mechanism = null,
-        RelabelRenderModel? Relabel = null);
+        RelabelRenderModel? Relabel = null,
+        string? RefKey = null,
+        int? ComponentIndex = null,
+        ClassifyRenderModel? Classify = null,
+        MatchRenderModel? Match = null,
+        NumericRenderModel? Numeric = null,
+        CaseGroupRenderModel? CaseGroup = null);
     private sealed record ArticleBlockRenderModel(
         string Id,
         string Kind,
@@ -2688,7 +4690,9 @@ renderSlides();
         string? Tone = null,
         string? Title = null,
         TableRenderModel? Table = null,
-        string? TitleHtml = null);
+        string? TitleHtml = null,
+        DiagramExploreRenderModel? DiagramExplore = null,
+        RevealBlockRenderModel? Reveal = null);
     private sealed record TableRenderModel(
         string? Title,
         string? CaptionHtml,
@@ -2704,11 +4708,11 @@ renderSlides();
     private sealed record FlashcardRenderModel(FlashcardSideRenderModel Front, FlashcardSideRenderModel Back);
     private sealed record FlashcardSideRenderModel(string? TextHtml, string? ImagePath, string Position);
     private sealed record FillBlankSlotRenderModel(int Index, List<string> Answers, string? PrimaryAnswerHtml = null);
-    private sealed record FillBlankRenderModel(string PromptHtml, List<FillBlankSlotRenderModel> Blanks, bool Fuzzy, bool CaseSensitive, string? ExplanationHtml);
+    private sealed record FillBlankRenderModel(string PromptHtml, List<FillBlankSlotRenderModel> Blanks, bool Fuzzy, bool CaseSensitive, string? ExplanationHtml, string? Placeholder = null);
     private sealed record AssertionReasonOptionRenderModel(string Code, string Label);
     private sealed record AssertionReasonRenderModel(string AssertionHtml, string ReasonHtml, string Answer, string Scheme, List<AssertionReasonOptionRenderModel> Options, string? ExplanationHtml);
     private sealed record SpotErrorSegmentRenderModel(int? SpanIndex, string Html, bool IsCandidate, bool IsError, List<string>? Corrections, string? PrimaryCorrectionHtml = null);
-    private sealed record SpotErrorRenderModel(List<SpotErrorSegmentRenderModel> Segments, bool RequireFix, bool AllowNoError, bool NoError, string? ExplanationHtml);
+    private sealed record SpotErrorRenderModel(List<SpotErrorSegmentRenderModel> Segments, bool RequireFix, bool AllowNoError, bool NoError, string? ExplanationHtml, string? ImagePath = null);
     private sealed record DiffCellRenderModel(
         int RowIndex,
         int ColIndex,
@@ -2747,4 +4751,16 @@ renderSlides();
         List<RelabelBoxRenderModel> Boxes,
         List<string> Distractors,
         string? ExplanationHtml);
+    private sealed record DiagramHotspotRenderModel(int Index, string Label, string NoteHtml, double X, double Y, double W, double H);
+    private sealed record DiagramExploreRenderModel(string ImagePath, string? Title, string? TitleHtml, string? CaptionHtml, string? Alt, List<DiagramHotspotRenderModel> Hotspots);
+    private sealed record RevealStepRenderModel(int Index, string HeadingHtml, string BodyHtml);
+    private sealed record RevealBlockRenderModel(string? Title, string? TitleHtml, bool ShowFirst, List<RevealStepRenderModel> Steps);
+    private sealed record ClassifyBucketRenderModel(int BucketId, string Name, string NameHtml);
+    private sealed record ClassifyItemRenderModel(int ItemId, int BucketId, string Html);
+    private sealed record ClassifyRenderModel(string? Title, string? TitleHtml, List<ClassifyBucketRenderModel> Buckets, List<ClassifyItemRenderModel> Items, string? ExplanationHtml);
+    private sealed record MatchPairRenderModel(int PairId, string LeftHtml, string RightHtml);
+    private sealed record MatchBankOptionRenderModel(int OptionId, string Html, int? CorrectPairId);
+    private sealed record MatchRenderModel(string? Title, string? TitleHtml, List<MatchPairRenderModel> Pairs, List<MatchBankOptionRenderModel> RightPool, string? ExplanationHtml);
+    private sealed record NumericRenderModel(string PromptHtml, double Answer, double Tolerance, string ToleranceMode, string? Unit, string? Placeholder, string? ImagePath, string? ExplanationHtml);
+    private sealed record CaseGroupRenderModel(string? Title, string? TitleHtml, string StemHtml, string? ImagePath, string? CaptionHtml, List<SlideRenderModel> Questions, string? ExplanationHtml);
 }

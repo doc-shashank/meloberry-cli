@@ -24,7 +24,8 @@ public sealed record FillBlankPayload(
     IReadOnlyList<FillBlankSlot> Blanks,
     bool Fuzzy,
     bool CaseSensitive,
-    string? Explanation);
+    string? Explanation,
+    string? Placeholder = null);
 
 public sealed record AssertionReasonPayload(
     string Assertion,
@@ -46,7 +47,20 @@ public sealed record SpotErrorPayload(
     bool RequireFix,
     bool AllowNoError,
     bool NoError,
-    string? Explanation);
+    string? Explanation,
+    string? ImagePath = null);
+
+public sealed record ArticleLinkCard(
+    string Id,
+    string? Title,
+    string? Text,
+    string? ImagePath = null);
+
+public sealed record ParsedArticleLinkTarget(
+    string Kind,
+    string TargetId,
+    string? SubTargetId = null,
+    string? ExplicitHref = null);
 
 public static class Phase1PayloadCodec
 {
@@ -640,5 +654,274 @@ public static partial class Phase1PayloadRules
             j++;
         }
         return false;
+    }
+}
+
+public static partial class ArticleLinkRules
+{
+    public static Result<string> ValidateAndNormalizeCardId(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return new Error("ArticleLink.InvalidId", "Link card id cannot be empty.", ErrorType.Validation);
+
+        var normalized = raw.Trim().ToLowerInvariant();
+        if (normalized.Length > 64)
+            return new Error("ArticleLink.InvalidId", $"Link card id '{raw}' exceeds 64 characters.", ErrorType.Validation);
+
+        for (int i = 0; i < normalized.Length; i++)
+        {
+            char c = normalized[i];
+            bool valid = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || (i > 0 && c is '-' or '_');
+            if (!valid)
+                return new Error("ArticleLink.InvalidId", $"Link card id '{raw}' must match ^[a-z0-9][a-z0-9_-]{{0,63}}$.", ErrorType.Validation);
+        }
+
+        return normalized;
+    }
+
+    public static bool TryParseMbyUri(string? rawUrl, out ParsedArticleLinkTarget target)
+    {
+        target = default!;
+        if (string.IsNullOrWhiteSpace(rawUrl))
+            return false;
+
+        var trimmed = rawUrl.Trim();
+        if (!trimmed.StartsWith("mby://", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var rest = trimmed["mby://".Length..];
+        string? explicitHref = null;
+        int qIdx = rest.IndexOf('?');
+        if (qIdx >= 0)
+        {
+            var query = rest[(qIdx + 1)..];
+            rest = rest[..qIdx];
+            foreach (var part in query.Split('&', StringSplitOptions.RemoveEmptyEntries))
+            {
+                int eq = part.IndexOf('=');
+                if (eq <= 0) continue;
+                var k = Uri.UnescapeDataString(part[..eq]).Trim();
+                if (!string.Equals(k, "href", StringComparison.OrdinalIgnoreCase)) continue;
+                var v = Uri.UnescapeDataString(part[(eq + 1)..]).Trim();
+                if (IsUnsafeHref(v))
+                    return false;
+                if (!string.IsNullOrWhiteSpace(v))
+                    explicitHref = v;
+            }
+        }
+
+        int hashIdx = rest.IndexOf('#');
+        if (hashIdx >= 0)
+            rest = rest[..hashIdx];
+
+        var segments = rest.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (segments.Length < 2)
+            return false;
+
+        var kind = segments[0].Trim().ToLowerInvariant();
+        var targetId = Uri.UnescapeDataString(segments[1]).Trim();
+        if (string.IsNullOrWhiteSpace(targetId))
+            return false;
+
+        if (kind is "card" or "article")
+        {
+            if (segments.Length != 2)
+                return false;
+            target = new ParsedArticleLinkTarget(kind, kind == "card" ? targetId.ToLowerInvariant() : targetId, null, explicitHref);
+            return true;
+        }
+
+        if (kind == "session")
+        {
+            if (segments.Length > 3)
+                return false;
+            string? sub = segments.Length == 3 ? Uri.UnescapeDataString(segments[2]).Trim() : null;
+            if (segments.Length == 3 && string.IsNullOrWhiteSpace(sub))
+                return false;
+            target = new ParsedArticleLinkTarget("session", targetId, sub, explicitHref);
+            return true;
+        }
+
+        return false;
+    }
+
+    public static IReadOnlyList<ParsedArticleLinkTarget> ExtractMbyLinksFromMarkdown(string? markdown)
+    {
+        if (string.IsNullOrWhiteSpace(markdown))
+            return [];
+
+        var results = new List<ParsedArticleLinkTarget>();
+        var normalized = markdown.Replace("\r\n", "\n").Replace('\r', '\n');
+        var lines = normalized.Split('\n');
+        string? activeFence = null;
+        var proseSb = new StringBuilder();
+
+        foreach (var line in lines)
+        {
+            var trimmed = line.TrimStart();
+            if (activeFence is null)
+            {
+                if (TryGetFenceToken(trimmed, out var token))
+                {
+                    activeFence = token;
+                    continue;
+                }
+                proseSb.AppendLine(line);
+            }
+            else if (trimmed.StartsWith(activeFence, StringComparison.Ordinal) && trimmed[activeFence.Length..].Trim().Length == 0)
+            {
+                activeFence = null;
+            }
+        }
+
+        var text = proseSb.ToString();
+        int i = 0;
+        while (i < text.Length)
+        {
+            if (Phase1PayloadRules.TrySkipInlineCodeSpan(text, i, out int afterCode))
+            {
+                i = afterCode;
+                continue;
+            }
+            if (Phase1PayloadRules.TrySkipMathSpan(text, i, out int afterMath))
+            {
+                i = afterMath;
+                continue;
+            }
+
+            if (text[i] == '[' && (i == 0 || (text[i - 1] != '!' && !Phase1PayloadRules.IsEscaped(text, i))))
+            {
+                int closeBracket = FindClosingBracket(text, i + 1);
+                if (closeBracket > i && closeBracket + 1 < text.Length && text[closeBracket + 1] == '(')
+                {
+                    int closeParen = FindClosingParen(text, closeBracket + 2);
+                    if (closeParen > closeBracket + 2)
+                    {
+                        var dest = text[(closeBracket + 2)..closeParen].Trim();
+                        if (dest.StartsWith('<'))
+                        {
+                            int angEnd = dest.IndexOf('>');
+                            if (angEnd > 1) dest = dest[1..angEnd].Trim();
+                        }
+                        else
+                        {
+                            int ws = dest.IndexOfAny([' ', '\t', '\r', '\n']);
+                            if (ws > 0) dest = dest[..ws].Trim();
+                        }
+
+                        if (TryParseMbyUri(dest, out var parsed))
+                            results.Add(parsed);
+
+                        i = closeParen + 1;
+                        continue;
+                    }
+                }
+            }
+            i++;
+        }
+
+        return results;
+    }
+
+    public static string ResolveSessionHref(ParsedArticleLinkTarget target)
+    {
+        var baseHref = !string.IsNullOrWhiteSpace(target.ExplicitHref)
+            ? target.ExplicitHref.Trim()
+            : $"../{Uri.EscapeDataString(target.TargetId)}_web/index.html";
+
+        if (!string.IsNullOrWhiteSpace(target.SubTargetId) && !baseHref.Contains('#'))
+            return $"{baseHref}#article={Uri.EscapeDataString(target.SubTargetId)}";
+
+        return baseHref;
+    }
+
+    public static string ResolveSessionPreviewDir(string resolvedHref)
+    {
+        if (string.IsNullOrWhiteSpace(resolvedHref))
+            return ".";
+
+        var clean = resolvedHref.Trim();
+        int hash = clean.IndexOf('#');
+        if (hash >= 0) clean = clean[..hash];
+        int query = clean.IndexOf('?');
+        if (query >= 0) clean = clean[..query];
+
+        if (clean.EndsWith('/'))
+            return clean.TrimEnd('/') is { Length: > 0 } dir ? dir : ".";
+
+        int lastSlash = clean.LastIndexOf('/');
+        if (lastSlash < 0)
+            return ".";
+
+        var lastSeg = clean[(lastSlash + 1)..];
+        if (lastSeg.Contains('.'))
+        {
+            var parent = clean[..lastSlash].TrimEnd('/');
+            return string.IsNullOrEmpty(parent) ? "." : parent;
+        }
+
+        return clean.TrimEnd('/');
+    }
+
+    private static bool IsUnsafeHref(string href)
+    {
+        var compact = new string(href.Where(c => !char.IsWhiteSpace(c) && !char.IsControl(c)).ToArray());
+        return compact.StartsWith("javascript:", StringComparison.OrdinalIgnoreCase) ||
+               compact.StartsWith("vbscript:", StringComparison.OrdinalIgnoreCase) ||
+               compact.StartsWith("data:", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool TryGetFenceToken(string trimmedStart, out string token)
+    {
+        token = string.Empty;
+        if (trimmedStart.Length < 3) return false;
+        char ch = trimmedStart[0];
+        if (ch is not ('`' or '~')) return false;
+        int len = 0;
+        while (len < trimmedStart.Length && trimmedStart[len] == ch) len++;
+        if (len < 3) return false;
+        token = new string(ch, len);
+        return true;
+    }
+
+    private static int FindClosingBracket(string text, int start)
+    {
+        int depth = 1;
+        for (int j = start; j < text.Length; j++)
+        {
+            if (Phase1PayloadRules.TrySkipInlineCodeSpan(text, j, out int afterCode))
+            {
+                j = afterCode - 1;
+                continue;
+            }
+            if (text[j] == '\\') { j++; continue; }
+            if (text[j] == '[') depth++;
+            else if (text[j] == ']')
+            {
+                depth--;
+                if (depth == 0) return j;
+            }
+        }
+        return -1;
+    }
+
+    private static int FindClosingParen(string text, int start)
+    {
+        int depth = 1;
+        for (int j = start; j < text.Length; j++)
+        {
+            if (text[j] == '\\') { j++; continue; }
+            if (text[j] == '(') depth++;
+            else if (text[j] == ')')
+            {
+                depth--;
+                if (depth == 0) return j;
+            }
+            else if (text[j] == '\n')
+            {
+                return -1;
+            }
+        }
+        return -1;
     }
 }

@@ -18,7 +18,8 @@ internal sealed record ResolvedWorkspaceLint(StudySession? Session, Quiz? Quiz, 
 public sealed class LintHandler(
     EntityAddressResolver addressResolver,
     IWorkingDirectoryProvider workingDirectoryProvider,
-    IContentInspector contentInspector)
+    IContentInspector contentInspector,
+    IWorkspaceRepository? workspaceRepository = null)
 {
     public async Task<Result<LintReportResponse>> HandleAsync(LintCommand command, CancellationToken cancellationToken = default)
     {
@@ -134,7 +135,97 @@ public sealed class LintHandler(
         }
         foreach (var component in session.Components)
             await LintComponentAsync(component, storageDirectory, issues, ct);
+
+        await LintSessionNativeLinksAsync(session, issues, ct);
     }
+
+    private async Task LintSessionNativeLinksAsync(StudySession session, List<LintIssue> issues, CancellationToken ct)
+    {
+        var allCardIds = session.Components
+            .Where(c => c.Kind == ComponentKind.Article)
+            .SelectMany(c => c.LinkCards)
+            .Select(l => l.Id)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var sessionArticles = session.Components
+            .Where(c => c.Kind == ComponentKind.Article)
+            .ToList();
+
+        var externalSessionCache = new Dictionary<string, StudySession?>(StringComparer.Ordinal);
+
+        foreach (var comp in sessionArticles)
+        {
+            var localCardIds = comp.LinkCards.Select(l => l.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var mdText in Phase3PayloadRules.EnumerateArticleBlockMarkdownStrings(comp))
+            {
+                if (string.IsNullOrWhiteSpace(mdText))
+                    continue;
+
+                foreach (var link in ArticleLinkRules.ExtractMbyLinksFromMarkdown(mdText))
+                {
+                    if (link.Kind == "card")
+                    {
+                        if (!localCardIds.Contains(link.TargetId) && !allCardIds.Contains(link.TargetId))
+                        {
+                            issues.Add(new LintIssue(
+                                "Error",
+                                "Lint.MissingLinkCard",
+                                comp.Id,
+                                $"Native link 'mby://card/{link.TargetId}' in '{comp.Id}' references an undefined link card. Define ':::link{{id=\"{link.TargetId}\"}}'."));
+                        }
+                    }
+                    else if (link.Kind == "article")
+                    {
+                        bool foundArt = MatchesArticleInSession(sessionArticles, link.TargetId);
+                        if (!foundArt)
+                        {
+                            issues.Add(new LintIssue(
+                                "Error",
+                                "Lint.UnresolvedArticleLink",
+                                comp.Id,
+                                $"Native link 'mby://article/{link.TargetId}' in '{comp.Id}' does not match any article component in session '{session.Id}'."));
+                        }
+                    }
+                    else if (link.Kind == "session" && workspaceRepository is not null)
+                    {
+                        if (!externalSessionCache.TryGetValue(link.TargetId, out var extSession))
+                        {
+                            var lookup = await workspaceRepository.FindSessionAsync(link.TargetId, ct);
+                            extSession = lookup?.Session;
+                            externalSessionCache[link.TargetId] = extSession;
+                        }
+
+                        if (extSession is null)
+                        {
+                            issues.Add(new LintIssue(
+                                "Warning",
+                                "Lint.UnresolvedSessionLink",
+                                comp.Id,
+                                $"Cross-session link 'mby://session/{link.TargetId}' points to a session not yet indexed; preview will load dynamically once built."));
+                        }
+                        else if (!string.IsNullOrWhiteSpace(link.SubTargetId))
+                        {
+                            var extArticles = extSession.Components.Where(c => c.Kind == ComponentKind.Article).ToList();
+                            if (!MatchesArticleInSession(extArticles, link.SubTargetId))
+                            {
+                                issues.Add(new LintIssue(
+                                    "Warning",
+                                    "Lint.UnresolvedSessionLink",
+                                    comp.Id,
+                                    $"Cross-session link 'mby://session/{link.TargetId}/{link.SubTargetId}' could not match article '{link.SubTargetId}' in '{link.TargetId}'."));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private static bool MatchesArticleInSession(IReadOnlyList<SessionComponent> articles, string target) =>
+        articles.Any(a =>
+            string.Equals(a.Id, target, StringComparison.OrdinalIgnoreCase) ||
+            (!string.IsNullOrWhiteSpace(a.RefKey) && string.Equals(a.RefKey, target, StringComparison.OrdinalIgnoreCase)) ||
+            string.Equals($"c{a.Index}", target, StringComparison.OrdinalIgnoreCase));
 
     private async Task LintComponentAsync(SessionComponent component, string storageDirectory, List<LintIssue> issues, CancellationToken ct)
     {
@@ -147,6 +238,11 @@ public sealed class LintHandler(
             }
             foreach (var block in component.ArticleBlocks)
                 await LintArticleBlockAsync(block, storageDirectory, issues, ct);
+            foreach (var lc in component.LinkCards)
+            {
+                if (!string.IsNullOrWhiteSpace(lc.ImagePath))
+                    await CheckImageAssetAsync(storageDirectory, lc.ImagePath, $"{component.Id}:link:{lc.Id}", issues, ct);
+            }
         }
         else if (component.Quiz is not null)
         {
@@ -177,7 +273,67 @@ public sealed class LintHandler(
             LintTableBlock(block, issues);
             return Task.CompletedTask;
         }
+        if (block.Kind == ArticleBlockKind.DiagramExplore)
+        {
+            return LintDiagramExploreBlockAsync(block, storageDirectory, issues, ct);
+        }
+        if (block.Kind == ArticleBlockKind.Reveal)
+        {
+            LintRevealBlock(block, issues);
+            return Task.CompletedTask;
+        }
         return CheckImageAssetAsync(storageDirectory, block.ImagePath, block.Id, issues, ct);
+    }
+
+    private async Task LintDiagramExploreBlockAsync(ArticleBlock block, string storageDirectory, List<LintIssue> issues, CancellationToken ct)
+    {
+        if (!Phase1PayloadCodec.TryDeserialize<DiagramExplorePayload>(block.PayloadJson, out var p) || p is null)
+        {
+            issues.Add(new LintIssue("Error", "Lint.InvalidDiagramExplorePayload", block.Id, "Diagram Explorer block has missing or invalid payload JSON."));
+            return;
+        }
+        var imgPath = !string.IsNullOrWhiteSpace(p.ImagePath) ? p.ImagePath : block.ImagePath;
+        await CheckImageAssetAsync(storageDirectory, imgPath, $"{block.Id}:image", issues, ct);
+        if (p.Hotspots is null || p.Hotspots.Count == 0)
+        {
+            issues.Add(new LintIssue("Error", "Lint.EmptyDiagramHotspots", block.Id, "Diagram Explorer block must define at least 1 annotated hotspot."));
+            return;
+        }
+        for (int i = 0; i < p.Hotspots.Count; i++)
+        {
+            var hs = p.Hotspots[i];
+            if (hs is null)
+            {
+                issues.Add(new LintIssue("Error", "Lint.InvalidDiagramExplorePayload", block.Id, $"Diagram hotspot #{i + 1} is null."));
+                continue;
+            }
+            if (string.IsNullOrWhiteSpace(hs.Label))
+                issues.Add(new LintIssue("Error", "Lint.EmptyDiagramHotspotLabel", block.Id, $"Diagram hotspot #{i + 1} has an empty label."));
+            if (string.IsNullOrWhiteSpace(hs.Note))
+                issues.Add(new LintIssue("Error", "Lint.EmptyDiagramHotspotNote", block.Id, $"Diagram hotspot #{i + 1} ('{hs.Label}') has an empty annotation note."));
+            if (!Phase3PayloadRules.HasValidHotspotBounds(hs))
+                issues.Add(new LintIssue("Error", "Lint.InvalidDiagramHotspotBounds", block.Id, $"Diagram hotspot #{i + 1} ('{hs.Label}') has out-of-bounds rect [{hs.X}, {hs.Y}, {hs.W}, {hs.H}]. Coordinates must stay in 0..1 with x+w<=1 and y+h<=1."));
+        }
+    }
+
+    private static void LintRevealBlock(ArticleBlock block, List<LintIssue> issues)
+    {
+        if (!Phase1PayloadCodec.TryDeserialize<RevealBlockPayload>(block.PayloadJson, out var p) || p is null)
+        {
+            issues.Add(new LintIssue("Error", "Lint.InvalidRevealPayload", block.Id, "Reveal block has missing or invalid payload JSON."));
+            return;
+        }
+        if (p.Steps is null || p.Steps.Count == 0)
+        {
+            issues.Add(new LintIssue("Error", "Lint.EmptyRevealSteps", block.Id, "Reveal block must define at least 1 step card."));
+            return;
+        }
+        for (int i = 0; i < p.Steps.Count; i++)
+        {
+            var st = p.Steps[i];
+            if (st is null || string.IsNullOrWhiteSpace(st.Heading) || string.IsNullOrWhiteSpace(st.Body))
+                issues.Add(new LintIssue("Error", "Lint.EmptyRevealStep", block.Id, $"Reveal step #{i + 1} must have both a non-empty heading and body."));
+        }
     }
 
     private static void LintTableBlock(ArticleBlock block, List<LintIssue> issues)
@@ -391,6 +547,8 @@ public sealed class LintHandler(
                     issues.Add(new LintIssue("Error", "Lint.SpotErrorConflictingNoError", pq.Id, "Spot-the-error question has 'noError=true' with 'allowNoError=false'."));
                 if (!p.NoError && errorCount == 0)
                     issues.Add(new LintIssue("Error", "Lint.SpotErrorMissingFault", pq.Id, "Spot-the-error question has no error span marked with '[~~wrong~~ -> right]' and 'noError' is false."));
+                if (!string.IsNullOrWhiteSpace(p.ImagePath))
+                    await CheckImageAssetAsync(storageDirectory, p.ImagePath, $"{pq.Id}:image", issues, ct);
                 break;
             }
             case QuestionType.Differentiation:
@@ -526,6 +684,179 @@ public sealed class LintHandler(
                         issues.Add(new LintIssue("Error", "Lint.EmptyRelabelLabel", pq.Id, $"Relabel box #{i + 1} has an empty label."));
                     if (!Phase2PayloadRules.HasValidRelabelBoxBounds(box))
                         issues.Add(new LintIssue("Error", "Lint.InvalidRelabelBoxBounds", pq.Id, $"Relabel box #{i + 1} ('{box.Label}') has out-of-bounds coordinates [x={box.X}, y={box.Y}, w={box.W}, h={box.H}]. Coordinates must stay within 0..1 with x+w<=1 and y+h<=1."));
+                }
+                break;
+            }
+            case QuestionType.Classify:
+            {
+                if (!Phase1PayloadCodec.TryDeserialize<ClassifyPayload>(pq.PayloadJson, out var p) || p is null)
+                {
+                    issues.Add(new LintIssue("Error", "Lint.InvalidQuestionPayload", pq.Id, "Classify question has invalid payload JSON."));
+                    return;
+                }
+                if (p.Buckets is null || p.Buckets.Count < 2)
+                {
+                    issues.Add(new LintIssue("Error", "Lint.InsufficientClassifyBuckets", pq.Id, $"Classify question has {p.Buckets?.Count ?? 0} bucket(s); at least 2 are required."));
+                    return;
+                }
+                var bucketIds = new HashSet<int>();
+                var bucketNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var b in p.Buckets)
+                {
+                    if (b is null || string.IsNullOrWhiteSpace(b.Name))
+                    {
+                        issues.Add(new LintIssue("Error", "Lint.InvalidQuestionPayload", pq.Id, "Classify bucket name cannot be empty."));
+                        continue;
+                    }
+                    bucketIds.Add(b.BucketId);
+                    if (!bucketNames.Add(b.Name.Trim()))
+                        issues.Add(new LintIssue("Error", "Lint.DuplicateClassifyBucket", pq.Id, $"Duplicate bucket name '{b.Name.Trim()}'."));
+                }
+                if (p.Items is null || p.Items.Count == 0)
+                {
+                    issues.Add(new LintIssue("Error", "Lint.EmptyClassifyBucket", pq.Id, "Classify question must contain items assigned to its buckets."));
+                    return;
+                }
+                var itemCounts = bucketIds.ToDictionary(id => id, _ => 0);
+                var seenItems = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var it in p.Items)
+                {
+                    if (it is null || string.IsNullOrWhiteSpace(it.Text))
+                    {
+                        issues.Add(new LintIssue("Error", "Lint.EmptyClassifyItem", pq.Id, "Classify question contains an item with empty text."));
+                        continue;
+                    }
+                    if (!seenItems.Add(it.Text.Trim()))
+                        issues.Add(new LintIssue("Error", "Lint.DuplicateClassifyItem", pq.Id, $"Classify question contains duplicate item '{it.Text.Trim()}'."));
+                    if (!bucketIds.Contains(it.BucketId))
+                        issues.Add(new LintIssue("Error", "Lint.InvalidQuestionPayload", pq.Id, $"Classify item '{it.Text}' references unknown bucketId {it.BucketId}."));
+                    else
+                        itemCounts[it.BucketId]++;
+                }
+                foreach (var b in p.Buckets)
+                {
+                    if (b is not null && itemCounts.TryGetValue(b.BucketId, out int cnt) && cnt == 0)
+                        issues.Add(new LintIssue("Error", "Lint.EmptyClassifyBucket", pq.Id, $"Classify bucket '{b.Name}' has 0 items assigned."));
+                }
+                break;
+            }
+            case QuestionType.Match:
+            {
+                if (!Phase1PayloadCodec.TryDeserialize<MatchPayload>(pq.PayloadJson, out var p) || p is null)
+                {
+                    issues.Add(new LintIssue("Error", "Lint.InvalidQuestionPayload", pq.Id, "Match question has invalid payload JSON."));
+                    return;
+                }
+                if (p.Pairs is null || p.Pairs.Count < 2)
+                    issues.Add(new LintIssue("Error", "Lint.InsufficientMatchPairs", pq.Id, $"Match question has {p.Pairs?.Count ?? 0} pair(s); at least 2 are required."));
+                var seenLeft = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var seenRight = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                if (p.Pairs is not null)
+                {
+                    foreach (var pair in p.Pairs)
+                    {
+                        if (pair is null || string.IsNullOrWhiteSpace(pair.Left) || string.IsNullOrWhiteSpace(pair.Right))
+                        {
+                            issues.Add(new LintIssue("Error", "Lint.EmptyMatchItem", pq.Id, "Match pair must have non-empty left and right text."));
+                            continue;
+                        }
+                        if (!seenLeft.Add(pair.Left.Trim()))
+                            issues.Add(new LintIssue("Error", "Lint.DuplicateMatchItem", pq.Id, $"Duplicate left item '{pair.Left.Trim()}' in match question."));
+                        if (!seenRight.Add(pair.Right.Trim()))
+                            issues.Add(new LintIssue("Error", "Lint.DuplicateMatchItem", pq.Id, $"Duplicate right item '{pair.Right.Trim()}' in match question."));
+                    }
+                }
+                if (p.Distractors is not null)
+                {
+                    foreach (var d in p.Distractors)
+                    {
+                        if (string.IsNullOrWhiteSpace(d))
+                            issues.Add(new LintIssue("Error", "Lint.EmptyMatchItem", pq.Id, "Match distractor cannot be empty."));
+                        else if (!seenRight.Add(d.Trim()))
+                            issues.Add(new LintIssue("Error", "Lint.DuplicateMatchItem", pq.Id, $"Match distractor '{d.Trim()}' duplicates an existing right-side option."));
+                    }
+                    if (p.Pairs is { Count: > 0 } && p.Distractors.Count > p.Pairs.Count)
+                        issues.Add(new LintIssue("Warning", "Lint.ExcessiveMatchDistractors", pq.Id, $"Match question has {p.Distractors.Count} distractors vs {p.Pairs.Count} pairs."));
+                }
+                break;
+            }
+            case QuestionType.Numeric:
+            {
+                if (!Phase1PayloadCodec.TryDeserialize<NumericPayload>(pq.PayloadJson, out var p) || p is null)
+                {
+                    issues.Add(new LintIssue("Error", "Lint.InvalidQuestionPayload", pq.Id, "Numeric question has invalid payload JSON."));
+                    return;
+                }
+                if (string.IsNullOrWhiteSpace(p.Prompt))
+                    issues.Add(new LintIssue("Error", "Lint.EmptyQuestionPrompt", pq.Id, "Numeric question prompt is empty."));
+                if (!double.IsFinite(p.Answer))
+                    issues.Add(new LintIssue("Error", "Lint.InvalidNumericAnswer", pq.Id, "Numeric answer must be a finite number."));
+                if (!double.IsFinite(p.Tolerance) || p.Tolerance < 0)
+                    issues.Add(new LintIssue("Error", "Lint.InvalidNumericTolerance", pq.Id, $"Numeric tolerance '{p.Tolerance}' must be a finite number >= 0."));
+                if (!Phase3PayloadRules.IsValidToleranceMode(p.ToleranceMode))
+                    issues.Add(new LintIssue("Error", "Lint.InvalidQuestionPayload", pq.Id, $"Invalid toleranceMode '{p.ToleranceMode}'. Use 'absolute' or 'percent'."));
+                if (!string.IsNullOrWhiteSpace(p.ImagePath))
+                    await CheckImageAssetAsync(storageDirectory, p.ImagePath, $"{pq.Id}:image", issues, ct);
+                break;
+            }
+            case QuestionType.CaseGroup:
+            {
+                if (!Phase1PayloadCodec.TryDeserialize<CaseGroupPayload>(pq.PayloadJson, out var p) || p is null)
+                {
+                    issues.Add(new LintIssue("Error", "Lint.InvalidQuestionPayload", pq.Id, "Case question has invalid payload JSON."));
+                    return;
+                }
+                if (string.IsNullOrWhiteSpace(p.Stem))
+                    issues.Add(new LintIssue("Error", "Lint.EmptyCaseStem", pq.Id, "Case question vignette stem cannot be empty."));
+                if (!string.IsNullOrWhiteSpace(p.ImagePath))
+                    await CheckImageAssetAsync(storageDirectory, p.ImagePath, $"{pq.Id}:image", issues, ct);
+                if (p.Questions is null || p.Questions.Count < 2)
+                    issues.Add(new LintIssue("Error", "Lint.InsufficientCaseQuestions", pq.Id, $"Case question has {p.Questions?.Count ?? 0} sub-question(s); at least 2 are required."));
+                if (p.Questions is not null)
+                {
+                    foreach (var sub in p.Questions)
+                    {
+                        if (sub is null)
+                        {
+                            issues.Add(new LintIssue("Error", "Lint.InvalidQuestionPayload", pq.Id, "Case sub-question cannot be null."));
+                            continue;
+                        }
+                        if (!Meloberry.Domain.Quizzes.Quiz.TryParseQuestionType(sub.Type, out var subType))
+                        {
+                            issues.Add(new LintIssue("Error", "Lint.InvalidQuestionPayload", $"{pq.Id}:sub-{sub.Index}", $"Invalid case sub-question type '{sub.Type}'."));
+                            continue;
+                        }
+                        if (subType == QuestionType.CaseGroup)
+                        {
+                            issues.Add(new LintIssue("Error", "Lint.NestedCaseNotAllowed", $"{pq.Id}:sub-{sub.Index}", "Nested 'case' sub-questions inside 'case' are not allowed."));
+                            continue;
+                        }
+
+                        var subId = $"{pq.Id}:sub-{sub.Index}";
+                        Question? rehydrated = subType switch
+                        {
+                            QuestionType.Mcq when sub.Mcq is not null => McqQuestion.Rehydrate(
+                                subId,
+                                pq.ContainerId,
+                                sub.Index + 1,
+                                sub.Mcq.Text ?? string.Empty,
+                                Math.Max(2, sub.Mcq.MaxOptions),
+                                sub.Mcq.IsMultiCorrect,
+                                (sub.Mcq.Options ?? []).Select(o => McqOption.Create(o.Index, o.Text, o.ImagePath, o.IsCorrect)),
+                                imagePath: sub.Mcq.ImagePath,
+                                explanation: sub.Mcq.Explanation),
+                            QuestionType.Flashcard when sub.Flashcard is not null => FlashcardQuestion.Rehydrate(
+                                subId,
+                                pq.ContainerId,
+                                sub.Index + 1,
+                                FlashcardSide.Rehydrate(sub.Flashcard.Front.Text, sub.Flashcard.Front.ImagePath,
+                                    string.Equals(sub.Flashcard.Front.Position, "aboveImage", StringComparison.OrdinalIgnoreCase) ? MediaPosition.TextAboveImage : MediaPosition.TextBelowImage),
+                                FlashcardSide.Rehydrate(sub.Flashcard.Back.Text, sub.Flashcard.Back.ImagePath,
+                                    string.Equals(sub.Flashcard.Back.Position, "aboveImage", StringComparison.OrdinalIgnoreCase) ? MediaPosition.TextAboveImage : MediaPosition.TextBelowImage)),
+                            _ => PayloadQuestion.Rehydrate(subId, pq.ContainerId, sub.Index + 1, subType, sub.PayloadJson ?? "{}")
+                        };
+                        await LintQuestionAsync(rehydrated, storageDirectory, issues, ct);
+                    }
                 }
                 break;
             }

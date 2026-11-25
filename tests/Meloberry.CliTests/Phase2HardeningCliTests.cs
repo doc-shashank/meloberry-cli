@@ -183,11 +183,15 @@ public sealed class Phase2HardeningCliTests : IDisposable
         using (var doc = JsonDocument.Parse(qSpecConsole.StandardOutput))
         {
             var schemas = doc.RootElement.GetProperty("data").GetProperty("schemas");
-            Assert.Equal(8, schemas.GetArrayLength());
+            Assert.Equal(12, schemas.GetArrayLength());
             var topics = schemas.EnumerateArray().Select(s => s.GetProperty("topic").GetString()).ToList();
             Assert.Contains("diff", topics);
             Assert.Contains("mechanism", topics);
             Assert.Contains("relabel", topics);
+            Assert.Contains("case", topics);
+            Assert.Contains("classify", topics);
+            Assert.Contains("match", topics);
+            Assert.Contains("numeric", topics);
             Assert.All(schemas.EnumerateArray(), s =>
             {
                 Assert.Equal("content", s.GetProperty("scope").GetString());

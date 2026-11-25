@@ -3,7 +3,7 @@ using Meloberry.Domain.Layouts;
 
 namespace Meloberry.Domain.Questions;
 
-public enum QuestionType { Mcq, Flashcard, FillBlank, AssertionReason, SpotError, Differentiation, Mechanism, RelabelImage }
+public enum QuestionType { Mcq, Flashcard, FillBlank, AssertionReason, SpotError, Differentiation, Mechanism, RelabelImage, CaseGroup, Classify, Match, Numeric }
 public enum FlashcardFace { Front, Back }
 public enum MediaPosition { TextBelowImage, TextAboveImage }
 
@@ -58,6 +58,10 @@ public abstract class Question : IIndexedEntity
         QuestionType.Differentiation => "diff",
         QuestionType.Mechanism => "mechanism",
         QuestionType.RelabelImage => "relabel",
+        QuestionType.CaseGroup => "case",
+        QuestionType.Classify => "classify",
+        QuestionType.Match => "match",
+        QuestionType.Numeric => "numeric",
         _ => type.ToString().ToLowerInvariant()
     };
 
@@ -74,7 +78,7 @@ public abstract class Question : IIndexedEntity
 
     public Result<string> SetLayoutOverride(string propertyName, string rawValue)
     {
-        var resolved = LayoutBoundsCatalog.ValidateAndResolve(LayoutTargetKey, propertyName, rawValue);
+        var resolved = LayoutBoundsCatalog.ValidateAndResolveForEntityOverride(LayoutTargetKey, propertyName, rawValue);
         if (!resolved.IsSuccess) return resolved.Error!;
         _layoutOverrides[resolved.Value.CanonicalName] = resolved.Value.Value;
         return resolved.Value.Value;
