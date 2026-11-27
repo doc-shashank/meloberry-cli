@@ -70,19 +70,19 @@ public sealed class LayoutAndWebAppTests : IDisposable
         var domainMeta = new AssemblyCliToolMetadataProvider(typeof(Meloberry.Domain.Common.Result).Assembly, "mby").GetMetadata();
         var appMeta = new AssemblyCliToolMetadataProvider(typeof(Meloberry.Application.DependencyInjection).Assembly, "mby").GetMetadata();
         var infraMeta = sp.GetRequiredService<ICliToolMetadataProvider>().GetMetadata();
-        Assert.Equal("2.1.1", domainMeta.Version);
-        Assert.Equal("2.1.1", appMeta.Version);
-        Assert.Equal("2.1.1", infraMeta.Version);
+        Assert.Equal("2.1.3", domainMeta.Version);
+        Assert.Equal("2.1.3", appMeta.Version);
+        Assert.Equal("2.1.3", infraMeta.Version);
         Assert.Equal("Meloberry", infraMeta.AppName);
         Assert.Equal("Meloberry CLI", infraMeta.ProductName);
         Assert.Equal("mby", infraMeta.ExecutableName);
         Assert.Equal("https://github.com/doc-shashank/meloberry-cli/", infraMeta.RepositoryUrl);
 
         var editorHtml = sp.GetRequiredService<ILayoutEditorPageBuilder>().BuildHtml("relabel", infraMeta, "csrf-sample-123");
-        Assert.Contains("<meta name=\"generator\" content=\"Meloberry CLI (mby) 2.1.1\"", editorHtml);
+        Assert.Contains("<meta name=\"generator\" content=\"Meloberry CLI (mby) 2.1.3\"", editorHtml);
         Assert.Contains("EDITOR_CSRF_TOKEN = \"csrf-sample-123\"", editorHtml);
         Assert.Contains("X-Mby-Editor-Token", editorHtml);
-        Assert.Contains("mby v2.1.1", editorHtml);
+        Assert.Contains("mby v2.1.3", editorHtml);
         Assert.Contains("data-theme=\"paper\"", editorHtml);
         foreach (var targetId in new[] { "article-text", "callout", "table", "image", "mcq-question", "mcq-options", "fill-blank", "assertion-reason", "spot-error", "diff", "mechanism", "relabel", "flashcard" })
             Assert.Contains($"id: '{targetId}'", editorHtml);
@@ -137,7 +137,7 @@ public sealed class LayoutAndWebAppTests : IDisposable
 
         var html = await File.ReadAllTextAsync(built.Value.IndexHtmlPath);
         var js = await File.ReadAllTextAsync(Path.Combine(webOut, "app.js"));
-        Assert.Contains("<meta name=\"generator\" content=\"Meloberry CLI (mby) 2.1.1\"", html);
+        Assert.Contains("<meta name=\"generator\" content=\"Meloberry CLI (mby) 2.1.3\"", html);
         Assert.DoesNotContain("<script>alert(1)</script>", js);
         Assert.DoesNotContain("javascript:alert(2)", js);
         Assert.Contains("aboveImage", js);
@@ -374,9 +374,18 @@ public sealed class LayoutAndWebAppTests : IDisposable
         var built = await build.HandleAsync(new BuildWebAppCommand(applied.Value.TargetId, webDir, StaticVerifyOnly: true));
         Assert.True(built.IsSuccess && built.Value.Verify?.Passed == true);
 
-        // Verify componentIndex lives in app.js (not index.html)
+        // Verify componentIndex lives in app.js (not index.html) and Phase 1 widget improvements emit properly
         var appJs = await File.ReadAllTextAsync(Path.Combine(webDir, "app.js"));
         Assert.Contains("\"componentIndex\":2", appJs);
+        var classifyJs = await File.ReadAllTextAsync(Path.Combine(webDir, "components", "questions", "classify.js"));
+        var matchJs = await File.ReadAllTextAsync(Path.Combine(webDir, "components", "questions", "match.js"));
+        var numericJs = await File.ReadAllTextAsync(Path.Combine(webDir, "components", "questions", "numeric.js"));
+        Assert.Contains("deterministicShuffle", classifyJs);
+        Assert.DoesNotContain("Math.random()", classifyJs);
+        Assert.Contains("deterministicShuffle", matchJs);
+        Assert.DoesNotContain("Math.random()", matchJs);
+        Assert.Contains("toPrecision(6)", numericJs);
+        Assert.Contains("off by ", numericJs);
 
         // Run 1: Live headless CDP check across all 6 blocks + all 12 question types
         var cdpRes = await verifier.VerifyAsync(webDir, staticOnly: false, timeoutSeconds: 45);

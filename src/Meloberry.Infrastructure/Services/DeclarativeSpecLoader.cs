@@ -620,7 +620,7 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
             "Assertion-Reason question cannot specify 'text' or fields belonging to another question type."),
         [QuestionType.SpotError] = (QuestionFieldMask.ImagePath | QuestionFieldMask.SpotOnly | QuestionFieldMask.AllowNoError | QuestionFieldMask.Text,
             "Spot-the-error question specifies fields belonging to another question type."),
-        [QuestionType.Differentiation] = (QuestionFieldMask.RecallFlags | QuestionFieldMask.AllowNoError | QuestionFieldMask.Mode | QuestionFieldMask.DiffOnly | QuestionFieldMask.Title,
+        [QuestionType.Differentiation] = (QuestionFieldMask.RecallFlags | QuestionFieldMask.Placeholder | QuestionFieldMask.AllowNoError | QuestionFieldMask.Mode | QuestionFieldMask.DiffOnly | QuestionFieldMask.Title,
             "Differentiation question cannot specify 'text' or fields belonging to another question type."),
         [QuestionType.Mechanism] = (QuestionFieldMask.MechOnly | QuestionFieldMask.Title,
             "Mechanism question cannot specify 'text' or fields belonging to another question type."),
@@ -746,7 +746,8 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
                             mode, string.IsNullOrWhiteSpace(q.Title) ? null : q.Title.Trim(),
                             q.Bank ?? false, q.Fuzzy ?? true, q.CaseSensitive ?? false, q.AllowNoError ?? false,
                             headers, alignments, rows, specialRes.IsSuccess ? specialRes.Value : [],
-                            string.IsNullOrWhiteSpace(q.Explanation) ? null : q.Explanation.Trim()));
+                            string.IsNullOrWhiteSpace(q.Explanation) ? null : q.Explanation.Trim(),
+                            string.IsNullOrWhiteSpace(q.Placeholder) ? null : q.Placeholder.Trim()));
                         break;
                     }
                     case QuestionType.Mechanism:

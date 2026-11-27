@@ -71,25 +71,29 @@ Three global profiles (`article`, `mcq`, `flashcard`) persist in `<app-data>/app
 | `Lint.EmptyRelabelLabel` | Error | `relabel` overlay box has an empty label |
 | `Lint.InvalidRelabelBoxBounds` | Error | `relabel` box coordinates fall outside `[0..1]` or exceed `x+w <= 1` / `y+h <= 1` |
 | `Lint.EmptyDiagramHotspots` | Error | `diagram-explore` block defines zero annotated hotspots |
+| `Lint.ExcessiveDiagramHotspots` | Warning | `diagram-explore` block exceeds recommended max (`20`) hotspots |
 | `Lint.EmptyDiagramHotspotLabel` / `Note` | Error | `diagram-explore` hotspot has an empty label or annotation note |
 | `Lint.InvalidDiagramHotspotBounds` | Error | `diagram-explore` hotspot falls outside `[0..1]` or exceeds `x+w <= 1` / `y+h <= 1` |
 | `Lint.EmptyRevealSteps` / `Step` | Error | `reveal` block has zero steps or a step with empty heading/body |
+| `Lint.ExcessiveRevealSteps` | Warning | `reveal` block exceeds recommended max (`20`) steps |
 | `Lint.InsufficientClassifyBuckets` | Error | `classify` question has `< 2` buckets |
+| `Lint.ExcessiveClassifyBuckets` / `Items` | Warning | `classify` question exceeds recommended max (`4` buckets / `24` items) |
 | `Lint.DuplicateClassifyBucket` / `Item` | Error | `classify` has duplicate bucket names or duplicate items |
 | `Lint.EmptyClassifyBucket` / `Item` | Error | `classify` has an empty item or a bucket with `0` assigned items |
 | `Lint.InsufficientMatchPairs` | Error | `match` question has `< 2` `Left :: Right` pairs |
+| `Lint.ExcessiveMatchPairs` / `Distractors` | Warning | `match` exceeds recommended max (`12` pairs / `6` distractors or `> pairs`) |
 | `Lint.EmptyMatchItem` / `DuplicateMatchItem` | Error | `match` has empty or duplicate left/right/distractor entries |
-| `Lint.ExcessiveMatchDistractors` | Warning | `match` has more distractors than matching pairs |
 | `Lint.InvalidNumericAnswer` / `Tolerance` | Error | `numeric` answer is not finite or tolerance is negative/non-finite |
 | `Lint.EmptyCaseStem` | Error | `case` vignette stem text is empty |
 | `Lint.InsufficientCaseQuestions` | Error | `case` has `< 2` sub-questions |
+| `Lint.ExcessiveCaseQuestions` | Warning | `case` question exceeds recommended max (`10`) sub-questions |
 | `Lint.NestedCaseNotAllowed` | Error | `case` contains a nested `case` sub-question |
 
 ## Generated WebApp, Search & Headless Verification
 
 `build` emits `index.html`, `styles.css` (active theme only), `app.js`, tree-shaken `components/{aux,blocks,questions}/` modules for only the block/question specs used by the workspace, `assets/`, `preview-index.{json,js}` (for sessions), and offline `katex/` assets whenever math is detected (including captions, callouts, table titles/headers/cells/footnotes, blank answers, and spot-error corrections).
-- **Articles:** Render semantic `<figure>/<figcaption>` pairs, `pearl`/`clinical`/`warning` callout cards, interactive study tables (`stickyFirstCol`, `hideableCols` blur/peek recall toggles), and native `mby://` link cards / cross-article navigation.
-- **Interactive Recall & Quizzes:** Supports MCQ, 3D flashcards, `fill-blank` (custom `placeholder`, case/whitespace/Greek normalization, Levenshtein fuzzy tolerance, and `"Override: Mark Correct"`), `assertion-reason`, `spot-error` (optional prompt `image`, tappable chips, optional `requireFix` input with `Enter` submit, and `"No error"` toggle), `diff` (`fill` with optional word bank, `spot-wrong`, `rearrange`), `mechanism` (parallel `orderGroup` sequencing + decoys), and `relabel` (`reveal`, `bank`, `recall` occlusion over an unmasked diagram).
+- **Articles:** Render semantic `<figure>/<figcaption>` pairs, `pearl`/`clinical`/`warning` callout cards, interactive study tables (`stickyFirstCol`, `hideableCols` blur/peek recall toggles), `diagram-explore` interactive hotspot stages, `reveal` progressive step-through cards, and native `mby://` link cards / cross-article navigation.
+- **Interactive Recall & Quizzes:** Supports MCQ, 3D flashcards, `fill-blank` (custom `placeholder`, case/whitespace/Greek normalization, Levenshtein fuzzy tolerance, and `"Override: Mark Correct"`), `assertion-reason`, `spot-error` (optional prompt `image`, tappable chips, optional `requireFix` input with `Enter` submit, and `"No error"` toggle), `diff` (`fill` with optional word bank and `placeholder`, `spot-wrong`, `rearrange`), `mechanism` (parallel `orderGroup` sequencing + decoys), `relabel` (`reveal`, `bank`, `recall` occlusion over an unmasked diagram), `classify` (multi-bucket chip sorting), `match` (two-column pairing with distractors), `numeric` (unit-aware tolerance grading), and `case` (shared vignette driving linked sub-questions).
 - **Search & Telemetry:** Client-side `Ctrl+K` / `/` full-text search indexes all article blocks, tables, and quiz questions.
 - `mby analyze <webDir> --headless` (or `--static-only` without a browser) runs zero-touch DOM/image/overflow/KaTeX/table-toggle/search/console verification and writes `reports/verify.latest.json`.
 - `mby analyze <webDir> --live` captures interactive `POST /api/analysis` telemetry into `<webDir>/reports/*.analysis.json`.

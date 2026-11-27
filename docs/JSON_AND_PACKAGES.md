@@ -30,7 +30,7 @@ Pass a `.md` file or directory (`./articles/`) directly to `mby apply` or `mby b
   - `:::fill-blank{ref?="slug" fuzzy?=true caseSensitive?=false placeholder?="..." explanation?="..."}` using `{{primary | alias}}` slots (preserves `$...$` math and `` `...` `` inline code spans; supports `:::explanation`).
   - `:::assertion-reason{ref?="slug" answer="both-explain"|"both-no-explain"|"a-true-r-false"|"a-false-r-true"|"both-false" scheme?="4opt"|"5opt" explanation?="..."}` with `A:` and `R:` statements (`scheme` defaults to `5opt` when `answer` is `both-false`, else `4opt`; explicit `4opt` with `both-false` fails lint).
   - `:::spot-error{ref?="slug" image?="assets/fig.png" requireFix?=false allowNoError?=false noError?=false explanation?="..."}` with `[candidate]` and `[~~wrong~~ -> correction | alias]` spans (`allowNoError` defaults to `false`, flipping to `true` when `noError=true`; `\\[...]` renders literal `\` before `[...]`).
-  - `:::diff{ref?="slug" mode="fill"|"spot-wrong"|"rearrange" title?="..." bank?=false fuzzy?=true caseSensitive?=false allowNoError?=false explanation?="..."}` with a Markdown table using `{{ans | alias}}` blanks (`fill`) or `~~wrong~~ -> fix \| alias` / `~~wrong~~ -> {{fix | alias}}` cells (`spot-wrong`), plus optional `:::explanation`.
+  - `:::diff{ref?="slug" mode="fill"|"spot-wrong"|"rearrange" title?="..." bank?=false fuzzy?=true caseSensitive?=false allowNoError?=false placeholder?="..." explanation?="..."}` with a Markdown table using `{{ans | alias}}` blanks (`fill`) or `~~wrong~~ -> fix \| alias` / `~~wrong~~ -> {{fix | alias}}` cells (`spot-wrong`), plus optional `:::explanation`.
   - `:::mechanism{ref?="slug" title?="..." explanation?="..."}` with numbered ordered steps (`1. ...`), commutative parallel groups (`2a. ...`, `2b. ...`), and optional decoy steps (`! ...`), plus optional `:::explanation`.
   - `:::relabel{ref?="slug" image="assets/fig.png" masks?="assets/fig.masks.json" mode?="bank"|"reveal"|"recall" style?="solid"|"blur"|"pixelate"|"whiteout" fuzzy?=true caseSensitive?=false explanation?="..."}` with YAML body (`prompt`, `include`, `distractors`, inline `boxes` with `label`, `aliases`, `rect: [x,y,w,h]` or `x/y/w/h`) and optional `:::explanation`.
   - `:::classify{ref?="slug" title?="..." explanation?="..."}` with `[Bucket Name]` headers and `- Item` bullets.
@@ -133,6 +133,40 @@ Pass a `.md` file or directory (`./articles/`) directly to `mby apply` or `mby b
           "boxes": [
             { "label": "Glomerulus", "rect": [0.45, 0.15, 0.14, 0.05] }
           ]
+        },
+        {
+          "type": "classify",
+          "title": "Sort Diuretics",
+          "buckets": ["Loop", "Thiazide"],
+          "items": [
+            { "bucket": "Loop", "text": "Furosemide" },
+            { "bucket": "Thiazide", "text": "Hydrochlorothiazide" }
+          ]
+        },
+        {
+          "type": "match",
+          "title": "Match Receptors",
+          "pairs": [
+            { "left": "Alpha-1", "right": "$G_q$" },
+            { "left": "Beta-2", "right": "$G_s$" }
+          ],
+          "distractors": ["$G_i$"]
+        },
+        {
+          "type": "numeric",
+          "text": "Calculate MAP for BP 120/80 mmHg.",
+          "answer": 93.3,
+          "tolerance": "5%",
+          "unit": "mmHg"
+        },
+        {
+          "type": "case",
+          "title": "Renal Vignette",
+          "stem": "A patient presents with hypertension and hypokalemia.",
+          "questions": [
+            { "type": "mcq", "text": "Likely hormone elevated?", "options": [{ "text": "Aldosterone", "isCorrect": true }, { "text": "ADH", "isCorrect": false }] },
+            { "type": "numeric", "text": "Normal serum K+ lower bound:", "answer": 3.5, "tolerance": 0.2, "unit": "mEq/L" }
+          ]
         }
       ]
     }
@@ -153,15 +187,21 @@ Pass a `.md` file or directory (`./articles/`) directly to `mby apply` or `mby b
   - `image`: `{ imagePath?, caption?, alt?, ref? }`
   - `callout`: `{ tone?, title?, text?, ref? }`
   - `table`: `{ title?, caption?, stickyFirstCol?, hideableCols?, headers?, alignments?, rows?, footnote?, ref? }` *(1-based `hideableCols`; row widths and `alignments` are validated immediately against `headers.length`)*
+  - `diagram-explore`: `{ title?, caption?, alt?, imagePath?, hotspots?, ref? }`
+  - `reveal`: `{ title?, showFirst?, steps?, ref? }`
 - `question`:
   - `mcq`: `{ text?, imagePath?, explanation?, isMultiCorrect?, maxOptions?, options?, ref?, layoutOverrides? }` *(`options` requires `2..26` items on `patch`; omitting `maxOptions` auto-expands up to `26` when `>4` options are passed)*
   - `flashcard`: `{ front?: { text?, imagePath?, position? }, back?: { ... }, ref?, layoutOverrides? }`
   - `fill-blank`: `{ text?, fuzzy?, caseSensitive?, placeholder?, explanation?, ref?, layoutOverrides? }`
   - `assertion-reason`: `{ assertion?, reason?, answer?, scheme?, explanation?, ref?, layoutOverrides? }`
   - `spot-error`: `{ text?, imagePath?, requireFix?, allowNoError?, noError?, explanation?, ref?, layoutOverrides? }`
-  - `diff`: `{ mode?, title?, bank?, fuzzy?, caseSensitive?, allowNoError?, headers?, alignments?, rows?, explanation?, ref?, layoutOverrides? }`
+  - `diff`: `{ mode?, title?, bank?, fuzzy?, caseSensitive?, allowNoError?, placeholder?, headers?, alignments?, rows?, explanation?, ref?, layoutOverrides? }`
   - `mechanism`: `{ title?, steps?, explanation?, ref?, layoutOverrides? }`
   - `relabel`: `{ imagePath?, prompt?, mode?, style?, boxes?, distractors?, fuzzy?, caseSensitive?, explanation?, ref?, layoutOverrides? }`
+  - `case`: `{ title?, stem?, imagePath?, caption?, questions?, explanation?, ref?, layoutOverrides? }`
+  - `classify`: `{ title?, buckets?, items?, explanation?, ref?, layoutOverrides? }`
+  - `match`: `{ title?, pairs?, distractors?, explanation?, ref?, layoutOverrides? }`
+  - `numeric`: `{ text?, prompt?, answer?, tolerance?, toleranceMode?, unit?, placeholder?, imagePath?, explanation?, ref?, layoutOverrides? }`
 - `--set <k=v>` converts `null` to JSON `null` (`hideableCols=null` clears to `[]`), clearing nullable fields/overrides and rejecting non-nullable fields with `Patch.InvalidValue`. An empty `{}` patch without `--set` or `--move` fails with `Patch.Empty`. Pass `--move <index>:<shift|exchange>` to reorder.
 
 ### `.mbypkg` Package Format (`v2.0` — Backward-Compatible `v1.0`/`v2.0` Import)

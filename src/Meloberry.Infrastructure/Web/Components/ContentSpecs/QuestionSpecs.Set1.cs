@@ -373,6 +373,11 @@ function attachFlashcardFlip(scene, inner, frontFace, backFace, flipMs, getFlipp
     const explanationBox = MBY.helpers.createExplanationBox(num.explanationHtml, st.checked, ctx);
 
     const tolRadius = num.toleranceMode === 'percent' ? Math.abs(num.answer * (num.tolerance / 100)) : Math.abs(num.tolerance);
+    const fmtNum = v => {
+      if (!Number.isFinite(v)) return String(v);
+      const rounded = Number(v.toPrecision(6));
+      return Math.abs(rounded) < 1e-12 ? '0' : String(rounded);
+    };
 
     function syncVisual() {
       input.classList.remove('correct', 'wrong');
@@ -380,9 +385,14 @@ function attachFlashcardFlip(scene, inner, frontFace, backFace, flipMs, getFlipp
       if (st.checked) {
         input.classList.add(st.isCorrect ? 'correct' : 'wrong');
         const unitTxt = num.unit ? ` ${num.unit}` : '';
-        if (tolRadius > 0) rangeEl.textContent = `Accepted: ${(num.answer - tolRadius).toPrecision(4)} .. ${(num.answer + tolRadius).toPrecision(4)}${unitTxt}`;
-        else rangeEl.textContent = `Exact answer: ${num.answer}${unitTxt}`;
-        MBY.helpers.setFeedbackMessage(feedback, st.isCorrect ? 'Correct!' : 'Out of accepted range.', st.isCorrect);
+        if (tolRadius > 0) rangeEl.textContent = `Accepted: ${fmtNum(num.answer - tolRadius)} .. ${fmtNum(num.answer + tolRadius)}${unitTxt}`;
+        else rangeEl.textContent = `Exact answer: ${fmtNum(num.answer)}${unitTxt}`;
+        let msg = st.isCorrect ? 'Correct!' : 'Out of accepted range.';
+        if (!st.isCorrect && Number.isFinite(st.parsedValue) && num.answer !== 0) {
+          const pctOff = Math.abs((st.parsedValue - num.answer) / num.answer) * 100;
+          msg = `Out of accepted range (off by ${pctOff.toFixed(1)}%).`;
+        }
+        MBY.helpers.setFeedbackMessage(feedback, msg, st.isCorrect);
         if (explanationBox) explanationBox.classList.remove('hidden');
       } else {
         feedback.textContent = '';
@@ -392,7 +402,7 @@ function attachFlashcardFlip(scene, inner, frontFace, backFace, flipMs, getFlipp
     }
 
     const retryBtn = MBY.helpers.createRetryBtn(() => {
-      st.value = ''; st.checked = false; st.isCorrect = null;
+      st.value = ''; st.parsedValue = NaN; st.checked = false; st.isCorrect = null;
       input.value = '';
       syncVisual();
       const m = ctx.metricById.get(slide.id); if (m) m.isCorrect = null;
@@ -404,11 +414,16 @@ function attachFlashcardFlip(scene, inner, frontFace, backFace, flipMs, getFlipp
       if (st.checked) { st.checked = false; st.isCorrect = null; syncVisual(); }
     });
     function gradeNumeric() {
-      const cleaned = (st.value || '').trim().replace(/,/g, '');
+      let cleaned = (st.value || '').trim().replace(/,/g, '');
+      if (num.unit) {
+        const escUnit = num.unit.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        cleaned = cleaned.replace(new RegExp('\\s*' + escUnit + '$', 'i'), '').trim();
+      }
       const parsed = cleaned === '' ? NaN : Number(cleaned);
       const ok = Number.isFinite(parsed) && Math.abs(parsed - num.answer) <= tolRadius + 1e-9;
       st.checked = true;
       st.isCorrect = ok;
+      st.parsedValue = parsed;
       MBY.helpers.recordGradeAttempt(ctx.metricById.get(slide.id), ok);
       syncVisual();
       if (onAnswered) onAnswered();

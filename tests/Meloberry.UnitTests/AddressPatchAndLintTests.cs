@@ -126,7 +126,9 @@ public sealed class AddressPatchAndLintTests : IDisposable
         Assert.True((await patch.HandleAsync(new PatchEntityCommand($"{wsId}#rev1", SetPairs: ["showFirst=true"]))).IsSuccess);
         Assert.True((await patch.HandleAsync(new PatchEntityCommand($"{wsId}#q-fb", SetPairs: ["fuzzy=false", "text=Pacemaker is {{PFK-1}}."]))).IsSuccess);
         Assert.True((await patch.HandleAsync(new PatchEntityCommand($"{wsId}#q-ar", SetPairs: ["answer=both-explain"]))).IsSuccess);
-        Assert.True((await patch.HandleAsync(new PatchEntityCommand($"{wsId}#q-diff", InlineJson: """{"title":"Updated Diff","bank":false,"rows":[["Resp","{{High PaCO2}}","Renal"]]}"""))).IsSuccess);
+        Assert.True((await patch.HandleAsync(new PatchEntityCommand($"{wsId}#q-diff", InlineJson: """{"title":"Updated Diff","bank":false,"placeholder":"Type gas change","rows":[["Resp","{{High PaCO2}}","Renal"]]}"""))).IsSuccess);
+        var patchedDiff = (PayloadQuestion)(await resolver.ResolveAsync($"{wsId}#q-diff")).Value.Question!;
+        Assert.Contains("\"placeholder\":\"Type gas change\"", patchedDiff.PayloadJson);
         Assert.True((await patch.HandleAsync(new PatchEntityCommand($"{wsId}#q-mech", InlineJson: """{"title":"Upd Mech","steps":[{"orderGroup":1,"text":"A"},{"orderGroup":2,"text":"B"},{"isDistractor":true,"text":"C"}]}"""))).IsSuccess);
         Assert.True((await patch.HandleAsync(new PatchEntityCommand($"{wsId}#q-rel", SetPairs: ["mode=reveal", "style=pixelate", "prompt=Updated"]))).IsSuccess);
         Assert.True((await patch.HandleAsync(new PatchEntityCommand($"{wsId}#q-rel", JsonFilePath: await WriteTempJsonAsync(srcDir, "p_img.json", """{"imagePath":"fig2.png"}""")))).IsSuccess);
@@ -335,6 +337,55 @@ public sealed class AddressPatchAndLintTests : IDisposable
         await repo.CreateQuizAsync(Quiz.Rehydrate("Set_20261124_120000_993", QuizType.Mixed, corruptStorage,
             [PayloadQuestion.Rehydrate("Q_20261124_120000_993", "Set_20261124_120000_993", 1, QuestionType.FillBlank, """{"template":"Enzyme is {{PFK-1}}."}""")], "Corrupt"));
         Assert.Contains((await lint.HandleAsync(new LintCommand("Set_20261124_120000_993"))).Value.Issues, i => i.Code == "Lint.InvalidQuestionPayload");
+
+        // 4. Phase 3 Max* lint warnings when density thresholds are exceeded
+        var denseHotspots = string.Join(",", Enumerable.Range(1, Phase3PayloadRules.MaxHotspots + 1).Select(idx => $"{{\"label\":\"H{idx}\",\"note\":\"Note {idx}\",\"rect\":[0.1,0.1,0.1,0.1]}}"));
+        var denseSteps = string.Join(",", Enumerable.Range(1, Phase3PayloadRules.MaxRevealSteps + 1).Select(idx => $"{{\"heading\":\"S{idx}\",\"body\":\"B{idx}\"}}"));
+        var denseBuckets = string.Join(",", Enumerable.Range(1, Phase3PayloadRules.MaxClassifyBuckets + 1).Select(idx => $"\"B{idx}\""));
+        var denseItems = string.Join(",", Enumerable.Range(1, Phase3PayloadRules.MaxClassifyItems + 1).Select(idx => $"{{\"bucket\":\"B{(idx % (Phase3PayloadRules.MaxClassifyBuckets + 1)) + 1}\",\"text\":\"Item {idx}\"}}"));
+        var densePairs = string.Join(",", Enumerable.Range(1, Phase3PayloadRules.MaxMatchPairs + 1).Select(idx => $"{{\"left\":\"L{idx}\",\"right\":\"R{idx}\"}}"));
+        var denseSubQs = string.Join(",", Enumerable.Range(1, Phase3PayloadRules.MaxCaseQuestions + 1).Select(idx => $"{{\"type\":\"numeric\",\"text\":\"Q{idx}\",\"answer\":{idx}}}"));
+        var denseSpecPath = await WriteTempJsonAsync(srcDir, "dense_warnings.json", $$"""
+        {
+          "kind": "session",
+          "name": "Dense Warnings",
+          "components": [
+            {
+              "kind": "article",
+              "title": "Dense Article",
+              "blocks": [
+                { "kind": "diagram-explore", "imagePath": "img.png", "hotspots": [{{denseHotspots}}] },
+                { "kind": "reveal", "steps": [{{denseSteps}}] }
+              ]
+            },
+            {
+              "kind": "quiz",
+              "quizType": "mixed",
+              "title": "Dense Quiz",
+              "questions": [
+                { "type": "classify", "buckets": [{{denseBuckets}}], "items": [{{denseItems}}] },
+                { "type": "match", "pairs": [{{densePairs}}] },
+                { "type": "case", "stem": "Dense stem.", "questions": [{{denseSubQs}}] }
+              ]
+            }
+          ]
+        }
+        """);
+        var denseApplied = (await apply.HandleAsync(new ApplySpecCommand(null, denseSpecPath, WorkingDirectory: _fx.WorkDir))).Value;
+        var denseReport = (await lint.HandleAsync(new LintCommand(denseApplied.TargetId))).Value;
+        Assert.True(denseReport.IsClean);
+        foreach (var warnCode in new[]
+        {
+            "Lint.ExcessiveDiagramHotspots",
+            "Lint.ExcessiveRevealSteps",
+            "Lint.ExcessiveClassifyBuckets",
+            "Lint.ExcessiveClassifyItems",
+            "Lint.ExcessiveMatchPairs",
+            "Lint.ExcessiveCaseQuestions"
+        })
+        {
+            Assert.Single(denseReport.Issues, i => i.Severity == "Warning" && i.Code == warnCode);
+        }
     }
 
     private static async Task<string> WriteTempJsonAsync(string dir, string name, string content)

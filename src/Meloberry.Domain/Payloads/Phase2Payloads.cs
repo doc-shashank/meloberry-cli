@@ -27,7 +27,8 @@ public sealed record DifferentiationPayload(
     IReadOnlyList<string> Alignments,
     IReadOnlyList<IReadOnlyList<string>> Rows,
     IReadOnlyList<DiffCellSpec> SpecialCells,
-    string? Explanation);
+    string? Explanation,
+    string? Placeholder = null);
 
 public sealed record MechanismStep(
     int StepId,

@@ -99,6 +99,15 @@ public sealed class PersistenceAndPackagingTests : IDisposable
 
         var listedAfter = await repo.ListWorkspacesAsync(wsRoot);
         Assert.Equal(2, Assert.Single(listedAfter, w => w.Id == sessionId).ItemCount);
+
+        // Verify IX_EntityIndex_WorkspaceId secondary index exists in app_settings.db
+        await using (var appConn = new SqliteConnection($"Data Source={Path.Combine(_fx.AppDataDir, "app_settings.db")};Pooling=False"))
+        {
+            await appConn.OpenAsync();
+            await using var idxCmd = appConn.CreateCommand();
+            idxCmd.CommandText = "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'IX_EntityIndex_WorkspaceId';";
+            Assert.Equal("IX_EntityIndex_WorkspaceId", (await idxCmd.ExecuteScalarAsync())?.ToString());
+        }
     }
 
     [Fact]

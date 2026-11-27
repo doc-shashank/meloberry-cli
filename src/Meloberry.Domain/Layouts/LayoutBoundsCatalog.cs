@@ -136,12 +136,6 @@ public static class LayoutBoundsCatalog
         return ValidateAndResolve(targetTypes, propertyName, rawValue);
     }
 
-    public static Result<string> ValidateAndNormalize(string targetType, string propertyName, string rawValue)
-    {
-        var res = ValidateAndResolve(targetType, propertyName, rawValue);
-        return res.IsSuccess ? res.Value.Value : res.Error!;
-    }
-
     public static string GetCanonicalPropertyName(string targetType, string propertyName) =>
         FindSpec(targetType.Trim().ToLowerInvariant(), propertyName)?.Name ?? propertyName;
 

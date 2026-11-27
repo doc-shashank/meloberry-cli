@@ -434,7 +434,8 @@ public sealed partial class SlidingWebAppGenerator(
                     rowsHtml,
                     rowsRaw,
                     specialModels,
-                    expHtml));
+                    expHtml,
+                    dp.Placeholder));
         }
 
         if (question.Type == QuestionType.Mechanism && Phase1PayloadCodec.TryDeserialize<MechanismPayload>(question.PayloadJson, out var mp) && mp is not null)
@@ -2226,7 +2227,8 @@ renderSlides();
         List<List<string>> RowsHtml,
         List<List<string>>? RowsRaw,
         List<DiffCellRenderModel> SpecialCells,
-        string? ExplanationHtml);
+        string? ExplanationHtml,
+        string? Placeholder = null);
     internal sealed record MechanismStepRenderModel(int StepId, int OrderGroup, string Html, bool IsDistractor);
     internal sealed record MechanismRenderModel(string? Title, string? TitleHtml, List<MechanismStepRenderModel> Steps, string? ExplanationHtml);
     internal sealed record RelabelBoxRenderModel(int Index, string Label, List<string> Aliases, double X, double Y, double W, double H);

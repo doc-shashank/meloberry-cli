@@ -98,6 +98,7 @@ public sealed class SqliteLayoutRepository(MeloberryStorageOptions options) : IL
                     CREATE TABLE IF NOT EXISTS LayoutProfiles (TargetType TEXT PRIMARY KEY, PropertiesJson TEXT NOT NULL, UpdatedAtUtc TEXT NOT NULL);
                     CREATE TABLE IF NOT EXISTS WorkspaceRegistry (WorkspaceId TEXT PRIMARY KEY, Kind TEXT NOT NULL, SubType TEXT NOT NULL, DbPath TEXT NOT NULL, StorageDirectory TEXT NOT NULL, UpdatedAtUtc TEXT NOT NULL, ItemCount INTEGER NULL, DbLastWriteUtc TEXT NULL);
                     CREATE TABLE IF NOT EXISTS EntityIndex (EntityId TEXT PRIMARY KEY, WorkspaceId TEXT NOT NULL);
+                    CREATE INDEX IF NOT EXISTS IX_EntityIndex_WorkspaceId ON EntityIndex(WorkspaceId);
                     """;
                 await cmd.ExecuteNonQueryAsync(cancellationToken);
             }

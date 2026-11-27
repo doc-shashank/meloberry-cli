@@ -24,8 +24,6 @@ public sealed class LocalPreviewHost(
         DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
     };
 
-    private static readonly JsonSerializerOptions CompactJsonOptions = JsonOptions;
-
     public Task<int> ServeDirectoryAsync(
         string directoryPath,
         IConsole console,
@@ -249,7 +247,7 @@ public sealed class LocalPreviewHost(
             return CliResultExtensions.WriteValidationError(
                 console,
                 "Layout.InvalidTargetType",
-                $"Invalid target '{targetType}'. Use 'article-text', 'callout', 'table', 'image', 'mcq-question', 'mcq-options', 'fill-blank', 'assertion-reason', 'spot-error', 'diff', 'mechanism', 'relabel', 'flashcard' (or legacy 'article', 'mcq').",
+                $"Invalid target '{targetType}'. Use 'article-text', 'callout', 'table', 'image', 'diagram-explore', 'reveal', 'mcq-question', 'mcq-options', 'fill-blank', 'assertion-reason', 'spot-error', 'diff', 'mechanism', 'relabel', 'classify', 'match', 'numeric', 'case', 'flashcard' (or legacy 'article', 'mcq').",
                 json);
         }
 
@@ -764,7 +762,7 @@ public sealed class LocalPreviewHost(
 
     private static Task TryWriteJsonAsync(HttpListenerResponse response, int statusCode, object? payload, CancellationToken cancellationToken)
     {
-        var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(payload, CompactJsonOptions));
+        var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(payload, JsonOptions));
         return TryWriteBytesAsync(response, statusCode, "application/json; charset=utf-8", bytes, cancellationToken);
     }
 

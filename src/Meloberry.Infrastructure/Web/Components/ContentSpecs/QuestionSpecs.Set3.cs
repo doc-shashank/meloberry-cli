@@ -342,7 +342,7 @@ internal static class QuestionSpecsSet3
       selectedItemId: null,
       checked: false,
       isCorrect: null,
-      order: cl.items.map(it => it.itemId).sort(() => Math.random() - 0.5)
+      order: MBY.helpers.deterministicShuffle(cl.items, `${slide.id}:cls`, it => String(it.itemId)).map(it => it.itemId)
     };
     ctx.gradedStateMap.set(slide.id, st);
 
@@ -523,7 +523,7 @@ internal static class QuestionSpecsSet3
       selectedOptId: null,
       checked: false,
       isCorrect: null,
-      poolOrder: mt.rightPool.map(o => o.optionId).sort(() => Math.random() - 0.5)
+      poolOrder: MBY.helpers.deterministicShuffle(mt.rightPool, `${slide.id}:mth`, o => String(o.optionId)).map(o => o.optionId)
     };
     ctx.gradedStateMap.set(slide.id, st);
 

@@ -15,9 +15,9 @@ Stateless, AI-agent-first compiler for deterministic study helper WebApps. Agent
 | :--- | :--- | :--- |
 | `Session_<YYYYMMDD_HHMMSS_fff>` | Study Session | `<dir>/<id>/<id>.db` + `assets/` |
 | `Component_<YYYYMMDD_HHMMSS_fff>` | Session Component (`article` \| `quiz`) | Parent session SQLite DB |
-| `ArtComp_<YYYYMMDD_HHMMSS_fff>` | Article Block (`text` \| `image` \| `callout` \| `table`) | Parent session SQLite DB |
+| `ArtComp_<YYYYMMDD_HHMMSS_fff>` | Article Block (`text` \| `image` \| `callout` \| `table` \| `diagram-explore` \| `reveal`) | Parent session SQLite DB |
 | `Set_<YYYYMMDD_HHMMSS_fff>` | Standalone Quiz (`mcq` \| `flashcard` \| `mixed`) | `<dir>/<id>/<id>.db` + `assets/` |
-| `Q_<YYYYMMDD_HHMMSS_fff>` | Question (`mcq` \| `flashcard` \| `fill-blank` \| `assertion-reason` \| `spot-error` \| `diff` \| `mechanism` \| `relabel`) | Parent quiz/component |
+| `Q_<YYYYMMDD_HHMMSS_fff>` | Question (`mcq` \| `flashcard` \| `fill-blank` \| `assertion-reason` \| `spot-error` \| `diff` \| `mechanism` \| `relabel` \| `case` \| `classify` \| `match` \| `numeric`) | Parent quiz/component |
 
 Unless `-o` is specified, new workspace DB folders default under `.meloberry/workspaces/<id>/`, while `ls` discovers both CWD and `.meloberry/workspaces/`. Component `ref` slugs (`^[a-z0-9][a-z0-9_-]{0,31}$`) are deterministically auto-generated from `title`/filename if omitted.
 

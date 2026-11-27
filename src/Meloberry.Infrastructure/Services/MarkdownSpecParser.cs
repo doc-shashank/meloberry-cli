@@ -1,4 +1,4 @@
-﻿using System.Globalization;
+using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
 using Meloberry.Application.Abstractions;
@@ -86,7 +86,7 @@ internal static partial class MarkdownSpecParser
 
     private static readonly HashSet<string> AllowedDiffAttrs = new(StringComparer.OrdinalIgnoreCase)
     {
-        "ref", "mode", "title", "bank", "fuzzy", "caseSensitive", "allowNoError", "explanation"
+        "ref", "mode", "title", "bank", "fuzzy", "caseSensitive", "allowNoError", "placeholder", "explanation"
     };
 
     private static readonly HashSet<string> AllowedMechanismAttrs = new(StringComparer.OrdinalIgnoreCase)
@@ -1761,6 +1761,8 @@ internal static partial class MarkdownSpecParser
         attrs.TryGetValue("ref", out var refKey);
         attrs.TryGetValue("title", out var title);
 
+        attrs.TryGetValue("placeholder", out var rawPlaceholder);
+        var placeholder = string.IsNullOrWhiteSpace(rawPlaceholder) ? null : rawPlaceholder.Trim();
         if (!attrs.TryGetValue("mode", out var rawMode) || string.IsNullOrWhiteSpace(rawMode))
             return new Error("Markdown.InvalidDirectiveAttr", $"':::diff' at line {openLine} of '{sourceLabel}' requires a 'mode' attribute ('fill', 'spot-wrong', or 'rearrange').", ErrorType.Validation, Path: $"markdown:{openLine}");
 
@@ -1812,8 +1814,7 @@ internal static partial class MarkdownSpecParser
             headers,
             alignments,
             rows,
-            specialRes.Value,
-            explanation);
+            specialRes.Value, explanation, placeholder);
 
         return new JsonQuestionSpec(
             Type: "diff",

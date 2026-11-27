@@ -307,6 +307,8 @@ public sealed class LintHandler(
             issues.Add(new LintIssue("Error", "Lint.EmptyDiagramHotspots", block.Id, "Diagram Explorer block must define at least 1 annotated hotspot."));
             return;
         }
+        if (p.Hotspots.Count > Phase3PayloadRules.MaxHotspots)
+            issues.Add(new LintIssue("Warning", "Lint.ExcessiveDiagramHotspots", block.Id, $"Diagram Explorer block has {p.Hotspots.Count} hotspots (recommended max {Phase3PayloadRules.MaxHotspots})."));
         for (int i = 0; i < p.Hotspots.Count; i++)
         {
             var hs = p.Hotspots[i];
@@ -336,6 +338,8 @@ public sealed class LintHandler(
             issues.Add(new LintIssue("Error", "Lint.EmptyRevealSteps", block.Id, "Reveal block must define at least 1 step card."));
             return;
         }
+        if (p.Steps.Count > Phase3PayloadRules.MaxRevealSteps)
+            issues.Add(new LintIssue("Warning", "Lint.ExcessiveRevealSteps", block.Id, $"Reveal block has {p.Steps.Count} steps (recommended max {Phase3PayloadRules.MaxRevealSteps})."));
         for (int i = 0; i < p.Steps.Count; i++)
         {
             var st = p.Steps[i];
@@ -698,6 +702,8 @@ public sealed class LintHandler(
                     issues.Add(new LintIssue("Error", "Lint.InsufficientClassifyBuckets", pq.Id, $"Classify question has {p.Buckets?.Count ?? 0} bucket(s); at least 2 are required."));
                     return;
                 }
+                if (p.Buckets.Count > Phase3PayloadRules.MaxClassifyBuckets)
+                    issues.Add(new LintIssue("Warning", "Lint.ExcessiveClassifyBuckets", pq.Id, $"Classify question has {p.Buckets.Count} buckets (recommended max {Phase3PayloadRules.MaxClassifyBuckets})."));
                 var bucketIds = new HashSet<int>();
                 var bucketNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var b in p.Buckets)
@@ -716,6 +722,8 @@ public sealed class LintHandler(
                     issues.Add(new LintIssue("Error", "Lint.EmptyClassifyBucket", pq.Id, "Classify question must contain items assigned to its buckets."));
                     return;
                 }
+                if (p.Items.Count > Phase3PayloadRules.MaxClassifyItems)
+                    issues.Add(new LintIssue("Warning", "Lint.ExcessiveClassifyItems", pq.Id, $"Classify question has {p.Items.Count} items (recommended max {Phase3PayloadRules.MaxClassifyItems})."));
                 var itemCounts = bucketIds.ToDictionary(id => id, _ => 0);
                 var seenItems = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var it in p.Items)
@@ -744,6 +752,8 @@ public sealed class LintHandler(
                 if (!TryDeserializePayload<MatchPayload>(pq, "Match", issues, out var p)) return;
                 if (p.Pairs is null || p.Pairs.Count < 2)
                     issues.Add(new LintIssue("Error", "Lint.InsufficientMatchPairs", pq.Id, $"Match question has {p.Pairs?.Count ?? 0} pair(s); at least 2 are required."));
+                else if (p.Pairs.Count > Phase3PayloadRules.MaxMatchPairs)
+                    issues.Add(new LintIssue("Warning", "Lint.ExcessiveMatchPairs", pq.Id, $"Match question has {p.Pairs.Count} pairs (recommended max {Phase3PayloadRules.MaxMatchPairs})."));
                 var seenLeft = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 var seenRight = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 if (p.Pairs is not null)
@@ -770,8 +780,8 @@ public sealed class LintHandler(
                         else if (!seenRight.Add(d.Trim()))
                             issues.Add(new LintIssue("Error", "Lint.DuplicateMatchItem", pq.Id, $"Match distractor '{d.Trim()}' duplicates an existing right-side option."));
                     }
-                    if (p.Pairs is { Count: > 0 } && p.Distractors.Count > p.Pairs.Count)
-                        issues.Add(new LintIssue("Warning", "Lint.ExcessiveMatchDistractors", pq.Id, $"Match question has {p.Distractors.Count} distractors vs {p.Pairs.Count} pairs."));
+                    if ((p.Pairs is { Count: > 0 } && p.Distractors.Count > p.Pairs.Count) || p.Distractors.Count > Phase3PayloadRules.MaxMatchDistractors)
+                        issues.Add(new LintIssue("Warning", "Lint.ExcessiveMatchDistractors", pq.Id, $"Match question has {p.Distractors.Count} distractors (recommended max {Math.Min(p.Pairs?.Count ?? Phase3PayloadRules.MaxMatchDistractors, Phase3PayloadRules.MaxMatchDistractors)})."));
                 }
                 break;
             }
@@ -799,6 +809,8 @@ public sealed class LintHandler(
                     await CheckImageAssetAsync(storageDirectory, p.ImagePath, $"{pq.Id}:image", issues, verifiedAssets, ct);
                 if (p.Questions is null || p.Questions.Count < 2)
                     issues.Add(new LintIssue("Error", "Lint.InsufficientCaseQuestions", pq.Id, $"Case question has {p.Questions?.Count ?? 0} sub-question(s); at least 2 are required."));
+                else if (p.Questions.Count > Phase3PayloadRules.MaxCaseQuestions)
+                    issues.Add(new LintIssue("Warning", "Lint.ExcessiveCaseQuestions", pq.Id, $"Case question has {p.Questions.Count} sub-questions (recommended max {Phase3PayloadRules.MaxCaseQuestions})."));
                 if (p.Questions is not null)
                 {
                     foreach (var sub in p.Questions)

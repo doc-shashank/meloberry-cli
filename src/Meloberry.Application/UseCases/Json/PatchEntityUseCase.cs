@@ -49,7 +49,7 @@ public sealed class PatchEntityHandler(
         ["question:fill-blank"] = new(StringComparer.OrdinalIgnoreCase) { "text", "fuzzy", "caseSensitive", "placeholder", "explanation", "ref", "layoutOverrides" },
         ["question:assertion-reason"] = new(StringComparer.OrdinalIgnoreCase) { "assertion", "reason", "answer", "scheme", "explanation", "ref", "layoutOverrides" },
         ["question:spot-error"] = new(StringComparer.OrdinalIgnoreCase) { "text", "imagePath", "requireFix", "allowNoError", "noError", "explanation", "ref", "layoutOverrides" },
-        ["question:diff"] = new(StringComparer.OrdinalIgnoreCase) { "mode", "title", "bank", "fuzzy", "caseSensitive", "allowNoError", "headers", "alignments", "rows", "explanation", "ref", "layoutOverrides" },
+        ["question:diff"] = new(StringComparer.OrdinalIgnoreCase) { "mode", "title", "bank", "fuzzy", "caseSensitive", "allowNoError", "placeholder", "headers", "alignments", "rows", "explanation", "ref", "layoutOverrides" },
         ["question:mechanism"] = new(StringComparer.OrdinalIgnoreCase) { "title", "steps", "explanation", "ref", "layoutOverrides" },
         ["question:relabel"] = new(StringComparer.OrdinalIgnoreCase) { "imagePath", "prompt", "mode", "style", "boxes", "distractors", "fuzzy", "caseSensitive", "explanation", "ref", "layoutOverrides" },
         ["question:case"] = new(StringComparer.OrdinalIgnoreCase) { "title", "stem", "imagePath", "caption", "questions", "explanation", "ref", "layoutOverrides" },
@@ -62,6 +62,12 @@ public sealed class PatchEntityHandler(
     {
         ReadCommentHandling = JsonCommentHandling.Skip,
         AllowTrailingCommas = true
+    };
+
+    private static readonly JsonSerializerOptions OptionReadOptions = new(ReadOptions)
+    {
+        PropertyNameCaseInsensitive = true,
+        UnmappedMemberHandling = System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow
     };
 
     public async Task<Result<PatchEntityResponse>> HandleAsync(PatchEntityCommand command, CancellationToken cancellationToken = default)
@@ -970,6 +976,7 @@ public sealed class PatchEntityHandler(
                 var rows = current.Rows ?? [];
                 var specialCells = current.SpecialCells ?? [];
                 var explanation = current.Explanation;
+                var placeholder = current.Placeholder;
                 bool recomputeSpecial = false;
 
                 if (TryGetProp(patch, "mode", out var modeNode))
@@ -997,6 +1004,9 @@ public sealed class PatchEntityHandler(
                 if (!gridRes.IsSuccess) return gridRes.Error!;
                 if (gridChanged) recomputeSpecial = true;
 
+                if (TryReadNullableString(patch, "placeholder", out var phVal, out var phErr)) placeholder = phVal;
+                else if (phErr is not null) return phErr;
+
                 if (TryReadNullableString(patch, "explanation", out var expVal, out var expErr)) explanation = expVal;
                 else if (expErr is not null) return expErr;
 
@@ -1018,7 +1028,7 @@ public sealed class PatchEntityHandler(
                 }
 
                 return pq.SetPayloadJson(Phase1PayloadCodec.Serialize(new DifferentiationPayload(
-                    mode, title, bank, fuzzy, caseSensitive, allowNoError, headers, alignments, rows, specialCells, explanation)));
+                    mode, title, bank, fuzzy, caseSensitive, allowNoError, headers, alignments, rows, specialCells, explanation, placeholder)));
             }
             case QuestionType.Mechanism:
             {
@@ -1423,11 +1433,7 @@ public sealed class PatchEntityHandler(
                     return new Error("Json.InvalidQuestion", "MCQ 'options' cannot contain null entries.", ErrorType.Validation, Path: $"options[{i}]");
                 try
                 {
-                    var optDto = optsArr[i]!.Deserialize<PatchOptionDto>(new JsonSerializerOptions(ReadOptions)
-                    {
-                        PropertyNameCaseInsensitive = true,
-                        UnmappedMemberHandling = System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow
-                    });
+                    var optDto = optsArr[i]!.Deserialize<PatchOptionDto>(OptionReadOptions);
                     if (optDto is null)
                         return new Error("Json.InvalidQuestion", $"Invalid option at index {i}.", ErrorType.Validation, Path: $"options[{i}]");
                     parsedOpts.Add(optDto);

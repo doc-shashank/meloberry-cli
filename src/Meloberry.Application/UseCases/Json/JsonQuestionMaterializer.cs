@@ -221,7 +221,8 @@ internal static class JsonQuestionMaterializer
                     alignments,
                     rows,
                     specialRes.IsSuccess ? specialRes.Value : [],
-                    string.IsNullOrWhiteSpace(parsed.Explanation) ? null : parsed.Explanation.Trim());
+                    string.IsNullOrWhiteSpace(parsed.Explanation) ? null : parsed.Explanation.Trim(),
+                    string.IsNullOrWhiteSpace(parsed.Placeholder) ? null : parsed.Placeholder.Trim());
                 canonicalPayload = Phase1PayloadCodec.Serialize(normalized);
             }
             else if (qType == QuestionType.Mechanism)
