@@ -21,6 +21,7 @@
     <EmbeddedResource Include="Web\Assets\katex\katex.min.js" LogicalName="Meloberry.Infrastructure.Web.Assets.katex.katex.min.js" />
     <EmbeddedResource Include="Web\Assets\katex\katex.min.css" LogicalName="Meloberry.Infrastructure.Web.Assets.katex.katex.min.css" />
     <EmbeddedResource Include="Web\Assets\katex\fonts\*.woff2" LogicalName="Meloberry.Infrastructure.Web.Assets.katex.fonts.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="Web\Assets\SpecIcons\*.svg" LogicalName="Meloberry.Infrastructure.Web.Assets.SpecIcons.%(Filename)%(Extension)" />
   </ItemGroup>
 
 </Project>

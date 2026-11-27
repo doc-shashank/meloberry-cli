@@ -1,9 +1,11 @@
+using System.Text.Json.Serialization;
+using Meloberry.Application.Abstractions;
 using Meloberry.Domain.Common;
 using Meloberry.Domain.Layouts;
 
 namespace Meloberry.Application.UseCases.Diagnostics;
 
-public sealed record GetSchemaQuery(IReadOnlyList<string>? Topics = null);
+public sealed record GetSchemaQuery(IReadOnlyList<string>? Topics = null, bool IncludeIcons = false);
 
 public sealed record SchemaFieldSpec(
     string Name,
@@ -25,12 +27,15 @@ public sealed record SchemaTopicDefinition(
     IReadOnlyList<SchemaFieldSpec> Fields,
     object Example,
     string Scope = "content",
-    string Category = "question");
+    string Category = "question",
+    string? DisplayName = null);
 
 public sealed record GetSchemaResponse(
     IReadOnlyList<string> RequestedTopics,
     IReadOnlyList<SchemaTopicDefinition> Schemas,
-    IReadOnlyList<SchemaLayoutPropertySpec>? LayoutProperties = null);
+    IReadOnlyList<SchemaLayoutPropertySpec>? LayoutProperties = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    IReadOnlyDictionary<string, string>? Icons = null);
 
 public sealed record SchemaLayoutPropertySpec(
     string Name,
@@ -42,8 +47,40 @@ public sealed record SchemaLayoutPropertySpec(
     IReadOnlyList<string> ApplicableTargets,
     string Description);
 
-public sealed class GetSchemaHandler
+public sealed class GetSchemaHandler(ISpecIconProvider? iconProvider = null)
 {
+    private static readonly Dictionary<string, string> TopicDisplayNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["session"] = "Study Session",
+        ["article"] = "Study Article",
+        ["quiz"] = "Practice Quiz",
+        ["text"] = "Text Block",
+        ["image"] = "Image Block",
+        ["callout"] = "Callout Box",
+        ["table"] = "Study Table",
+        ["diagram-explore"] = "Interactive Diagram",
+        ["reveal"] = "Step-by-Step Reveal",
+        ["mcq"] = "Multiple Choice",
+        ["flashcard"] = "Flashcard",
+        ["fill-blank"] = "Fill in the Blank",
+        ["assertion-reason"] = "Assertion-Reason",
+        ["spot-error"] = "Spot the Error",
+        ["diff"] = "Differentiation Table",
+        ["mechanism"] = "Mechanism Sequence",
+        ["relabel"] = "Diagram Relabel",
+        ["case"] = "Case Vignette",
+        ["classify"] = "Classification",
+        ["match"] = "Matching",
+        ["numeric"] = "Numeric Response",
+        ["markdown"] = "Markdown Format",
+        ["layouts"] = "Layout Properties",
+        ["patch"] = "Surgical Patch",
+        ["batch"] = "Atomic Batch",
+        ["pkg"] = "Package Export/Import",
+        ["build"] = "WebApp Build",
+        ["analyze"] = "Verification & Telemetry"
+    };
+
     public sealed record TopicClassification(string Topic, string Scope, string Category);
 
     public static readonly IReadOnlyList<TopicClassification> TopicCatalog =
@@ -176,11 +213,17 @@ public sealed class GetSchemaHandler
         foreach (var t in activeTopics)
         {
             if (TopicSchemaBuilders.TryGetValue(t, out var builder))
-                schemas.Add(builder());
+            {
+                var def = builder();
+                schemas.Add(def with { DisplayName = def.DisplayName ?? TopicDisplayNames.GetValueOrDefault(t, t) });
+            }
         }
 
         var layoutProps = activeTopics.Contains("layouts", StringComparer.Ordinal) ? BuildLayoutSpecs() : null;
-        return Task.FromResult(Result<GetSchemaResponse>.Success(new GetSchemaResponse(activeTopics, schemas, layoutProps)));
+        IReadOnlyDictionary<string, string>? icons = query.IncludeIcons && iconProvider is not null
+            ? iconProvider.GetIcons(requested.Count == 0 ? null : activeTopics)
+            : null;
+        return Task.FromResult(Result<GetSchemaResponse>.Success(new GetSchemaResponse(activeTopics, schemas, layoutProps, icons)));
     }
 
     private static IReadOnlyList<string>? ExpandGroupToken(string groupToken)
@@ -601,7 +644,7 @@ public sealed class GetSchemaHandler
                 // fill-blank: { text?, fuzzy?, caseSensitive?, placeholder?, explanation?, ref?, layoutOverrides? }
                 // assertion-reason: { assertion?, reason?, answer?, scheme?, explanation?, ref?, layoutOverrides? }
                 // spot-error: { text?, imagePath?, requireFix?, allowNoError?, noError?, explanation?, ref?, layoutOverrides? }
-                // diff: { mode?, title?, bank?, fuzzy?, caseSensitive?, allowNoError?, headers?, alignments?, rows?, explanation?, ref?, layoutOverrides? }
+                // diff: { mode?, title?, bank?, fuzzy?, caseSensitive?, allowNoError?, placeholder?, headers?, alignments?, rows?, explanation?, ref?, layoutOverrides? }
                 // mechanism: { title?, steps?, explanation?, ref?, layoutOverrides? }
                 // relabel: { imagePath?, prompt?, mode?, style?, boxes?, distractors?, fuzzy?, caseSensitive?, explanation?, ref?, layoutOverrides? }
                 // case: { title?, stem?, imagePath?, caption?, questions?, explanation?, ref?, layoutOverrides? }
@@ -768,8 +811,8 @@ public sealed class GetSchemaHandler
             Topic: "diff",
             CompactSignature: """
                 // Question: diff (comparative table drill: mode="fill" | "spot-wrong" | "rearrange")
-                { type:"diff", ref?:string, mode:"fill"|"spot-wrong"|"rearrange", title?:string, bank?:bool, fuzzy?:bool, caseSensitive?:bool, allowNoError?:bool, headers:string[], alignments?:("left"|"center"|"right")[], rows:string[][], explanation?:string, layoutOverrides?:Record<string,string> }
-                // Markdown: :::diff{mode="spot-wrong" title="..."}\n| Prop | A | B |\n|---|---|---|\n| X | ~~wrong~~ -> fix \| alias | {{fix | alias}} |\n:::
+                { type:"diff", ref?:string, mode:"fill"|"spot-wrong"|"rearrange", title?:string, bank?:bool, fuzzy?:bool, caseSensitive?:bool, allowNoError?:bool, placeholder?:string, headers:string[], alignments?:("left"|"center"|"right")[], rows:string[][], explanation?:string, layoutOverrides?:Record<string,string> }
+                // Markdown: :::diff{mode="spot-wrong" title="..." placeholder?="..."}\n| Prop | A | B |\n|---|---|---|\n| X | ~~wrong~~ -> fix \| alias | {{fix | alias}} |\n:::
                 """,
             Command: "Inside quiz.questions[] or :::diff{...} in Markdown",
             Summary: "Comparative differentiation table supporting fill-blanks (with optional bank), spot-wrong cells, and row-wise rearrange.",
@@ -784,6 +827,7 @@ public sealed class GetSchemaHandler
                 new("fuzzy", "boolean", false, "Allow Levenshtein distance <= 1 in 'fill' mode (default true)."),
                 new("caseSensitive", "boolean", false, "Require exact case match in 'fill' mode (default false)."),
                 new("allowNoError", "boolean", false, "Display 'No error in table' option in 'spot-wrong' mode (default false)."),
+                new("placeholder", "string", false, "Optional blank input placeholder text in 'fill' mode."),
                 new("headers", "array<string>", true, ">=2 column headers (>=3 for 'rearrange': col 0 feature + >=2 entities)."),
                 new("alignments", "array<string>", false, "Optional per-column alignment ('left' | 'center' | 'right'); length must match headers.length."),
                 new("rows", "array<array<string>>", true, ">=1 row; mark 'fill' blanks with '{{ans | alias}}' and 'spot-wrong' faults with '~~wrong~~ -> fix \\| alias' or '~~wrong~~ -> {{fix | alias}}'."),

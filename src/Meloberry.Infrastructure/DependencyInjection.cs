@@ -29,6 +29,7 @@ public static class DependencyInjection
         services.AddSingleton<SqliteLayoutRepository>();
         services.AddSingleton<ILayoutRepository>(sp => sp.GetRequiredService<SqliteLayoutRepository>());
         services.AddSingleton<ILayoutEditorPageBuilder, LayoutEditorPageBuilder>();
+        services.AddSingleton<ISpecIconProvider, EmbeddedSpecIconProvider>();
         services.AddScoped<IWorkspaceRepository, SqliteWorkspaceRepository>();
         services.AddScoped<IPackageExporter, MbypkgExporter>();
         services.AddScoped<IWebAppGenerator, SlidingWebAppGenerator>();

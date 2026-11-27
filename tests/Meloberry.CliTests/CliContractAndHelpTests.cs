@@ -360,6 +360,53 @@ public sealed class CliContractAndHelpTests : IDisposable
         Assert.True(JsonDocument.Parse(extBuildC.StandardOutput).RootElement.GetProperty("data").GetProperty("verify").GetProperty("passed").GetBoolean());
     }
 
+    [Fact]
+    public async Task SpecCommand_WithIconsFlag_IncludesIconsAndDisplayNames_WhileDefaultOmitsIcons()
+    {
+        var defaultConsole = new TestConsole();
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["spec", "@content", "--json"], defaultConsole, _fx.AppDataDir));
+        using (var defaultDoc = JsonDocument.Parse(defaultConsole.StandardOutput))
+        {
+            var data = defaultDoc.RootElement.GetProperty("data");
+            Assert.False(data.TryGetProperty("icons", out _));
+            var schemas = data.GetProperty("schemas");
+            Assert.All(schemas.EnumerateArray(), item =>
+            {
+                Assert.True(item.TryGetProperty("displayName", out var dn));
+                Assert.False(string.IsNullOrWhiteSpace(dn.GetString()));
+            });
+        }
+
+        var iconsConsole = new TestConsole();
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["spec", "--icons", "--json"], iconsConsole, _fx.AppDataDir));
+        using (var iconsDoc = JsonDocument.Parse(iconsConsole.StandardOutput))
+        {
+            var data = iconsDoc.RootElement.GetProperty("data");
+            Assert.True(data.TryGetProperty("icons", out var iconsEl));
+            foreach (var requiredIcon in new[]
+            {
+                "text", "image", "callout", "callout-clinical", "table", "link",
+                "diagram-explore", "reveal", "mcq", "mcq-multi", "flashcard",
+                "fill-blank", "assertion-reason", "spot-error", "diff",
+                "mechanism", "relabel", "relabel-blur", "case", "classify", "match", "numeric"
+            })
+            {
+                Assert.True(iconsEl.TryGetProperty(requiredIcon, out var svgEl), $"Missing icon '{requiredIcon}'.");
+                Assert.StartsWith("<svg", svgEl.GetString(), StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        var blocksIconsConsole = new TestConsole();
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["spec", "@blocks", "--icons", "--json"], blocksIconsConsole, _fx.AppDataDir));
+        using (var blocksDoc = JsonDocument.Parse(blocksIconsConsole.StandardOutput))
+        {
+            var iconsEl = blocksDoc.RootElement.GetProperty("data").GetProperty("icons");
+            Assert.True(iconsEl.TryGetProperty("diagram-explore", out _));
+            Assert.True(iconsEl.TryGetProperty("callout-clinical", out _));
+            Assert.False(iconsEl.TryGetProperty("mcq", out _));
+        }
+    }
+
     private sealed class ThrowingTestCommand() : CliCommand(new CommandDescriptor("boom", "boom", "Test throwing command", typeof(ThrowingHandler)))
     {
         public sealed class ThrowingHandler : ICommandHandler

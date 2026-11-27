@@ -40,17 +40,19 @@ public sealed class SpecCliCommand : CliCommand
     public SpecCliCommand()
         : base(new CommandDescriptor(
             Verb: "spec",
-            Usage: "spec [type|@group...]",
+            Usage: "spec [type|@group...] [--icons]",
             Description: "Prints compact schemas for implemented specs (Session & Quiz Content Specs vs. Other Specs) and layout bounds.",
             HandlerType: typeof(Handler),
+            AllowedFlagOptions: new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "icons" },
             Prerequisites: $"Stateless; pass topic names ({string.Join(", ", GetSchemaHandler.SupportedTopics)}) or group selectors ({string.Join(", ", GetSchemaHandler.SupportedGroups)}), or omit to print all.",
             OptionsHelp:
             [
-                "(No command-specific options; supports global --json.)"
+                "--icons    Include embedded SVG spec/subtype icons in JSON output."
             ],
             Examples:
             [
                 "mby spec @questions --json",
+                "mby spec --icons --json",
                 "mby spec @content @other --json",
                 "mby spec mcq flashcard layouts --json"
             ]))
@@ -62,7 +64,7 @@ public sealed class SpecCliCommand : CliCommand
         public Task<int> InvokeAsync(CliInvocationContext context) =>
             CliCommandHelpers.FinishAsync(
                 context,
-                useCase.HandleAsync(new GetSchemaQuery(context.PositionalArgs), context.CancellationToken),
+                useCase.HandleAsync(new GetSchemaQuery(context.PositionalArgs, context.HasFlag("icons")), context.CancellationToken),
                 FormatSpec);
 
         private static string FormatSpec(GetSchemaResponse res)

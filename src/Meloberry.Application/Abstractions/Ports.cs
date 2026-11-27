@@ -304,6 +304,7 @@ public sealed record CliToolMetadata(
 
 public interface ICliToolMetadataProvider { CliToolMetadata GetMetadata(); }
 public interface ILayoutEditorPageBuilder { string BuildHtml(string initialComponent, CliToolMetadata toolMetadata, string? csrfToken = null); }
+public interface ISpecIconProvider { IReadOnlyDictionary<string, string> GetIcons(IEnumerable<string>? topics = null); }
 
 public interface IChainTransactionScope : IDisposable
 {
