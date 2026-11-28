@@ -24,7 +24,8 @@ public sealed record ApplySpecCommand(
     bool VerifyWeb = false,
     bool StaticVerifyOnly = false,
     int VerifyTimeoutSeconds = 30,
-    bool Ephemeral = false);
+    bool Ephemeral = false,
+    string? AssetBaseDirectoryOverride = null);
 
 public sealed record AppliedComponentSummary(
     string P,
@@ -81,7 +82,11 @@ public sealed class ApplySpecHandler(
         var spec = loadRes.Value;
         var cwd = workingDirectoryProvider.GetCurrentDirectory();
         string jsonDir;
-        if (!string.IsNullOrWhiteSpace(spec.AssetBaseDirectory))
+        if (!string.IsNullOrWhiteSpace(command.AssetBaseDirectoryOverride))
+        {
+            jsonDir = workingDirectoryProvider.NormalizeDirectoryPath(command.AssetBaseDirectoryOverride);
+        }
+        else if (!string.IsNullOrWhiteSpace(spec.AssetBaseDirectory))
         {
             jsonDir = spec.AssetBaseDirectory;
         }

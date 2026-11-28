@@ -202,6 +202,43 @@ public sealed class SessionComponent : IIndexedEntity
         return true;
     }
 
+    public Result SetLinkCards(IEnumerable<ArticleLinkCard> cards)
+    {
+        if (Kind != ComponentKind.Article) return ComponentErrors.WrongKind(Id, "article");
+        ArgumentNullException.ThrowIfNull(cards);
+
+        var validated = new List<ArticleLinkCard>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var card in cards)
+        {
+            if (card is null || string.IsNullOrWhiteSpace(card.Id))
+                return new Error("ArticleLink.InvalidId", "Link card requires a non-empty 'id'.", ErrorType.Validation);
+
+            var normRes = ArticleLinkRules.ValidateAndNormalizeCardId(card.Id);
+            if (!normRes.IsSuccess || string.IsNullOrWhiteSpace(normRes.Value))
+                return normRes.Error ?? new Error("ArticleLink.InvalidId", $"Invalid link card id '{card.Id}'.", ErrorType.Validation);
+
+            if (!seen.Add(normRes.Value))
+                return new Error("ArticleLink.DuplicateId", $"Duplicate link card id '{normRes.Value}'.", ErrorType.Conflict);
+
+            var text = string.IsNullOrWhiteSpace(card.Text) ? null : card.Text.Trim();
+            var img = string.IsNullOrWhiteSpace(card.ImagePath) ? null : card.ImagePath.Trim();
+            if (text is null && img is null)
+                return new Error("ArticleLink.EmptyContent", $"Link card '{normRes.Value}' must contain text, an image, or both.", ErrorType.Validation);
+
+            validated.Add(new ArticleLinkCard(
+                normRes.Value,
+                string.IsNullOrWhiteSpace(card.Title) ? null : card.Title.Trim(),
+                text,
+                img));
+        }
+
+        _linkCards.Clear();
+        _linkCards.AddRange(validated);
+        return Result.Success();
+    }
+
     public Result<(string CanonicalName, string Value)> SetLayoutOverride(string propertyName, string rawValue)
     {
         var targets = GetLayoutTargets();

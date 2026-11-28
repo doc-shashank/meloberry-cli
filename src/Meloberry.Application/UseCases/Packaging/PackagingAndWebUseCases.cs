@@ -11,7 +11,12 @@ namespace Meloberry.Application.UseCases.Packaging;
 public sealed record ExportPackageCommand(string Address, string? OutputPath = null, string TargetPlatform = "desktop", bool IncludeLayout = false);
 public sealed record ExportPackageResponse(string TargetId, string PackagePath, LintReportResponse LintReport, string TargetPlatform = "desktop", bool IncludedLayout = false, IReadOnlyList<string>? Warnings = null);
 public sealed record ImportPackageCommand(string PackagePath, string? DestinationDirectory = null);
-public sealed record ImportPackageResponse(string ImportedId, string Kind, string StorageDirectory);
+public sealed record ImportPackageResponse(
+    string ImportedId,
+    string Kind,
+    string StorageDirectory,
+    string TargetPlatform = "desktop",
+    bool IncludedLayout = false);
 public sealed record BuildWebAppCommand(string Address, string? OutputDirectory = null, bool Verify = false, bool Verbose = false, bool Quiet = false, bool StaticVerifyOnly = false, int VerifyTimeoutSeconds = 30, string? WorkspaceParentDirectory = null);
 public sealed record BuildWebAppResponse(string TargetId, string OutputDirectory, string IndexHtmlPath, ApplyLintSummary Lint, LintReportResponse? LintReport = null, WebAppVerificationReport? Verify = null);
 
@@ -109,7 +114,12 @@ public sealed class ImportPackageHandler(IWorkingDirectoryProvider workingDirect
         var destDir = workingDirectoryProvider.NormalizeDirectoryPath(command.DestinationDirectory);
         var importRes = await packageExporter.ImportPackageAsync(command.PackagePath, destDir, cancellationToken);
         return importRes.IsSuccess
-            ? new ImportPackageResponse(importRes.Value.Id, importRes.Value.Kind, importRes.Value.StorageDirectory)
+            ? new ImportPackageResponse(
+                importRes.Value.Workspace.Id,
+                importRes.Value.Workspace.Kind,
+                importRes.Value.Workspace.StorageDirectory,
+                importRes.Value.TargetPlatform,
+                importRes.Value.IncludedLayout)
             : importRes.Error!;
     }
 }

@@ -412,56 +412,18 @@ internal static class JsonQuestionMaterializer
                 var subQuestions = new List<CaseSubQuestion>();
                 if (spec.SubQuestions is { Count: > 0 })
                 {
-                    for (int sIdx = 0; sIdx < spec.SubQuestions.Count; sIdx++)
-                    {
-                        var subSpec = spec.SubQuestions[sIdx];
-                        if (Quiz.TryParseQuestionType(subSpec.Type, out var subQType) && subQType == QuestionType.CaseGroup)
-                            return new Error("Case.NestedCaseNotAllowed", "Nested 'case' sub-questions inside ':::case' are not allowed.", ErrorType.Validation);
-
-                        var subMat = await MaterializeAsync(
-                            $"{questionId}_sub{sIdx}",
-                            containerId,
-                            sIdx + 1,
-                            subSpec,
-                            jsonBaseDirectory,
-                            storageDirectory,
-                            contentInspector,
-                            cancellationToken,
-                            specRootDirectory,
-                            workspaceCwdDirectory);
-                        if (!subMat.IsSuccess) return subMat.Error!;
-
-                        var sq = subMat.Value;
-                        if (sq is McqQuestion smcq)
-                        {
-                            subQuestions.Add(new CaseSubQuestion(
-                                sIdx,
-                                "mcq",
-                                Mcq: new CaseSubMcqData(
-                                    smcq.Text,
-                                    smcq.MaxOptions,
-                                    smcq.IsMultiCorrect,
-                                    smcq.Options.Select(o => new CaseSubMcqOption(o.Index, o.Text, o.ImagePath, o.IsCorrect)).ToList(),
-                                    smcq.ImagePath,
-                                    smcq.Explanation)));
-                        }
-                        else if (sq is FlashcardQuestion sfc)
-                        {
-                            subQuestions.Add(new CaseSubQuestion(
-                                sIdx,
-                                "flashcard",
-                                Flashcard: new CaseSubFlashcardData(
-                                    new(sfc.Front.Text, sfc.Front.ImagePath, sfc.Front.Position == MediaPosition.TextAboveImage ? "aboveImage" : "belowImage"),
-                                    new(sfc.Back.Text, sfc.Back.ImagePath, sfc.Back.Position == MediaPosition.TextAboveImage ? "aboveImage" : "belowImage"))));
-                        }
-                        else if (sq is PayloadQuestion spq)
-                        {
-                            subQuestions.Add(new CaseSubQuestion(
-                                sIdx,
-                                Question.ToWireString(spq.Type),
-                                PayloadJson: spq.PayloadJson));
-                        }
-                    }
+                    var subMatRes = await MaterializeCaseSubQuestionsAsync(
+                        questionId,
+                        containerId,
+                        spec.SubQuestions,
+                        jsonBaseDirectory,
+                        storageDirectory,
+                        contentInspector,
+                        cancellationToken,
+                        specRootDirectory,
+                        workspaceCwdDirectory);
+                    if (!subMatRes.IsSuccess) return subMatRes.Error!;
+                    subQuestions = subMatRes.Value;
                 }
                 else if (parsed?.Questions is { Count: > 0 })
                 {
@@ -558,6 +520,71 @@ internal static class JsonQuestionMaterializer
         return Result.Success();
     }
 
+    internal static async Task<Result<List<CaseSubQuestion>>> MaterializeCaseSubQuestionsAsync(
+        string questionId,
+        string containerId,
+        IReadOnlyList<JsonQuestionSpec> subSpecs,
+        string jsonBaseDirectory,
+        string storageDirectory,
+        IContentInspector contentInspector,
+        CancellationToken cancellationToken,
+        string? specRootDirectory = null,
+        string? workspaceCwdDirectory = null)
+    {
+        var subQuestions = new List<CaseSubQuestion>(subSpecs.Count);
+        for (int sIdx = 0; sIdx < subSpecs.Count; sIdx++)
+        {
+            var subSpec = subSpecs[sIdx];
+            if (Quiz.TryParseQuestionType(subSpec.Type, out var subQType) && subQType == QuestionType.CaseGroup)
+                return new Error("Case.NestedCaseNotAllowed", "Nested 'case' sub-questions inside ':::case' are not allowed.", ErrorType.Validation);
+
+            var subMat = await MaterializeAsync(
+                $"{questionId}_sub{sIdx}",
+                containerId,
+                sIdx + 1,
+                subSpec,
+                jsonBaseDirectory,
+                storageDirectory,
+                contentInspector,
+                cancellationToken,
+                specRootDirectory,
+                workspaceCwdDirectory);
+            if (!subMat.IsSuccess) return subMat.Error!;
+
+            var sq = subMat.Value;
+            if (sq is McqQuestion smcq)
+            {
+                subQuestions.Add(new CaseSubQuestion(
+                    sIdx,
+                    "mcq",
+                    Mcq: new CaseSubMcqData(
+                        smcq.Text,
+                        smcq.MaxOptions,
+                        smcq.IsMultiCorrect,
+                        smcq.Options.Select(o => new CaseSubMcqOption(o.Index, o.Text, o.ImagePath, o.IsCorrect)).ToList(),
+                        smcq.ImagePath,
+                        smcq.Explanation)));
+            }
+            else if (sq is FlashcardQuestion sfc)
+            {
+                subQuestions.Add(new CaseSubQuestion(
+                    sIdx,
+                    "flashcard",
+                    Flashcard: new CaseSubFlashcardData(
+                        new(sfc.Front.Text, sfc.Front.ImagePath, sfc.Front.Position == MediaPosition.TextAboveImage ? "aboveImage" : "belowImage"),
+                        new(sfc.Back.Text, sfc.Back.ImagePath, sfc.Back.Position == MediaPosition.TextAboveImage ? "aboveImage" : "belowImage"))));
+            }
+            else if (sq is PayloadQuestion spq)
+            {
+                subQuestions.Add(new CaseSubQuestion(
+                    sIdx,
+                    Question.ToWireString(spq.Type),
+                    PayloadJson: spq.PayloadJson));
+            }
+        }
+        return subQuestions;
+    }
+
     internal static async Task<Result<string?>> CopyConfinedImageAsync(
         string? rawPath,
         string componentBaseDirectory,
@@ -568,6 +595,25 @@ internal static class JsonQuestionMaterializer
         string? workspaceCwdDirectory = null)
     {
         if (string.IsNullOrWhiteSpace(rawPath)) return (string?)null;
+
+        var normalizedForward = rawPath.Trim().Replace('\\', '/');
+        if (normalizedForward.StartsWith("./", StringComparison.Ordinal))
+            normalizedForward = normalizedForward[2..];
+
+        if (normalizedForward.StartsWith("assets/", StringComparison.OrdinalIgnoreCase))
+        {
+            var assetsRoot = Path.Combine(storageDirectory, "assets");
+            var relativeUnderAssets = normalizedForward["assets/".Length..];
+            if (!PathConfinement.TryResolveInside(assetsRoot, relativeUnderAssets, out var storedFullPath))
+                return new Error("Asset.InvalidPath", $"JSON imagePath '{rawPath}' must stay inside the workspace assets directory.", ErrorType.Validation);
+
+            if (File.Exists(storedFullPath))
+            {
+                var relAssetPath = $"assets/{Path.GetRelativePath(assetsRoot, storedFullPath).Replace('\\', '/')}";
+                var verifyRes = await contentInspector.VerifyStoredAssetAsync(storageDirectory, relAssetPath, cancellationToken);
+                return verifyRes.IsSuccess ? relAssetPath : verifyRes.Error!;
+            }
+        }
 
         if (!PathConfinement.TryResolveConfinedInputFile(rawPath, componentBaseDirectory, specRootDirectory, workspaceCwdDirectory, out var resolvedPath))
             return new Error("Asset.InvalidPath", $"JSON imagePath '{rawPath}' must be relative and stay inside the input directory.", ErrorType.Validation);

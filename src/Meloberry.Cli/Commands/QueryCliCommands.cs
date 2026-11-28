@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json;
 using Meloberry.Application.UseCases.Diagnostics;
 using Meloberry.Application.UseCases.Quizzes;
 using Meloberry.Cli.Abstractions;
@@ -13,19 +14,20 @@ public sealed class GetCliCommand : CliCommand
     public GetCliCommand()
         : base(new CommandDescriptor(
             Verb: "get",
-            Usage: "get <addr> [--view outline|full|ids]",
+            Usage: "get <addr> [--view outline|full|ids|spec]",
             Description: "Inspects an entity by ID, path (#c1.b2), or #ref (defaults to compact outline).",
             HandlerType: typeof(Handler),
             AllowedValueOptions: AllowedValues,
             Prerequisites: "Target entity must exist (direct ID, <wsId>#c<n>[.b<m>|.q<m>], <setId>#q<m>, or <wsId>#<ref>).",
             OptionsHelp:
             [
-                "--view <mode>   Output verbosity: 'outline' (default, compact snippets), 'full' (complete content), or 'ids' (minimal ID/path map)."
+                "--view <mode>   Output verbosity: 'outline' (default, compact snippets), 'full' (complete content), 'ids' (minimal ID/path map), or 'spec' (canonical apply-compatible JSON + idMap)."
             ],
             Examples:
             [
                 "mby get Session_2026... --json",
                 "mby get Session_2026...#c1 --view full --json",
+                "mby get Session_2026... --view spec --json",
                 "mby get Session_2026... --view ids --json"
             ]))
     {
@@ -36,7 +38,7 @@ public sealed class GetCliCommand : CliCommand
         public Task<int> InvokeAsync(CliInvocationContext context)
         {
             if (context.PositionalArgs.Count != 1)
-                return Task.FromResult(CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: get <addr> [--view outline|full|ids]", context.GlobalOptions.Json));
+                return Task.FromResult(CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: get <addr> [--view outline|full|ids|spec]", context.GlobalOptions.Json));
 
             var rawView = context.GetOptionValue("view") ?? "outline";
             InspectViewMode view;
@@ -45,8 +47,9 @@ public sealed class GetCliCommand : CliCommand
                 case "outline": view = InspectViewMode.Outline; break;
                 case "full": view = InspectViewMode.Full; break;
                 case "ids": view = InspectViewMode.Ids; break;
+                case "spec": view = InspectViewMode.Spec; break;
                 default:
-                    return Task.FromResult(CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Invalid --view '{rawView}'. Use 'outline', 'full', or 'ids'.", context.GlobalOptions.Json));
+                    return Task.FromResult(CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Invalid --view '{rawView}'. Use 'outline', 'full', 'ids', or 'spec'.", context.GlobalOptions.Json));
             }
 
             return CliCommandHelpers.FinishAsync(
@@ -59,6 +62,11 @@ public sealed class GetCliCommand : CliCommand
         {
             var sb = new StringBuilder();
             sb.AppendLine($"[{r.EntityKind}] {r.Id} ({r.View})");
+            if (r.Spec is not null)
+            {
+                sb.AppendLine(r.Spec.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+                return sb.ToString().TrimEnd();
+            }
             if (!string.IsNullOrWhiteSpace(r.Name)) sb.AppendLine($"  Name: {r.Name}");
             if (r.Components is not null)
             {

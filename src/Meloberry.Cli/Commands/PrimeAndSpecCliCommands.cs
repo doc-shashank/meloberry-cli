@@ -40,19 +40,21 @@ public sealed class SpecCliCommand : CliCommand
     public SpecCliCommand()
         : base(new CommandDescriptor(
             Verb: "spec",
-            Usage: "spec [type|@group...] [--icons]",
+            Usage: "spec [type|@group...] [--icons] [--nested]",
             Description: "Prints compact schemas for implemented specs (Session & Quiz Content Specs vs. Other Specs) and layout bounds.",
             HandlerType: typeof(Handler),
-            AllowedFlagOptions: new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "icons" },
+            AllowedFlagOptions: new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "icons", "nested" },
             Prerequisites: $"Stateless; pass topic names ({string.Join(", ", GetSchemaHandler.SupportedTopics)}) or group selectors ({string.Join(", ", GetSchemaHandler.SupportedGroups)}), or omit to print all.",
             OptionsHelp:
             [
-                "--icons    Include embedded SVG spec/subtype icons in JSON output."
+                "--icons    Include embedded SVG spec/subtype icons in JSON output.",
+                "--nested   Include machine-readable schemas for nested item types (e.g., mcqOption, relabelBox, linkCard)."
             ],
             Examples:
             [
                 "mby spec @questions --json",
                 "mby spec --icons --json",
+                "mby spec relabel --nested --json",
                 "mby spec @content @other --json",
                 "mby spec mcq flashcard layouts --json"
             ]))
@@ -64,7 +66,9 @@ public sealed class SpecCliCommand : CliCommand
         public Task<int> InvokeAsync(CliInvocationContext context) =>
             CliCommandHelpers.FinishAsync(
                 context,
-                useCase.HandleAsync(new GetSchemaQuery(context.PositionalArgs, context.HasFlag("icons")), context.CancellationToken),
+                useCase.HandleAsync(
+                    new GetSchemaQuery(context.PositionalArgs, context.HasFlag("icons"), context.HasFlag("nested")),
+                    context.CancellationToken),
                 FormatSpec);
 
         private static string FormatSpec(GetSchemaResponse res)
@@ -83,6 +87,17 @@ public sealed class SpecCliCommand : CliCommand
                 {
                     var bounds = p.AllowedValues is { Count: > 0 } ? string.Join('|', p.AllowedValues) : $"{p.MinValue}..{p.MaxValue}";
                     sb.AppendLine($"{p.Name} ({p.ValueType}, def={p.DefaultValue}, bounds={bounds}, targets={string.Join(',', p.ApplicableTargets)})");
+                }
+            }
+
+            if (res.NestedTypes is { Count: > 0 })
+            {
+                sb.AppendLine();
+                sb.AppendLine("// nestedTypes");
+                foreach (var (typeName, fields) in res.NestedTypes)
+                {
+                    var sig = string.Join(", ", fields.Select(f => $"{f.Name}{(f.Required ? "" : "?")}:{f.Type}"));
+                    sb.AppendLine($"{typeName}: {{ {sig} }}");
                 }
             }
 

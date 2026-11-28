@@ -35,6 +35,7 @@ public sealed partial class BatchOperationsHandler(
     public async Task<Result<BatchOperationsResponse>> HandleAsync(BatchOperationsCommand command, CancellationToken cancellationToken = default)
     {
         string rawJson;
+        string? batchFileDir = null;
         if (command.InlineJson is not null)
         {
             rawJson = command.InlineJson.TrimStart('\uFEFF');
@@ -42,6 +43,7 @@ public sealed partial class BatchOperationsHandler(
         else if (!string.IsNullOrWhiteSpace(command.JsonFilePath) && File.Exists(command.JsonFilePath))
         {
             rawJson = (await File.ReadAllTextAsync(command.JsonFilePath, cancellationToken)).TrimStart('\uFEFF');
+            batchFileDir = Path.GetDirectoryName(Path.GetFullPath(command.JsonFilePath));
         }
         else
         {
@@ -89,7 +91,7 @@ public sealed partial class BatchOperationsHandler(
                     return new Error("Batch.InvalidOp", $"Batch step {i} is missing 'op'.", ErrorType.Validation, Path: $"[{i}].op");
                 }
 
-                var (ok, data, producedId, error) = await ExecuteStepAsync(opObj, op, producedIds, cancellationToken);
+                var (ok, data, producedId, error) = await ExecuteStepAsync(opObj, op, producedIds, batchFileDir, cancellationToken);
                 if (!ok)
                 {
                     tx?.Rollback();
@@ -117,7 +119,7 @@ public sealed partial class BatchOperationsHandler(
     }
 
     private async Task<(bool Ok, object? Data, string? ProducedId, Error? Error)> ExecuteStepAsync(
-        JsonObject obj, string op, List<string?> producedIds, CancellationToken ct)
+        JsonObject obj, string op, List<string?> producedIds, string? batchFileDir, CancellationToken ct)
     {
         string? ResolveAddr(string? raw)
         {
@@ -133,12 +135,58 @@ public sealed partial class BatchOperationsHandler(
             });
         }
 
+        string? ResolveStepFile(string? rawFile)
+        {
+            if (string.IsNullOrWhiteSpace(rawFile) || Path.IsPathRooted(rawFile) || string.IsNullOrWhiteSpace(batchFileDir))
+                return rawFile;
+            if (File.Exists(rawFile) || Directory.Exists(rawFile))
+                return rawFile;
+            var candidate = Path.Combine(batchFileDir, rawFile);
+            return File.Exists(candidate) || Directory.Exists(candidate) ? candidate : rawFile;
+        }
+
+        bool TryResolveStepBaseDir(out string? resolvedBaseDir, out Error? baseDirError)
+        {
+            resolvedBaseDir = null;
+            baseDirError = null;
+            var rawBaseDir = GetString(obj, "baseDir");
+            if (string.IsNullOrWhiteSpace(rawBaseDir))
+                return true;
+
+            string candidate;
+            if (Path.IsPathRooted(rawBaseDir))
+            {
+                candidate = Path.GetFullPath(rawBaseDir);
+            }
+            else if (!string.IsNullOrWhiteSpace(batchFileDir))
+            {
+                if (!PathConfinement.TryResolveInside(batchFileDir, rawBaseDir, out candidate))
+                {
+                    baseDirError = new Error("Batch.InvalidOp", $"Step 'baseDir' '{rawBaseDir}' escapes the batch file directory.", ErrorType.Validation, Path: "baseDir");
+                    return false;
+                }
+            }
+            else
+            {
+                candidate = Path.GetFullPath(rawBaseDir);
+            }
+
+            if (!Directory.Exists(candidate))
+            {
+                baseDirError = new Error("Batch.InvalidOp", $"Step 'baseDir' directory '{rawBaseDir}' was not found.", ErrorType.Validation, Path: "baseDir");
+                return false;
+            }
+
+            resolvedBaseDir = candidate;
+            return true;
+        }
+
         switch (op)
         {
             case "apply":
             {
                 var target = ResolveAddr(GetString(obj, "addr") ?? GetString(obj, "target"));
-                var file = GetString(obj, "file");
+                var file = ResolveStepFile(GetString(obj, "file"));
                 var outDir = GetString(obj, "out");
                 var buildOut = GetString(obj, "build");
                 var exportSpec = GetString(obj, "export");
@@ -147,6 +195,8 @@ public sealed partial class BatchOperationsHandler(
                 bool staticOnly = GetBool(obj, "staticOnly");
                 if (!TryResolveTimeout(obj, out int timeout, out var timeoutErr))
                     return (false, null, null, timeoutErr);
+                if (!TryResolveStepBaseDir(out var stepBaseDir, out var baseDirErr))
+                    return (false, null, null, baseDirErr);
                 var specNode = GetNode(obj, "spec");
 
                 if (specNode is null && string.IsNullOrWhiteSpace(file))
@@ -154,8 +204,21 @@ public sealed partial class BatchOperationsHandler(
                 if (specNode is not null && !string.IsNullOrWhiteSpace(file))
                     return (false, null, null, new Error("Batch.InvalidOp", "Specify either 'spec' or 'file' in an 'apply' batch step, not both.", ErrorType.Validation));
 
+                var effectiveBaseDir = stepBaseDir ?? (specNode is not null ? batchFileDir : null);
                 var res = await applyHandler.HandleAsync(
-                    new ApplySpecCommand(target, file, specNode?.ToJsonString(), outDir, dryRun, buildOut, exportSpec, VerifyWeb: verify, StaticVerifyOnly: staticOnly, VerifyTimeoutSeconds: timeout), ct);
+                    new ApplySpecCommand(
+                        target,
+                        file,
+                        specNode?.ToJsonString(),
+                        outDir,
+                        dryRun,
+                        buildOut,
+                        exportSpec,
+                        VerifyWeb: verify,
+                        StaticVerifyOnly: staticOnly,
+                        VerifyTimeoutSeconds: timeout,
+                        AssetBaseDirectoryOverride: effectiveBaseDir),
+                    ct);
                 return res.IsSuccess
                     ? (true, res.Value, res.Value.TargetId, null)
                     : (false, null, null, res.Error);
@@ -167,7 +230,10 @@ public sealed partial class BatchOperationsHandler(
                 if (string.IsNullOrWhiteSpace(addr))
                     return (false, null, null, new Error("Batch.InvalidOp", "'patch' requires 'addr'.", ErrorType.Validation));
 
-                var file = GetString(obj, "file");
+                if (!TryResolveStepBaseDir(out var stepBaseDir, out var baseDirErr))
+                    return (false, null, null, baseDirErr);
+
+                var file = ResolveStepFile(GetString(obj, "file"));
                 var dataNode = GetNode(obj, "data") ?? GetNode(obj, "patch");
                 if (dataNode is not null && !string.IsNullOrWhiteSpace(file))
                     return (false, null, null, new Error("Batch.InvalidOp", "Specify either 'data'/'patch' or 'file' in a 'patch' batch step, not both.", ErrorType.Validation));
@@ -188,8 +254,9 @@ public sealed partial class BatchOperationsHandler(
                     }
                 }
 
+                var effectiveBaseDir = stepBaseDir ?? (string.IsNullOrWhiteSpace(file) ? batchFileDir : null);
                 var res = await patchHandler.HandleAsync(
-                    new PatchEntityCommand(addr, file, dataNode?.ToJsonString(), sets, move), ct);
+                    new PatchEntityCommand(addr, file, dataNode?.ToJsonString(), sets, move, AssetBaseDirectoryOverride: effectiveBaseDir), ct);
                 return res.IsSuccess
                     ? (true, res.Value, res.Value.TargetId, null)
                     : (false, null, null, res.Error);

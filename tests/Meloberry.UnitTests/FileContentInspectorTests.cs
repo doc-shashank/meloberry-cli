@@ -94,4 +94,28 @@ public sealed class FileContentInspectorTests : IDisposable
         var verify = await _inspector.VerifyStoredAssetAsync(ws, resolved.Value.RelativeAssetPath!);
         Assert.True(verify.IsSuccess);
     }
+
+    [Fact]
+    public async Task CopyAndVerifyImageAsync_IsIdempotent_ForAlreadyHashedFilename()
+    {
+        var srcPng = Path.Combine(_tempDir, "fig.png");
+        byte[] pngBytes = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x01, 0x02, 0x03, 0x04];
+        await File.WriteAllBytesAsync(srcPng, pngBytes);
+
+        var ws1 = Path.Combine(_tempDir, "ws_idem_1");
+        var first = await _inspector.CopyAndVerifyImageAsync(srcPng, ws1);
+        Assert.True(first.IsSuccess);
+        Assert.StartsWith("assets/fig_", first.Value, StringComparison.Ordinal);
+        Assert.EndsWith(".png", first.Value, StringComparison.Ordinal);
+
+        var hashedFullPath = Path.Combine(ws1, first.Value.Replace('/', Path.DirectorySeparatorChar));
+        var secondSameWs = await _inspector.CopyAndVerifyImageAsync(hashedFullPath, ws1);
+        Assert.True(secondSameWs.IsSuccess);
+        Assert.Equal(first.Value, secondSameWs.Value);
+
+        var ws2 = Path.Combine(_tempDir, "ws_idem_2");
+        var secondOtherWs = await _inspector.CopyAndVerifyImageAsync(hashedFullPath, ws2);
+        Assert.True(secondOtherWs.IsSuccess);
+        Assert.Equal(first.Value, secondOtherWs.Value);
+    }
 }

@@ -18,7 +18,8 @@ public sealed record PatchEntityCommand(
     string? JsonFilePath = null,
     string? InlineJson = null,
     IReadOnlyList<string>? SetPairs = null,
-    string? MoveSpec = null);
+    string? MoveSpec = null,
+    string? AssetBaseDirectoryOverride = null);
 
 public sealed record PatchEntityResponse(
     string TargetId,
@@ -31,13 +32,14 @@ public sealed class PatchEntityHandler(
     EntityAddressResolver addressResolver,
     IWorkspaceRepository repository,
     IWorkingDirectoryProvider workingDirectoryProvider,
-    IContentInspector contentInspector)
+    IContentInspector contentInspector,
+    IDeclarativeSpecLoader specLoader)
 {
     private static readonly Dictionary<string, HashSet<string>> AllowedKeysByKind = new(StringComparer.Ordinal)
     {
         ["session"] = new(StringComparer.OrdinalIgnoreCase) { "name", "description" },
         ["quiz"] = new(StringComparer.OrdinalIgnoreCase) { "name", "description" },
-        ["component"] = new(StringComparer.OrdinalIgnoreCase) { "title", "ref", "layoutOverrides" },
+        ["component"] = new(StringComparer.OrdinalIgnoreCase) { "title", "ref", "layoutOverrides", "links" },
         ["articleBlock:text"] = new(StringComparer.OrdinalIgnoreCase) { "text", "ref" },
         ["articleBlock:image"] = new(StringComparer.OrdinalIgnoreCase) { "imagePath", "caption", "alt", "ref" },
         ["articleBlock:callout"] = new(StringComparer.OrdinalIgnoreCase) { "tone", "title", "text", "ref" },
@@ -85,7 +87,10 @@ public sealed class PatchEntityHandler(
         var target = resolved.Value;
 
         JsonObject patchObj = [];
-        string jsonDir = workingDirectoryProvider.GetCurrentDirectory();
+        bool hasBaseOverride = !string.IsNullOrWhiteSpace(command.AssetBaseDirectoryOverride);
+        string jsonDir = hasBaseOverride
+            ? workingDirectoryProvider.NormalizeDirectoryPath(command.AssetBaseDirectoryOverride)
+            : workingDirectoryProvider.GetCurrentDirectory();
 
         if (!string.IsNullOrWhiteSpace(command.JsonFilePath) || command.InlineJson is not null)
         {
@@ -99,7 +104,8 @@ public sealed class PatchEntityHandler(
                 if (!File.Exists(command.JsonFilePath))
                     return new Error("Json.FileNotFound", $"JSON file '{command.JsonFilePath}' was not found.", ErrorType.NotFound);
                 rawJson = (await File.ReadAllTextAsync(command.JsonFilePath, cancellationToken)).TrimStart('\uFEFF');
-                jsonDir = Path.GetDirectoryName(Path.GetFullPath(command.JsonFilePath)) ?? jsonDir;
+                if (!hasBaseOverride)
+                    jsonDir = Path.GetDirectoryName(Path.GetFullPath(command.JsonFilePath)) ?? jsonDir;
             }
 
             if (string.IsNullOrWhiteSpace(rawJson))
@@ -169,7 +175,7 @@ public sealed class PatchEntityHandler(
             {
                 "session" => ApplySessionPatch(target.Session!, patchObj),
                 "quiz" => ApplyQuizPatch(target.Quiz!, patchObj),
-                "component" => ApplyComponentPatch(target.Session!, target.Component!, patchObj),
+                "component" => await ApplyComponentPatchAsync(target.Session!, target.Component!, target.StorageDirectory, jsonDir, patchObj, cancellationToken),
                 "articleBlock" => await ApplyBlockPatchAsync(target.Session!, target.ArticleBlock!, target.StorageDirectory, jsonDir, patchObj, cancellationToken),
                 "question" => await ApplyQuestionPatchAsync(target, jsonDir, patchObj, cancellationToken),
                 _ => new Error("Patch.UnsupportedTarget", $"Cannot patch '{target.EntityKind}'.", ErrorType.Validation)
@@ -430,7 +436,13 @@ public sealed class PatchEntityHandler(
         return Result.Success();
     }
 
-    private static Result ApplyComponentPatch(StudySession session, SessionComponent comp, JsonObject patch)
+    private async Task<Result> ApplyComponentPatchAsync(
+        StudySession session,
+        SessionComponent comp,
+        string storageDir,
+        string jsonDir,
+        JsonObject patch,
+        CancellationToken ct)
     {
         if (TryGetProp(patch, "title", out var titleNode))
         {
@@ -460,6 +472,68 @@ public sealed class PatchEntityHandler(
                     if (!res.IsSuccess) return res.Error!;
                 }
             }
+        }
+        if (TryGetProp(patch, "links", out var linksNode))
+        {
+            if (comp.Kind != ComponentKind.Article)
+                return ComponentErrors.WrongKind(comp.Id, "article");
+
+            if (linksNode is not JsonArray linksArr)
+                return new Error("Patch.InvalidValue", "'links' must be a JSON array of link card objects.", ErrorType.Validation, Path: "links");
+
+            var cards = new List<ArticleLinkCard>(linksArr.Count);
+            var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            for (int i = 0; i < linksArr.Count; i++)
+            {
+                if (linksArr[i] is not JsonObject cardObj)
+                    return new Error("Patch.InvalidValue", $"Link card at index {i} must be a JSON object.", ErrorType.Validation, Path: $"links[{i}]");
+
+                foreach (var kv in cardObj)
+                {
+                    if (!string.Equals(kv.Key, "id", StringComparison.OrdinalIgnoreCase) &&
+                        !string.Equals(kv.Key, "title", StringComparison.OrdinalIgnoreCase) &&
+                        !string.Equals(kv.Key, "text", StringComparison.OrdinalIgnoreCase) &&
+                        !string.Equals(kv.Key, "imagePath", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return new Error("Patch.InvalidValue", $"Unknown property '{kv.Key}' on link card at index {i}. Allowed: id, title, text, imagePath.", ErrorType.Validation, Path: $"links[{i}].{kv.Key}");
+                    }
+                }
+
+                if (!TryReadRequiredString(cardObj, "id", out var rawId, out var idErr))
+                    return idErr ?? new Error("Patch.InvalidValue", $"Link card at index {i} requires a non-empty 'id'.", ErrorType.Validation, Path: $"links[{i}].id");
+
+                var normIdRes = ArticleLinkRules.ValidateAndNormalizeCardId(rawId);
+                if (!normIdRes.IsSuccess || string.IsNullOrWhiteSpace(normIdRes.Value))
+                    return normIdRes.Error ?? new Error("ArticleLink.InvalidId", $"Invalid link card id '{rawId}'.", ErrorType.Validation, Path: $"links[{i}].id");
+
+                if (!seenIds.Add(normIdRes.Value))
+                    return new Error("Json.DuplicateLinkId", $"Duplicate link card id '{normIdRes.Value}' in 'links'.", ErrorType.Conflict, Path: $"links[{i}].id");
+
+                string? title = null;
+                if (TryReadNullableString(cardObj, "title", out var tVal, out var tErr)) title = tVal;
+                else if (tErr is not null) return tErr;
+
+                string? text = null;
+                if (TryReadNullableString(cardObj, "text", out var txtVal, out var txtErr)) text = txtVal;
+                else if (txtErr is not null) return txtErr;
+
+                string? imagePath = null;
+                if (TryGetProp(cardObj, "imagePath", out var imgNode))
+                {
+                    var imgRes = await TryCopyPatchedImageAsync(imgNode, $"links[{i}].imagePath", allowNull: true, "Link card 'imagePath' must be a string or null.", storageDir, jsonDir, ct);
+                    if (!imgRes.IsSuccess) return imgRes.Error!;
+                    imagePath = imgRes.Value;
+                }
+
+                if (string.IsNullOrWhiteSpace(text) && string.IsNullOrWhiteSpace(imagePath))
+                    return new Error("ArticleLink.EmptyContent", $"Link card '{normIdRes.Value}' must specify 'text', 'imagePath', or both.", ErrorType.Validation, Path: $"links[{i}]");
+
+                cards.Add(new ArticleLinkCard(normIdRes.Value, title, text, imagePath));
+            }
+
+            var setLinksRes = comp.SetLinkCards(cards);
+            if (!setLinksRes.IsSuccess) return setLinksRes.Error!;
         }
         return Result.Success();
     }
@@ -1363,14 +1437,43 @@ public sealed class PatchEntityHandler(
                 }
                 if (TryGetProp(patch, "questions", out var qN))
                 {
-                    List<CaseSubQuestion>? deserialized;
-                    try { deserialized = JsonSerializer.Deserialize<List<CaseSubQuestion>>(qN?.ToJsonString() ?? "null", ReadOptions); }
-                    catch (JsonException ex) { return new Error("Patch.InvalidValue", $"Invalid 'questions' array: {ex.Message}", ErrorType.Validation, Path: "questions"); }
-                    if (deserialized is null || deserialized.Count < 2)
+                    if (qN is not JsonArray qArr || qArr.Count < 2)
+                        return new Error("Patch.InvalidValue", "'questions' must be an array containing at least 2 valid sub-questions.", ErrorType.Validation, Path: "questions");
+
+                    var wrapperJson = new JsonObject
+                    {
+                        ["kind"] = "quiz",
+                        ["quizType"] = "mixed",
+                        ["questions"] = new JsonArray
+                        {
+                            new JsonObject
+                            {
+                                ["type"] = "case",
+                                ["stem"] = string.IsNullOrWhiteSpace(stem) ? "Case stem" : stem,
+                                ["questions"] = qArr.DeepClone()
+                            }
+                        }
+                    }.ToJsonString();
+
+                    var parsedSpecRes = await specLoader.LoadFromTextAsync(wrapperJson, ct);
+                    if (!parsedSpecRes.IsSuccess)
+                        return NormalizeCaseSubQuestionError(parsedSpecRes.Error!);
+
+                    var subSpecs = parsedSpecRes.Value.Questions?.FirstOrDefault()?.SubQuestions;
+                    if (subSpecs is null || subSpecs.Count < 2)
                         return new Error("Patch.InvalidValue", "'questions' must contain at least 2 valid sub-questions.", ErrorType.Validation, Path: "questions");
-                    if (deserialized.Any(s => string.Equals(s.Type?.Trim(), "case", StringComparison.OrdinalIgnoreCase)))
-                        return new Error("Case.NestedCaseNotAllowed", "Nested 'case' sub-questions inside 'case' are not allowed.", ErrorType.Validation, Path: "questions");
-                    questions = deserialized.Select((s, idx) => s with { Index = idx }).ToList();
+
+                    var matRes = await JsonQuestionMaterializer.MaterializeCaseSubQuestionsAsync(
+                        pq.Id,
+                        pq.ContainerId,
+                        subSpecs,
+                        jsonDir,
+                        storageDir,
+                        contentInspector,
+                        ct,
+                        workspaceCwdDirectory: workingDirectoryProvider.GetCurrentDirectory());
+                    if (!matRes.IsSuccess) return matRes.Error!;
+                    questions = matRes.Value;
                 }
 
                 return pq.SetPayloadJson(Phase1PayloadCodec.Serialize(new CaseGroupPayload(title, stem, imagePath, caption, questions, explanation)));
@@ -1689,6 +1792,22 @@ public sealed class PatchEntityHandler(
             default:
                 return new Error("Patch.UnsupportedMove", $"Cannot move entity kind '{target.EntityKind}'.", ErrorType.Validation);
         }
+    }
+
+    private static Error NormalizeCaseSubQuestionError(Error error)
+    {
+        if (string.IsNullOrWhiteSpace(error.Path))
+            return error;
+
+        var path = error.Path;
+        if (path.StartsWith("$.questions[0].", StringComparison.Ordinal))
+            path = "$." + path["$.questions[0].".Length..];
+        else if (path.StartsWith("questions[0].", StringComparison.Ordinal))
+            path = path["questions[0].".Length..];
+
+        return string.Equals(path, error.Path, StringComparison.Ordinal)
+            ? error
+            : error with { Path = path };
     }
 
     private sealed class PatchOptionDto

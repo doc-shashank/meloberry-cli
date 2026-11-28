@@ -181,7 +181,7 @@ Pass a `.md` file or directory (`./articles/`) directly to `mby apply` or `mby b
 ### Surgical Patch (`mby spec patch`)
 
 - `session` / `quiz`: `{ name?, description? }`
-- `component`: `{ title?, ref?, layoutOverrides? }`
+- `component`: `{ title?, ref?, layoutOverrides?, links? }` *(`links` is article-only; replaces link cards or clears with `[]`)*
 - `articleBlock`:
   - `text`: `{ text?, ref? }`
   - `image`: `{ imagePath?, caption?, alt?, ref? }`
@@ -198,11 +198,12 @@ Pass a `.md` file or directory (`./articles/`) directly to `mby apply` or `mby b
   - `diff`: `{ mode?, title?, bank?, fuzzy?, caseSensitive?, allowNoError?, placeholder?, headers?, alignments?, rows?, explanation?, ref?, layoutOverrides? }`
   - `mechanism`: `{ title?, steps?, explanation?, ref?, layoutOverrides? }`
   - `relabel`: `{ imagePath?, prompt?, mode?, style?, boxes?, distractors?, fuzzy?, caseSensitive?, explanation?, ref?, layoutOverrides? }`
-  - `case`: `{ title?, stem?, imagePath?, caption?, questions?, explanation?, ref?, layoutOverrides? }`
+  - `case`: `{ title?, stem?, imagePath?, caption?, questions?, explanation?, ref?, layoutOverrides? }` *(`questions` accepts declarative `mby spec` sub-questions, copies relative images, and rejects nested `case`)*
   - `classify`: `{ title?, buckets?, items?, explanation?, ref?, layoutOverrides? }`
   - `match`: `{ title?, pairs?, distractors?, explanation?, ref?, layoutOverrides? }`
   - `numeric`: `{ text?, prompt?, answer?, tolerance?, toleranceMode?, unit?, placeholder?, imagePath?, explanation?, ref?, layoutOverrides? }`
-- `--set <k=v>` converts `null` to JSON `null` (`hideableCols=null` clears to `[]`), clearing nullable fields/overrides and rejecting non-nullable fields with `Patch.InvalidValue`. An empty `{}` patch without `--set` or `--move` fails with `Patch.Empty`. Pass `--move <index>:<shift|exchange>` to reorder.
+- `--set <k=v>` converts `null` to JSON `null` (`hideableCols=null` clears to `[]`), clearing nullable fields/overrides and rejecting non-nullable fields with `Patch.InvalidValue`. Existing workspace `assets/<file>` paths are preserved across arbitrary CWDs without re-copying or double-hashing, and `batch` resolves relative image paths against the batch file's directory (or optional step `baseDir`). An empty `{}` patch without `--set` or `--move` fails with `Patch.Empty`. Pass `--move <index>:<shift|exchange>` to reorder.
+- All workspace commands (`get`, `check`, `patch`, `rm`, `apply`, `build`, `pkg export`) accept an unregistered external workspace folder path directly (e.g., `mby get /path/to/Session_... --view spec --json` or `/path/to/Session_...#c1.b1`). Use `mby version --json` (`data.capabilities`) and `mby spec --nested --json` (`data.schemaVersion`, `data.nestedTypes`) for runtime capability and schema discovery.
 
 ### `.mbypkg` Package Format (`v2.0` — Backward-Compatible `v1.0`/`v2.0` Import)
 
@@ -212,4 +213,4 @@ ZIP archive produced after mandatory `check`:
 - `layouts.json`: global profiles (included only with `--include-layout`)
 - `assets/<filename>`: deduped verified media files
 
-`pkg export` defaults to `<projectRoot>/<wsId>.mbypkg` for workspaces under `.meloberry/workspaces/` (or `<workspaceParent>/<wsId>.mbypkg` otherwise) when `[outPath]` is omitted; `[outPath]` resolves as a directory if it exists or ends with `/` or `\`, and as a `.mbypkg` file path otherwise. `pkg import` supports both `v1.0` and `v2.0` packages (stripping UTF-8 BOM if present), defaults to CWD when `[destDir]` is omitted, validates payload schemas, enforces single-segment IDs and ZIP entry confinement, and caps decompression at `50 MB` per-entry / `250 MB` total via atomic staging.
+`pkg export` defaults to `<projectRoot>/<wsId>.mbypkg` for workspaces under `.meloberry/workspaces/` (or `<workspaceParent>/<wsId>.mbypkg` otherwise) when `[outPath]` is omitted; `[outPath]` resolves as a directory if it exists or ends with `/` or `\`, and as a `.mbypkg` file path otherwise. `pkg import` supports both `v1.0` and `v2.0` packages (stripping UTF-8 BOM if present), defaults to CWD when `[destDir]` is omitted, surfaces `targetPlatform` and `includedLayout` in `ImportPackageResponse`, validates payload schemas, enforces single-segment IDs and ZIP entry confinement, and caps decompression at `50 MB` per-entry / `250 MB` total via atomic staging.

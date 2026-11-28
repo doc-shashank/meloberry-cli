@@ -6,10 +6,10 @@ All commands are verb-first, stateless, and non-interactive. Pass `-` for any `<
 | :--- | :--- | :--- |
 | `prime` | `mby prime` *(or `mby` / `mby --help` / `mby -h`)* | Print compact AI-agent grammar card |
 | `help` | `mby <cmd> --help` *(or `mby <cmd> -h` / `mby help <cmd>`)* | Print command-specific usage, prerequisites, flags, and examples |
-| `spec` | `mby spec [type\|@group...]` | Print schemas with exact limits (grouped by `@content` vs. `@other`; see Spec Classification below) |
+| `spec` | `mby spec [type\|@group...] [--icons] [--nested]` | Print schemas with exact limits (grouped by `@content` vs. `@other`; `--icons` adds SVG icons, `--nested` adds nested item schemas) |
 | `apply` | `mby apply [addr] <file\|dir\|-> [-o dir] [--build dir] [--verify] [--static-only] [--timeout n] [--export plat[:path]] [--dry-run] [--quiet\|--verbose]` | Create workspace or append to `session`/`component`/`quiz` (`[addr]` cannot target blocks/questions); writes drafts and returns `data.lint` (use `--build`/`--export`/`check` for exit-`2` lint gating) |
 | `patch` | `mby patch <addr> [file\|-] [--set k=v] [--move idx:shift\|exchange]` | Surgically update fields or reorder by ID, `#path`, or `#ref` |
-| `get` | `mby get <addr> [--view outline\|full\|ids]` | Inspect entity (`outline` default) |
+| `get` | `mby get <addr> [--view outline\|full\|ids\|spec]` | Inspect entity by ID, `#path`, `#ref`, or direct workspace folder path (`outline` default; `spec` emits canonical `apply`-compatible JSON + parallel `idMap`) |
 | `ls` | `mby ls [dir] [--all]` | List workspaces in CWD + `.meloberry/workspaces/` (or all globally registered workspaces with `--all`) |
 | `rm` | `mby rm <addr>` | Delete workspace, component, block, or question immediately |
 | `check` | `mby check <addr> [--quiet\|--verbose]` | Run mandatory lint validation |
@@ -18,7 +18,7 @@ All commands are verb-first, stateless, and non-interactive. Pass `-` for any `<
 | `pkg` | `mby pkg export <wsId> <desktop\|android> [outPath] [--include-layout]`<br>`mby pkg import <file> [destDir]` | Export `.mbypkg` v2.0 archive (defaults to project root or parent dir; `[outPath]` ending in `/` or `\` or an existing dir writes `<dir>/<wsId>.mbypkg`) or import `v1.0`/`v2.0` (defaults to CWD) |
 | `layout` | `mby layout get [mcq\|flashcard\|article]`<br>`mby layout set <mcq\|flashcard\|article> <prop> <val>`<br>`mby layout reset [mcq\|flashcard\|article] [prop...]`<br>`mby layout edit [target] [--no-wait]` | Query bounds, update or reset global layout profiles, or serve GUI layout editor (`article-text`, `image`, `mcq-question`, `mcq-options`, `flashcard`, `callout`, `table`, `fill-blank`, `assertion-reason`, `spot-error`, `diff`, `mechanism`, `relabel`) |
 | `analyze` | `mby analyze <webDir\|report.json> [--headless] [--static-only] [--timeout n] [--all] [--live] [--no-wait]` | Run zero-touch headless/static WebApp verification or analyze captured telemetry reports |
-| `version` | `mby version` *(or `-v` / `--version`)* | Print CLI version and .NET runtime |
+| `version` | `mby version` *(or `-v` / `--version`)* | Print CLI version, .NET runtime, and supported `data.capabilities` (in `--json`) |
 
 ## Spec Classification (`mby spec`)
 

@@ -5,7 +5,10 @@ using Meloberry.Domain.Layouts;
 
 namespace Meloberry.Application.UseCases.Diagnostics;
 
-public sealed record GetSchemaQuery(IReadOnlyList<string>? Topics = null, bool IncludeIcons = false);
+public sealed record GetSchemaQuery(
+    IReadOnlyList<string>? Topics = null,
+    bool IncludeIcons = false,
+    bool IncludeNested = false);
 
 public sealed record SchemaFieldSpec(
     string Name,
@@ -35,7 +38,10 @@ public sealed record GetSchemaResponse(
     IReadOnlyList<SchemaTopicDefinition> Schemas,
     IReadOnlyList<SchemaLayoutPropertySpec>? LayoutProperties = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    IReadOnlyDictionary<string, string>? Icons = null);
+    IReadOnlyDictionary<string, string>? Icons = null,
+    string SchemaVersion = "2.0",
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    IReadOnlyDictionary<string, IReadOnlyList<SchemaFieldSpec>>? NestedTypes = null);
 
 public sealed record SchemaLayoutPropertySpec(
     string Name,
@@ -223,7 +229,11 @@ public sealed class GetSchemaHandler(ISpecIconProvider? iconProvider = null)
         IReadOnlyDictionary<string, string>? icons = query.IncludeIcons && iconProvider is not null
             ? iconProvider.GetIcons(requested.Count == 0 ? null : activeTopics)
             : null;
-        return Task.FromResult(Result<GetSchemaResponse>.Success(new GetSchemaResponse(activeTopics, schemas, layoutProps, icons)));
+        IReadOnlyDictionary<string, IReadOnlyList<SchemaFieldSpec>>? nestedTypes = query.IncludeNested
+            ? BuildNestedTypes(activeTopics, includeAll: requested.Count == 0)
+            : null;
+        return Task.FromResult(Result<GetSchemaResponse>.Success(
+            new GetSchemaResponse(activeTopics, schemas, layoutProps, icons, SchemaVersion: "2.0", NestedTypes: nestedTypes)));
     }
 
     private static IReadOnlyList<string>? ExpandGroupToken(string groupToken)
@@ -635,7 +645,7 @@ public sealed class GetSchemaHandler(ISpecIconProvider? iconProvider = null)
             Topic: "patch",
             CompactSignature: """
                 // Surgical partial update / reorder by ID, #path, or #ref (strict per-entity keys; --set k=null clears nullable fields/overrides and rejects non-nullable fields; empty {} fails with Patch.Empty)
-                // session|quiz: { name?, description? } | component: { title?, ref?, layoutOverrides? }
+                // session|quiz: { name?, description? } | component: { title?, ref?, layoutOverrides?, links? }
                 // block(text): { text?, ref? } | block(image): { imagePath?, caption?, alt?, ref? } | block(callout): { tone?, title?, text?, ref? }
                 // block(table): { title?, caption?, stickyFirstCol?, hideableCols?, headers?, alignments?, rows?, footnote?, ref? }
                 // block(diagram-explore): { title?, caption?, alt?, imagePath?, hotspots?, ref? } | block(reveal): { title?, showFirst?, steps?, ref? }
@@ -1078,7 +1088,8 @@ public sealed class GetSchemaHandler(ISpecIconProvider? iconProvider = null)
             [
                 TypeField("numeric"),
                 RefField,
-                new("prompt", "string", true, "Question prompt (or alias 'text')."),
+                new("text", "string", false, "Question prompt (alias for 'prompt'; provide either 'text' or 'prompt')."),
+                new("prompt", "string", false, "Question prompt (alias for 'text'; provide either 'prompt' or 'text')."),
                 new("answer", "number", true, "Exact finite numeric answer."),
                 new("tolerance", "number|string", false, "Non-negative tolerance (number or 'X%' percentage; default 0)."),
                 new("toleranceMode", "string", false, "Tolerance interpretation (default 'absolute').", ["absolute", "percent"]),
@@ -1163,5 +1174,112 @@ public sealed class GetSchemaHandler(ISpecIconProvider? iconProvider = null)
                 v.Targets.ToList(),
                 v.Spec.Description))
             .ToList();
+    }
+
+    private static readonly Dictionary<string, string[]> TopicNestedTypeMap = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["article"] = ["linkCard"],
+        ["mcq"] = ["mcqOption"],
+        ["flashcard"] = ["flashcardSide"],
+        ["relabel"] = ["relabelBox"],
+        ["diagram-explore"] = ["diagramHotspot"],
+        ["reveal"] = ["revealStep"],
+        ["mechanism"] = ["mechanismStep"],
+        ["classify"] = ["bucket", "classifyItem"],
+        ["match"] = ["matchPair"]
+    };
+
+    private static readonly Dictionary<string, IReadOnlyList<SchemaFieldSpec>> AllNestedTypes = new(StringComparer.Ordinal)
+    {
+        ["mcqOption"] =
+        [
+            new("index", "integer", false, "Optional 1-based option slot index (auto-assigned if omitted).", null, null, null, 1, 26),
+            new("text", "string", false, "Option Markdown/KaTeX text (provide text and/or imagePath)."),
+            new("imagePath", "string", false, "Optional option image path (provide text and/or imagePath)."),
+            new("isCorrect", "boolean", false, "Marks this option as a correct answer (default false).")
+        ],
+        ["flashcardSide"] =
+        [
+            new("text", "string", false, "Face Markdown/KaTeX text (provide text and/or imagePath)."),
+            new("imagePath", "string", false, "Optional face image path (provide text and/or imagePath)."),
+            new("position", "string", false, "Text placement relative to image (alias: textPosition; default 'belowImage').", ["belowImage", "aboveImage"])
+        ],
+        ["relabelBox"] =
+        [
+            new("label", "string", true, "Primary canonical label text."),
+            new("aliases", "array<string>", false, "Optional additional accepted answers in recall mode."),
+            new("rect", "array<number>", false, "Normalized [x, y, w, h] coordinates in 0..1 (alternative to x/y/w/h)."),
+            new("x", "number", false, "Normalized left coordinate in [0..1)."),
+            new("y", "number", false, "Normalized top coordinate in [0..1)."),
+            new("w", "number", false, "Normalized width in (0..1]."),
+            new("h", "number", false, "Normalized height in (0..1].")
+        ],
+        ["diagramHotspot"] =
+        [
+            new("label", "string", true, "Hotspot label (matched against sidecar when masksPath is set, or displayed directly)."),
+            new("note", "string", true, "Markdown/KaTeX annotation revealed when clicked."),
+            new("rect", "array<number>", false, "Normalized [x, y, w, h] coordinates in 0..1 (alternative to x/y/w/h when no masksPath)."),
+            new("x", "number", false, "Normalized left coordinate in [0..1)."),
+            new("y", "number", false, "Normalized top coordinate in [0..1)."),
+            new("w", "number", false, "Normalized width in (0..1]."),
+            new("h", "number", false, "Normalized height in (0..1].")
+        ],
+        ["revealStep"] =
+        [
+            new("heading", "string", true, "Step cue/header text."),
+            new("body", "string", true, "Step Markdown/KaTeX body revealed on click.")
+        ],
+        ["mechanismStep"] =
+        [
+            new("stepId", "integer", false, "Optional step identifier (auto-assigned if omitted)."),
+            new("orderGroup", "integer", false, "1-based sequence group; equal values are parallel/commutative (required when isDistractor is false).", null, null, null, 1, null),
+            new("text", "string", true, "Step Markdown/KaTeX text."),
+            new("isDistractor", "boolean", false, "Marks a decoy step excluded from the correct sequence (default false).")
+        ],
+        ["bucket"] =
+        [
+            new("bucketId", "integer", true, "1-based category bucket identifier (when passing objects instead of string names).", null, null, null, 1, 4),
+            new("name", "string", true, "Category bucket display name.")
+        ],
+        ["classifyItem"] =
+        [
+            new("bucket", "string", false, "Target bucket name (provide either bucket or bucketId)."),
+            new("bucketId", "integer", false, "1-based target bucket identifier (provide either bucket or bucketId).", null, null, null, 1, 4),
+            new("text", "string", true, "Sortable item chip Markdown/KaTeX text.")
+        ],
+        ["matchPair"] =
+        [
+            new("left", "string", true, "Left-column prompt item."),
+            new("right", "string", true, "Right-column matching item.")
+        ],
+        ["linkCard"] =
+        [
+            new("id", "string", true, "Unique link card slug referenced via [text](mby://card/<id>)."),
+            new("title", "string", false, "Optional hover card header title."),
+            new("text", "string", false, "Hover card Markdown/KaTeX body text."),
+            new("imagePath", "string", false, "Optional hover card image path.")
+        ]
+    };
+
+    private static IReadOnlyDictionary<string, IReadOnlyList<SchemaFieldSpec>>? BuildNestedTypes(
+        IReadOnlyList<string> activeTopics,
+        bool includeAll)
+    {
+        if (includeAll)
+            return new Dictionary<string, IReadOnlyList<SchemaFieldSpec>>(AllNestedTypes, StringComparer.Ordinal);
+
+        var result = new Dictionary<string, IReadOnlyList<SchemaFieldSpec>>(StringComparer.Ordinal);
+        foreach (var topic in activeTopics)
+        {
+            if (!TopicNestedTypeMap.TryGetValue(topic, out var typeNames))
+                continue;
+            foreach (var typeName in typeNames)
+            {
+                if (AllNestedTypes.TryGetValue(typeName, out var fields))
+                    result[typeName] = fields;
+            }
+        }
+
+        return result.Count > 0 ? result : null;
     }
 }

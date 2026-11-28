@@ -20,7 +20,7 @@ public sealed class CommandDispatcher(
     private static readonly HashSet<string> GlobalKnownFlagOptions = new(StringComparer.OrdinalIgnoreCase)
     {
         "json", "help", "version", "dry-run", "preview", "no-wait", "include-layout", "all", "live",
-        "quiet", "verbose", "headless", "verify", "static-only", "ephemeral", "icons"
+        "quiet", "verbose", "headless", "verify", "static-only", "ephemeral", "icons", "nested"
     };
 
     private readonly Dictionary<string, CliCommand> _commands =

@@ -19,7 +19,9 @@ public sealed record ResolvedEntity(
     Quiz? Quiz = null,
     Question? Question = null);
 
-public sealed partial class EntityAddressResolver(IWorkspaceRepository repository)
+public sealed partial class EntityAddressResolver(
+    IWorkspaceRepository repository,
+    IWorkingDirectoryProvider? workingDirectoryProvider = null)
 {
     [GeneratedRegex(@"^c(?<c>\d+)$", RegexOptions.IgnoreCase)]
     private static partial Regex ComponentPathRegex();
@@ -39,12 +41,35 @@ public sealed partial class EntityAddressResolver(IWorkspaceRepository repositor
             return AddressErrors.InvalidAddress(address);
 
         var trimmed = address.Trim();
+
+        // Direct workspace folder path (checked before splitting on '#' in case parent folders contain '#')
+        if (TryExtractWorkspaceDirectory(trimmed, out var directWsId, out var directParentDir))
+        {
+            await repository.ListWorkspacesAsync(directParentDir, includeAll: false, cancellationToken);
+            return await ResolveDirectIdAsync(directWsId, cancellationToken);
+        }
+
         int hashIndex = trimmed.IndexOf('#');
         if (hashIndex < 0)
             return await ResolveDirectIdAsync(trimmed, cancellationToken);
 
         var wsId = trimmed[..hashIndex].Trim();
         var subPath = trimmed[(hashIndex + 1)..].Trim();
+
+        // Support '<workspaceFolderPath>#<subPath>' (including bare CWD folder names and parent paths containing '#')
+        int lastHash = trimmed.LastIndexOf('#');
+        if (lastHash > 0)
+        {
+            var folderBase = trimmed[..lastHash].Trim();
+            var folderSub = trimmed[(lastHash + 1)..].Trim();
+            if (!string.IsNullOrWhiteSpace(folderSub) && TryExtractWorkspaceDirectory(folderBase, out var folderWsId, out var folderParentDir))
+            {
+                await repository.ListWorkspacesAsync(folderParentDir, includeAll: false, cancellationToken);
+                wsId = folderWsId;
+                subPath = folderSub;
+            }
+        }
+
         if (string.IsNullOrWhiteSpace(wsId) || string.IsNullOrWhiteSpace(subPath))
             return AddressErrors.InvalidAddress(address);
 
@@ -63,6 +88,53 @@ public sealed partial class EntityAddressResolver(IWorkspaceRepository repositor
         }
 
         return AddressErrors.InvalidAddress(address);
+    }
+
+    private static bool IsDirectWorkspaceIdPrefix(string id) =>
+        id.StartsWith("Session_", StringComparison.Ordinal) || id.StartsWith("Set_", StringComparison.Ordinal);
+
+    private bool TryExtractWorkspaceDirectory(string candidatePath, out string workspaceId, out string parentDirectory)
+    {
+        workspaceId = string.Empty;
+        parentDirectory = string.Empty;
+        if (string.IsNullOrWhiteSpace(candidatePath))
+            return false;
+
+        try
+        {
+            var cleaned = candidatePath.Trim().TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            if (string.IsNullOrWhiteSpace(cleaned))
+                return false;
+
+            var fullPath = workingDirectoryProvider is not null
+                ? workingDirectoryProvider.NormalizeDirectoryPath(cleaned)
+                : Path.GetFullPath(cleaned);
+
+            bool dirExists = workingDirectoryProvider?.DirectoryExists(fullPath) ?? Directory.Exists(fullPath);
+            if (!dirExists)
+                return false;
+
+            var dirName = Path.GetFileName(fullPath);
+            if (string.IsNullOrWhiteSpace(dirName) || !IsDirectWorkspaceIdPrefix(dirName))
+                return false;
+
+            var dbPath = Path.Combine(fullPath, $"{dirName}.db");
+            bool dbExists = workingDirectoryProvider?.FileExists(dbPath) ?? File.Exists(dbPath);
+            if (!dbExists)
+                return false;
+
+            var parent = Path.GetDirectoryName(fullPath);
+            if (string.IsNullOrWhiteSpace(parent))
+                return false;
+
+            workspaceId = dirName;
+            parentDirectory = parent;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private async Task<Result<ResolvedEntity>> ResolveDirectIdAsync(string id, CancellationToken cancellationToken)

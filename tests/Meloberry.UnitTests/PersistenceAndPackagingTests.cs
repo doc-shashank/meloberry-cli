@@ -290,6 +290,42 @@ public sealed class PersistenceAndPackagingTests : IDisposable
         Assert.Equal("Set_20261120_100100_001", impV1.Value.ImportedId);
     }
 
+    [Fact]
+    public async Task ImportPackage_ReturnsTargetPlatformAndIncludedLayout()
+    {
+        using var sp = _fx.CreateProvider("appdata_pkg_meta");
+        using var scope = sp.CreateScope();
+        var apply = scope.ServiceProvider.GetRequiredService<ApplySpecHandler>();
+        var export = scope.ServiceProvider.GetRequiredService<ExportPackageHandler>();
+        var import = scope.ServiceProvider.GetRequiredService<ImportPackageHandler>();
+
+        var applied = (await apply.HandleAsync(new ApplySpecCommand(
+            null,
+            null,
+            """{"kind":"quiz","quizType":"mcq","name":"Meta Quiz","questions":[{"type":"mcq","text":"1+1?","options":[{"text":"2","isCorrect":true},{"text":"3"}]}]}""",
+            _fx.WorkDir))).Value;
+
+        var androidPkg = Path.Combine(_fx.TempRoot, "android_with_layout.mbypkg");
+        var desktopPkg = Path.Combine(_fx.TempRoot, "desktop_no_layout.mbypkg");
+        Assert.True((await export.HandleAsync(new ExportPackageCommand(applied.TargetId, androidPkg, "android", IncludeLayout: true))).IsSuccess);
+        Assert.True((await export.HandleAsync(new ExportPackageCommand(applied.TargetId, desktopPkg, "desktop", IncludeLayout: false))).IsSuccess);
+
+        using var spImp1 = _fx.CreateProvider("appdata_pkg_meta_imp1");
+        using var scopeImp1 = spImp1.CreateScope();
+        var imp1 = await scopeImp1.ServiceProvider.GetRequiredService<ImportPackageHandler>()
+            .HandleAsync(new ImportPackageCommand(androidPkg, _fx.SubDir("imp_android_meta")));
+        Assert.True(imp1.IsSuccess, imp1.Error?.Description);
+        Assert.Equal("android", imp1.Value.TargetPlatform);
+        Assert.True(imp1.Value.IncludedLayout);
+
+        using var spImp2 = _fx.CreateProvider("appdata_pkg_meta_imp2");
+        using var scopeImp2 = spImp2.CreateScope();
+        var imp2 = await scopeImp2.ServiceProvider.GetRequiredService<ImportPackageHandler>()
+            .HandleAsync(new ImportPackageCommand(desktopPkg, _fx.SubDir("imp_desktop_meta")));
+        Assert.True(imp2.IsSuccess, imp2.Error?.Description);
+        Assert.Equal("desktop", imp2.Value.TargetPlatform);
+        Assert.False(imp2.Value.IncludedLayout);
+    }
     [Theory]
     [MemberData(nameof(InvalidPackageCases))]
     public async Task Mbypkg_Import_RejectsCorruptTamperedAndInvalidArchives(

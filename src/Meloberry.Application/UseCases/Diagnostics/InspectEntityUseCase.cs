@@ -1,3 +1,4 @@
+using System.Text.Json.Nodes;
 using Meloberry.Application.UseCases.Common;
 using Meloberry.Domain.Common;
 using Meloberry.Domain.Payloads;
@@ -6,7 +7,7 @@ using Meloberry.Domain.Sessions;
 
 namespace Meloberry.Application.UseCases.Diagnostics;
 
-public enum InspectViewMode { Outline, Full, Ids }
+public enum InspectViewMode { Outline, Full, Ids, Spec }
 
 public sealed record InspectEntityQuery(string Address, InspectViewMode View = InspectViewMode.Outline);
 
@@ -58,7 +59,8 @@ public sealed record InspectComponentDto(
     int? ItemCount = null,
     IReadOnlyList<InspectArticleBlockDto>? ArticleBlocks = null,
     IReadOnlyList<InspectQuestionDto>? Questions = null,
-    IReadOnlyDictionary<string, string>? LayoutOverrides = null);
+    IReadOnlyDictionary<string, string>? LayoutOverrides = null,
+    IReadOnlyList<ArticleLinkCard>? Links = null);
 
 public sealed record InspectEntityResponse(
     string EntityKind,
@@ -74,7 +76,9 @@ public sealed record InspectEntityResponse(
     InspectComponentDto? Component = null,
     InspectArticleBlockDto? ArticleBlock = null,
     IReadOnlyList<InspectQuestionDto>? Questions = null,
-    InspectQuestionDto? Question = null);
+    InspectQuestionDto? Question = null,
+    JsonNode? Spec = null,
+    InspectIdMapDto? IdMap = null);
 
 public sealed class InspectEntityHandler(EntityAddressResolver addressResolver)
 {
@@ -87,6 +91,9 @@ public sealed class InspectEntityHandler(EntityAddressResolver addressResolver)
         var entity = resolved.Value;
         var viewName = query.View.ToString().ToLowerInvariant();
         var storage = query.View == InspectViewMode.Ids ? null : entity.StorageDirectory;
+
+        if (query.View == InspectViewMode.Spec)
+            return ProjectSpecResponse(entity, viewName, storage);
 
         return entity.EntityKind switch
         {
@@ -140,6 +147,77 @@ public sealed class InspectEntityHandler(EntityAddressResolver addressResolver)
         };
     }
 
+    private static InspectEntityResponse ProjectSpecResponse(ResolvedEntity entity, string viewName, string? storage)
+    {
+        switch (entity.EntityKind)
+        {
+            case "session":
+            {
+                var (spec, idMap) = WorkspaceSpecProjector.ProjectSession(entity.Session!);
+                return new InspectEntityResponse(
+                    EntityKind: "session",
+                    Id: entity.Session!.Id,
+                    View: viewName,
+                    StorageDirectory: storage,
+                    Spec: spec,
+                    IdMap: idMap);
+            }
+            case "component":
+            {
+                var (spec, idMap) = WorkspaceSpecProjector.ProjectComponent(entity.Component!);
+                return new InspectEntityResponse(
+                    EntityKind: "component",
+                    Id: entity.Component!.Id,
+                    View: viewName,
+                    StorageDirectory: storage,
+                    SessionId: entity.Session!.Id,
+                    Spec: spec,
+                    IdMap: idMap);
+            }
+            case "articleBlock":
+            {
+                var bPath = $"c{entity.Component!.Index}.b{entity.ArticleBlock!.Index}";
+                var (spec, idMap) = WorkspaceSpecProjector.ProjectArticleBlock(entity.ArticleBlock, bPath);
+                return new InspectEntityResponse(
+                    EntityKind: "articleBlock",
+                    Id: entity.ArticleBlock.Id,
+                    View: viewName,
+                    StorageDirectory: storage,
+                    SessionId: entity.Session!.Id,
+                    ContainerId: entity.Component.Id,
+                    Spec: spec,
+                    IdMap: idMap);
+            }
+            case "quiz":
+            {
+                var (spec, idMap) = WorkspaceSpecProjector.ProjectQuiz(entity.Quiz!);
+                return new InspectEntityResponse(
+                    EntityKind: "quiz",
+                    Id: entity.Quiz!.Id,
+                    View: viewName,
+                    StorageDirectory: storage,
+                    Spec: spec,
+                    IdMap: idMap);
+            }
+            default:
+            {
+                var qPath = entity.Component is not null
+                    ? $"c{entity.Component.Index}.q{entity.Question!.Index}"
+                    : $"q{entity.Question!.Index}";
+                var (spec, idMap) = WorkspaceSpecProjector.ProjectQuestionWithIdMap(entity.Question!, qPath);
+                return new InspectEntityResponse(
+                    EntityKind: "question",
+                    Id: entity.Question!.Id,
+                    View: viewName,
+                    StorageDirectory: storage,
+                    SessionId: entity.Session?.Id,
+                    ContainerId: entity.Quiz!.Id,
+                    Spec: spec,
+                    IdMap: idMap);
+            }
+        }
+    }
+
     private static InspectComponentDto MapComponent(SessionComponent component, InspectViewMode view)
     {
         string path = $"c{component.Index}";
@@ -183,7 +261,8 @@ public sealed class InspectEntityHandler(EntityAddressResolver addressResolver)
             Questions: component.Kind == ComponentKind.Quiz && component.Quiz is not null
                 ? component.Quiz.Questions.Select(q => MapQuestion(q, $"{path}.q{q.Index}", view)).ToList()
                 : null,
-            LayoutOverrides: CopyOverridesOrNull(component.LayoutOverrides));
+            LayoutOverrides: CopyOverridesOrNull(component.LayoutOverrides),
+            Links: view == InspectViewMode.Full && component.LinkCards.Count > 0 ? component.LinkCards.ToList() : null);
     }
 
     private static InspectArticleBlockDto MapBlock(ArticleBlock block, string path, InspectViewMode view)

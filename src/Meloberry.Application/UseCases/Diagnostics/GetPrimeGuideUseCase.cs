@@ -30,7 +30,7 @@ public sealed class GetPrimeGuideHandler(ICliToolMetadataProvider metadataProvid
              spec [t|@grp..] {{topics}}
              apply [ws|comp] <src|-> [-o dir] [--build dir] [--verify] [--static-only] [--timeout n] [--export plat[:path]] [--dry-run]
              patch <addr> [f|-] [--set k=v] [--move idx:shift|exchange]
-             get <addr> [--view outline|full|ids] (def:outline)
+             get <addr> [--view outline|full|ids|spec] (def:outline)
              ls [dir] [--all] | List (.meloberry/workspaces; --all)
              rm <addr> | Delete entity
              check <addr> | Mandatory lint

@@ -42,7 +42,7 @@ public sealed class MbypkgExporter(
         WritePackageAsync(quiz.Id, "quiz", storageDirectory, MapQuizToDto(quiz, includeLayouts), layouts,
             CollectQuizAssets(quiz), outputPath, targetPlatform, includeLayouts, cancellationToken);
 
-    public async Task<Result<WorkspaceListItem>> ImportPackageAsync(
+    public async Task<Result<PackageImportResult>> ImportPackageAsync(
         string packagePath, string destinationDirectory, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(packagePath) || !File.Exists(packagePath))
@@ -207,14 +207,25 @@ public sealed class MbypkgExporter(
                 await layoutRepository.SaveProfilesAsync(existingProfiles.Values.ToList(), cancellationToken);
             }
 
+            var targetPlatform = string.IsNullOrWhiteSpace(manifest.TargetPlatform)
+                ? "desktop"
+                : manifest.TargetPlatform.Trim().ToLowerInvariant();
+            bool includedLayout = layoutsEntry is not null;
+
             if (importedSession is not null)
             {
                 await workspaceRepository.CreateSessionAsync(importedSession, cancellationToken);
-                return new WorkspaceListItem(importedSession.Id, "session", "session", targetStorageDir, importedSession.Components.Count);
+                return new PackageImportResult(
+                    new WorkspaceListItem(importedSession.Id, "session", "session", targetStorageDir, importedSession.Components.Count),
+                    targetPlatform,
+                    includedLayout);
             }
 
             await workspaceRepository.CreateQuizAsync(importedQuiz!, cancellationToken);
-            return new WorkspaceListItem(importedQuiz!.Id, "quiz", importedQuiz.Type.ToString().ToLowerInvariant(), targetStorageDir, importedQuiz.Questions.Count);
+            return new PackageImportResult(
+                new WorkspaceListItem(importedQuiz!.Id, "quiz", importedQuiz.Type.ToString().ToLowerInvariant(), targetStorageDir, importedQuiz.Questions.Count),
+                targetPlatform,
+                includedLayout);
         }
         catch
         {

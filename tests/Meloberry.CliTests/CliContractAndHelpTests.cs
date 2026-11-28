@@ -1,4 +1,7 @@
+using System.Reflection;
 using System.Text.Json;
+using Meloberry.Application.UseCases.Diagnostics;
+using Meloberry.Application.UseCases.Json;
 using Meloberry.Cli.Abstractions;
 using Meloberry.Cli.Commands;
 using Meloberry.Cli.Hosting;
@@ -404,6 +407,142 @@ public sealed class CliContractAndHelpTests : IDisposable
             Assert.True(iconsEl.TryGetProperty("diagram-explore", out _));
             Assert.True(iconsEl.TryGetProperty("callout-clinical", out _));
             Assert.False(iconsEl.TryGetProperty("mcq", out _));
+        }
+    }
+
+    [Fact]
+    public async Task GetCommand_ViewSpec_AndHelp_WorkWithinPrimeBudget()
+    {
+        var helpC = new TestConsole();
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["get", "--help"], helpC, _fx.AppDataDir));
+        Assert.Contains("spec", helpC.StandardOutput);
+
+        var applyC = new TestConsole("""{"kind":"session","name":"CLI Spec","components":[{"kind":"article","ref":"a1","blocks":[{"kind":"table","headers":["A","B"],"rows":[["1","2"]]}]}]}""");
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["apply", "-", "-o", _fx.WorkDir, "--json"], applyC, _fx.AppDataDir));
+        var wsId = JsonDocument.Parse(applyC.StandardOutput).RootElement.GetProperty("data").GetProperty("targetId").GetString()!;
+
+        var getSpecC = new TestConsole();
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["get", wsId, "--view", "spec", "--json"], getSpecC, _fx.AppDataDir));
+        Assert.DoesNotContain("payloadJson", getSpecC.StandardOutput, StringComparison.OrdinalIgnoreCase);
+        using var doc = JsonDocument.Parse(getSpecC.StandardOutput);
+        var data = doc.RootElement.GetProperty("data");
+        Assert.Equal("spec", data.GetProperty("view").GetString());
+        Assert.Equal("session", data.GetProperty("spec").GetProperty("kind").GetString());
+        Assert.Equal(wsId, data.GetProperty("idMap").GetProperty("id").GetString());
+
+        var primeC = new TestConsole();
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["prime"], primeC, _fx.AppDataDir));
+        var crlfPrime = primeC.StandardOutput.Replace("\r\n", "\n").Replace("\n", "\r\n");
+        Assert.True(crlfPrime.Length < 1550, $"Expected CRLF prime < 1550 chars, got {crlfPrime.Length}");
+    }
+
+    [Fact]
+    public async Task VersionJson_ExposesStableCapabilitiesList()
+    {
+        var verConsole = new TestConsole();
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["version", "--json"], verConsole, _fx.AppDataDir));
+        using var doc = JsonDocument.Parse(verConsole.StandardOutput);
+        var data = doc.RootElement.GetProperty("data");
+        Assert.True(data.TryGetProperty("capabilities", out var capsEl), "Expected 'capabilities' array on version --json.");
+        var caps = capsEl.EnumerateArray().Select(e => e.GetString()).ToHashSet(StringComparer.Ordinal);
+        foreach (var required in new[]
+        {
+            "get.view.spec",
+            "get.path.dir",
+            "patch.component.links",
+            "patch.case.declarative",
+            "spec.icons",
+            "spec.nested",
+            "pkg.import.metadata",
+            "batch.atomic"
+        })
+        {
+            Assert.Contains(required, caps);
+        }
+    }
+
+    [Fact]
+    public async Task SpecPatchParity_EveryPatchableFieldIsDocumentedInSpec()
+    {
+        var field = typeof(PatchEntityHandler).GetField("AllowedKeysByKind", BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(field);
+        var allowedByKind = Assert.IsType<Dictionary<string, HashSet<string>>>(field!.GetValue(null));
+
+        var handler = new GetSchemaHandler();
+        var schemaRes = await handler.HandleAsync(new GetSchemaQuery());
+        Assert.True(schemaRes.IsSuccess);
+        var byTopic = schemaRes.Value.Schemas.ToDictionary(s => s.Topic, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var (kind, allowedKeys) in allowedByKind)
+        {
+            HashSet<string> documentedFields;
+            if (kind == "component")
+            {
+                documentedFields = byTopic["article"].Fields.Concat(byTopic["quiz"].Fields)
+                    .Select(f => f.Name)
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            }
+            else
+            {
+                var topic = kind.Contains(':') ? kind.Split(':', 2)[1] : kind;
+                Assert.True(byTopic.TryGetValue(topic, out var topicDef), $"No spec topic '{topic}' for patch kind '{kind}'.");
+                documentedFields = topicDef!.Fields.Select(f => f.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            }
+
+            foreach (var key in allowedKeys)
+            {
+                Assert.True(
+                    documentedFields.Contains(key),
+                    $"Patchable key '{key}' on '{kind}' is missing from GetSchemaHandler fields.");
+            }
+        }
+
+        Assert.Contains("links?", byTopic["patch"].CompactSignature);
+    }
+
+    [Fact]
+    public async Task SpecNestedSchemas_OptionalFlag_DescribesComplexItemTypes()
+    {
+        var helpC = new TestConsole();
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["spec", "--help"], helpC, _fx.AppDataDir));
+        Assert.Contains("--nested", helpC.StandardOutput);
+
+        var defaultC = new TestConsole();
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["spec", "relabel", "--json"], defaultC, _fx.AppDataDir));
+        using (var defaultDoc = JsonDocument.Parse(defaultC.StandardOutput))
+        {
+            var data = defaultDoc.RootElement.GetProperty("data");
+            Assert.False(data.TryGetProperty("nestedTypes", out _));
+            Assert.True(data.TryGetProperty("schemaVersion", out var sv));
+            Assert.False(string.IsNullOrWhiteSpace(sv.GetString()));
+        }
+
+        var relabelNestedC = new TestConsole();
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["spec", "relabel", "--nested", "--json"], relabelNestedC, _fx.AppDataDir));
+        using (var relabelDoc = JsonDocument.Parse(relabelNestedC.StandardOutput))
+        {
+            var nestedTypes = relabelDoc.RootElement.GetProperty("data").GetProperty("nestedTypes");
+            Assert.True(nestedTypes.TryGetProperty("relabelBox", out var boxFields));
+            Assert.False(nestedTypes.TryGetProperty("mcqOption", out _));
+            var fieldNames = boxFields.EnumerateArray().Select(f => f.GetProperty("name").GetString()).ToHashSet(StringComparer.Ordinal);
+            foreach (var expected in new[] { "label", "aliases", "rect", "x", "y", "w", "h" })
+                Assert.Contains(expected, fieldNames);
+        }
+
+        var allNestedC = new TestConsole();
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["spec", "--nested", "--json"], allNestedC, _fx.AppDataDir));
+        using (var allDoc = JsonDocument.Parse(allNestedC.StandardOutput))
+        {
+            var nestedTypes = allDoc.RootElement.GetProperty("data").GetProperty("nestedTypes");
+            foreach (var expectedType in new[]
+            {
+                "mcqOption", "flashcardSide", "relabelBox", "diagramHotspot",
+                "revealStep", "mechanismStep", "bucket", "classifyItem", "matchPair", "linkCard"
+            })
+            {
+                Assert.True(nestedTypes.TryGetProperty(expectedType, out var fields), $"Missing nestedType '{expectedType}'.");
+                Assert.True(fields.GetArrayLength() > 0);
+            }
         }
     }
 

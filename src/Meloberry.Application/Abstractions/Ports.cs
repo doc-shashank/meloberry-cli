@@ -89,6 +89,7 @@ public sealed record QuestionOwnerContext(StudySession? Session, SessionComponen
 }
 
 public sealed record WorkspaceListItem(string Id, string Kind, string SubType, string StorageDirectory, int ItemCount);
+public sealed record PackageImportResult(WorkspaceListItem Workspace, string TargetPlatform = "desktop", bool IncludedLayout = false);
 
 public static class PathConfinement
 {
@@ -250,7 +251,7 @@ public interface IPackageExporter
         Quiz quiz, string storageDirectory, IReadOnlyDictionary<string, LayoutProfile> layouts,
         string? outputPath, string targetPlatform = "desktop", bool includeLayouts = false, CancellationToken cancellationToken = default);
 
-    Task<Result<WorkspaceListItem>> ImportPackageAsync(
+    Task<Result<PackageImportResult>> ImportPackageAsync(
         string packagePath, string destinationDirectory, CancellationToken cancellationToken = default);
 }
 
@@ -294,13 +295,29 @@ public interface IAnalysisReportStore
     Task<Result<SavedAnalysisFiles>> SaveReportToWebAppDirectoryAsync(string webAppDirectory, string rawReportJson, string? rawMarkdown = null, CancellationToken cancellationToken = default);
 }
 
+public static class CliCapabilities
+{
+    public static readonly IReadOnlyList<string> All =
+    [
+        "get.view.spec",
+        "get.path.dir",
+        "patch.component.links",
+        "patch.case.declarative",
+        "spec.icons",
+        "spec.nested",
+        "pkg.import.metadata",
+        "batch.atomic"
+    ];
+}
+
 public sealed record CliToolMetadata(
     string ProductName,
     string ExecutableName,
     string Version,
     string Runtime,
     string AppName = "Meloberry",
-    string RepositoryUrl = "https://github.com/doc-shashank/meloberry-cli/");
+    string RepositoryUrl = "https://github.com/doc-shashank/meloberry-cli/",
+    IReadOnlyList<string>? Capabilities = null);
 
 public interface ICliToolMetadataProvider { CliToolMetadata GetMetadata(); }
 public interface ILayoutEditorPageBuilder { string BuildHtml(string initialComponent, CliToolMetadata toolMetadata, string? csrfToken = null); }

@@ -123,6 +123,8 @@ public sealed partial class FileContentInspector(ChainTransactionManager? transa
         while (safeName.Contains("..", StringComparison.Ordinal)) safeName = safeName.Replace("..", "_", StringComparison.Ordinal);
         safeName = safeName.Trim('.');
         if (string.IsNullOrWhiteSpace(safeName)) safeName = "image";
+        if (safeName.EndsWith($"_{hash8}", StringComparison.OrdinalIgnoreCase))
+            return $"{safeName}{canonicalExtension}";
         return $"{safeName}_{hash8}{canonicalExtension}";
     }
 

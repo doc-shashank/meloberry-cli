@@ -48,6 +48,7 @@ public sealed class AssemblyCliToolMetadataProvider(
             Version: cleanVer,
             Runtime: RuntimeInformation.FrameworkDescription,
             AppName: appName.Trim(),
-            RepositoryUrl: repoUrl.Trim());
+            RepositoryUrl: repoUrl.Trim(),
+            Capabilities: CliCapabilities.All);
     }
 }
