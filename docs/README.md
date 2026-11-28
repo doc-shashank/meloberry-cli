@@ -1,4 +1,4 @@
-# Meloberry CLI (`mby` v2.1.1)
+# Meloberry CLI (`mby` v2.2.0-beta-1)
 
 Stateless, AI-agent-first compiler for deterministic study helper WebApps. Agents supply content and organization via JSON, Markdown (`.md` + frontmatter), or modular directories; `mby` owns themes, layout bounds, validation, and rendering.
 
@@ -40,9 +40,11 @@ All read (`get`), `patch`, `check`, and `rm` commands accept either a direct ID 
 | `--` | End of options (required before positional arguments starting with `-`; unrecognized short/long flags before `--` fail with `Cli.ParseError`, while bare `-` reads `stdin`) |
 | `MBY_AGENT=1` | Implicitly enables `--json` (also accepts `true`) |
 | `MBY_APP_DATA=<dir>` | Default `--app-data` directory |
+| `MBY_SIGNAL=1` | Implicitly enables `.mby-signal.txt` emission (`webapp_built`) on `build` |
 | `MBY_BROWSER_PATH=<path>` | Explicit Edge/Chrome executable path for `--headless` / `--verify` |
+| `--app-data`, `--quiet`, `--verbose` | Supported globally across all commands |
 
-Command-specific output flags: `-o`, `--out <dir>` is supported only on `apply` and `build` (`pkg` uses positional `[outPath]` / `[destDir]`).
+Command-specific `-o`, `--out <dir|file>` is supported on `prime`, `apply`, `get --view markdown`, `build`, and `scaffold` (`pkg` uses positional `[outPath]` / `[destDir]`).
 
 ## JSON Envelope & Exit Codes
 

@@ -88,7 +88,7 @@ public sealed partial class SlidingWebAppGenerator(
 
     public async Task<Result<string>> GenerateForSessionAsync(
         StudySession session, string storageDirectory, IReadOnlyDictionary<string, LayoutProfile> layouts,
-        string? outputDirectory, CancellationToken cancellationToken = default)
+        string? outputDirectory, bool includeAllThemes = false, CancellationToken cancellationToken = default)
     {
         var slides = new List<SlideRenderModel>();
         var linkCards = new Dictionary<string, LinkCardRenderModel>(StringComparer.OrdinalIgnoreCase);
@@ -150,17 +150,18 @@ public sealed partial class SlidingWebAppGenerator(
             linkCards.Count > 0 ? linkCards : null,
             externalPreviews.Count > 0 ? externalPreviews : null,
             isSession: true,
+            includeAllThemes,
             cancellationToken);
     }
 
     public Task<Result<string>> GenerateForQuizAsync(
         Quiz quiz, string storageDirectory, IReadOnlyDictionary<string, LayoutProfile> layouts,
-        string? outputDirectory, CancellationToken cancellationToken = default)
+        string? outputDirectory, bool includeAllThemes = false, CancellationToken cancellationToken = default)
     {
         var title = string.IsNullOrWhiteSpace(quiz.Name) ? "Meloberry Quiz" : quiz.Name;
         var desc = string.IsNullOrWhiteSpace(quiz.Description) ? $"Standalone quiz ({quiz.Questions.Count} questions)" : quiz.Description;
         return WriteWebAppBundleAsync(quiz.Id, title, desc, storageDirectory,
-            quiz.Questions.Select(q => BuildQuestionSlide(q, layouts, null)).ToList(), layouts, MbypkgExporter.CollectQuizAssets(quiz), outputDirectory, null, null, isSession: false, cancellationToken);
+            quiz.Questions.Select(q => BuildQuestionSlide(q, layouts, null)).ToList(), layouts, MbypkgExporter.CollectQuizAssets(quiz), outputDirectory, null, null, isSession: false, includeAllThemes, cancellationToken);
     }
 
     private static SlideRenderModel BuildArticleSlide(SessionComponent comp, IReadOnlyDictionary<string, LayoutProfile> layouts) =>
@@ -697,6 +698,7 @@ public sealed partial class SlidingWebAppGenerator(
         Dictionary<string, LinkCardRenderModel>? linkCards,
         Dictionary<string, SessionPreviewSidecarModel>? externalPreviews,
         bool isSession,
+        bool includeAllThemes,
         CancellationToken cancellationToken)
     {
         var outDir = !string.IsNullOrWhiteSpace(outputDirectory)
@@ -765,8 +767,8 @@ public sealed partial class SlidingWebAppGenerator(
 
         var indexPath = Path.Combine(outDir, "index.html");
         await File.WriteAllTextAsync(indexPath, BuildHtml(title, description, globalTheme, toolMeta, features, neededModules), cancellationToken);
-        await File.WriteAllTextAsync(Path.Combine(outDir, "styles.css"), MinifyCss(BuildCss(globalTheme)) + "\n", cancellationToken);
-        await File.WriteAllTextAsync(Path.Combine(outDir, "app.js"), MinifyJs(BuildJs(payloadJson, features)) + "\n", cancellationToken);
+        await File.WriteAllTextAsync(Path.Combine(outDir, "styles.css"), MinifyCss(BuildCss(globalTheme, includeAllThemes)) + "\n", cancellationToken);
+        await File.WriteAllTextAsync(Path.Combine(outDir, "app.js"), MinifyJs(BuildJs(payloadJson, features, includeAllThemes)) + "\n", cancellationToken);
 
         var previewJsonPath = Path.Combine(outDir, "preview-index.json");
         var previewJsPath = Path.Combine(outDir, "preview-index.js");
@@ -1059,8 +1061,8 @@ public sealed partial class SlidingWebAppGenerator(
 """;
     }
 
-    private static string BuildCss(string themeMode) =>
-        WebAppSharedStyles.BuildThemeCss(themeMode) + "\n" +
+    private static string BuildCss(string themeMode, bool includeAllThemes) =>
+        WebAppSharedStyles.BuildThemeCss(includeAllThemes ? null : themeMode) + "\n" +
         WebAppSharedStyles.BuildBaseCss() + "\n" + """
 html, body { height: 100%; overflow: hidden; }
 .mby-shell { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
@@ -1173,8 +1175,26 @@ html, body { height: 100%; overflow: hidden; }
 .mby-search-pulse { outline: 2px solid var(--select); outline-offset: 4px; border-radius: 10px; transition: outline-color 400ms ease; }
 """;
 
-    private static string BuildJs(string payloadJson, WebAppFeatureSet features)
+    private static string BuildJs(string payloadJson, WebAppFeatureSet features, bool includeAllThemes)
     {
+        var themeBridgeJs = includeAllThemes
+            ? """
+window.addEventListener('message', e => {
+  if (e.origin && e.origin !== 'null') {
+    try {
+      const u = new URL(e.origin);
+      if (u.hostname !== '127.0.0.1' && u.hostname !== 'localhost') return;
+    } catch { return; }
+  }
+  const msg = e.data;
+  if (!msg || msg.type !== 'mby-theme-override' || typeof msg.theme !== 'string') return;
+  const t = msg.theme.toLowerCase();
+  if (t !== 'berry' && t !== 'light' && t !== 'dark' && t !== 'paper') return;
+  document.documentElement.dataset.theme = t;
+  try { e.source?.postMessage({ type: 'mby-theme-applied', theme: t }, e.origin && e.origin !== 'null' ? e.origin : '*'); } catch {}
+});
+"""
+            : string.Empty;
         var renderMathBlock = features.HasMath
             ? """
 function renderMathIn(root) {
@@ -1956,6 +1976,7 @@ document.addEventListener('keydown', e => {
   if (!isTyping && greetingScreen.classList.contains('hidden') && !isFinished) { if (e.key === 'ArrowLeft') navigatePrevious(); if (e.key === 'ArrowRight') navigateNext(); }
 });
 renderSlides();
+{{themeBridgeJs}}
 """;
     }
 

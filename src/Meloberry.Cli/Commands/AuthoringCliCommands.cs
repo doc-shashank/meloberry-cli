@@ -6,13 +6,13 @@ namespace Meloberry.Cli.Commands;
 
 public sealed class ApplyCliCommand : CliCommand
 {
-    private static readonly HashSet<string> AllowedFlags = new(StringComparer.OrdinalIgnoreCase) { "dry-run", "verify", "static-only" };
-    private static readonly HashSet<string> AllowedValues = new(StringComparer.OrdinalIgnoreCase) { "out", "build", "export", "timeout" };
+    private static readonly HashSet<string> AllowedFlags = new(StringComparer.OrdinalIgnoreCase) { "dry-run", "verify", "static-only", "all-themes", "signal" };
+    private static readonly HashSet<string> AllowedValues = new(StringComparer.OrdinalIgnoreCase) { "out", "build", "export", "timeout", "at", "signal-dir" };
 
     public ApplyCliCommand()
         : base(new CommandDescriptor(
             Verb: "apply",
-            Usage: "apply [addr] <file|dir|-> [-o dir] [--build dir] [--verify] [--static-only] [--timeout 30] [--export plat[:path]] [--dry-run] [--quiet|--verbose]",
+            Usage: "apply [addr] <file|dir|-> [-o dir] [--at idx] [--build dir] [--verify] [--static-only] [--all-themes] [--signal] [--signal-dir dir] [--timeout 30] [--export plat[:path]] [--dry-run] [--quiet|--verbose]",
             Description: "Creates or appends to a session/quiz/component from JSON, Markdown (.md), a modular directory, or stdin ('-').",
             HandlerType: typeof(Handler),
             AllowedFlagOptions: AllowedFlags,
@@ -21,7 +21,11 @@ public sealed class ApplyCliCommand : CliCommand
             OptionsHelp:
             [
                 "-o, --out <dir>          Base workspace folder (defaults to .meloberry/workspaces).",
+                "--at <idx>               Insert appended item(s) starting at 1-based index <idx>.",
                 "--build <webDir>         Also compile the study WebApp into <webDir>.",
+                "--all-themes             When --build is set, emit all 4 CSS themes + postMessage theme bridge.",
+                "--signal                 When --build is set, write atomic .mby-signal.txt notification.",
+                "--signal-dir <dir>       Write .mby-signal.txt into <dir> (implies --signal when --build is set).",
                 "--verify                 Run headless verification on --build output.",
                 "--static-only            Run static asset/DATA check when --build is set (without launching a browser).",
                 "--timeout <sec>          Timeout for headless verification in seconds (default 30, range 5..180).",
@@ -47,11 +51,23 @@ public sealed class ApplyCliCommand : CliCommand
             if (!CliCommandHelpers.TryParseTimeoutOption(context, out int timeout, out int? timeoutErr))
                 return timeoutErr!.Value;
 
+            int? insertAt = null;
+            var rawAt = context.GetOptionValue("at");
+            if (!string.IsNullOrWhiteSpace(rawAt))
+            {
+                if (!int.TryParse(rawAt, out int parsedAt))
+                    return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Invalid --at value '{rawAt}'. Pass a 1-based integer.", context.GlobalOptions.Json);
+                insertAt = parsedAt;
+            }
+
             string? targetAddr = context.PositionalArgs.Count == 2 ? context.PositionalArgs[0] : null;
             string fileOrDash = context.PositionalArgs.Count == 2 ? context.PositionalArgs[1] : context.PositionalArgs[0];
 
             var (filePath, inlineJson, errExit) = await CliCommandHelpers.ReadJsonInputAsync(context, fileOrDash);
             if (errExit is not null) return errExit.Value;
+
+            var signalDir = context.GetOptionValue("signal-dir");
+            bool emitSignal = context.HasFlag("signal") || !string.IsNullOrWhiteSpace(signalDir);
 
             var cmd = new ApplySpecCommand(
                 TargetAddress: targetAddr,
@@ -65,7 +81,11 @@ public sealed class ApplyCliCommand : CliCommand
                 Verbose: context.GlobalOptions.Verbose,
                 VerifyWeb: context.HasFlag("verify"),
                 StaticVerifyOnly: context.HasFlag("static-only"),
-                VerifyTimeoutSeconds: timeout);
+                VerifyTimeoutSeconds: timeout,
+                InsertAtIndex: insertAt,
+                IncludeAllThemes: context.HasFlag("all-themes"),
+                EmitSignal: emitSignal,
+                SignalDirectory: signalDir);
 
             return await CliCommandHelpers.FinishAsync(
                 context,
@@ -77,26 +97,35 @@ public sealed class ApplyCliCommand : CliCommand
 
 public sealed class PatchCliCommand : CliCommand
 {
-    private static readonly HashSet<string> AllowedValues = new(StringComparer.OrdinalIgnoreCase) { "set", "move" };
+    private static readonly HashSet<string> AllowedFlags = new(StringComparer.OrdinalIgnoreCase) { "md" };
+    private static readonly HashSet<string> AllowedValues = new(StringComparer.OrdinalIgnoreCase) { "set", "move", "to", "at", "order", "subtype", "image" };
 
     public PatchCliCommand()
         : base(new CommandDescriptor(
             Verb: "patch",
-            Usage: "patch <addr> [file|-] [--set k=v] [--move idx:shift|exchange]",
-            Description: "Surgically updates or reorders an entity by ID, path (#c1.b2), or #ref.",
+            Usage: "patch <addr> [file|-] [--set k=v] [--move idx:shift|exchange] [--to compAddr[:idx]] [--at idx] [--order id1,id2,...] [--md] [--subtype s] [--image path]",
+            Description: "Surgically updates or reorganizes an entity by ID, path (#c1.b2), or #ref.",
             HandlerType: typeof(Handler),
+            AllowedFlagOptions: AllowedFlags,
             AllowedValueOptions: AllowedValues,
-            Prerequisites: "Target entity must exist (addressed by direct ID, <sessionId>#c<n>[.b<m>|.q<m>], <setId>#q<m>, or <wsId>#<ref>). Provide a non-empty patch JSON file/'-', --set, and/or --move (empty {} without --move fails with Patch.Empty).",
+            Prerequisites: "Target entity must exist (addressed by direct ID, <sessionId>#c<n>[.b<m>|.q<m>], <setId>#q<m>, or <wsId>#<ref>). Provide a non-empty patch JSON file/'-', --set, --move, --to, --order, or --md.",
             OptionsHelp:
             [
-                "--set <k=v>          Repeatable field update; supports dot paths (e.g. layoutOverrides.<k>=<v|null>, front.text=...). 'null' clears nullable fields/overrides and rejects non-nullable fields.",
-                "--move <idx>:<mode>  Reorder component, block, or question to 1-based <idx> using 'shift' or 'exchange'."
+                "--set <k=v>              Repeatable field update; supports dot paths (e.g. layoutOverrides.<k>=<v|null>, front.text=...).",
+                "--move <idx>:<mode>      Reorder component, block, or question to 1-based <idx> using 'shift' or 'exchange'.",
+                "--to <compAddr>[:<idx>]  Move a block or question into another component in the same session.",
+                "--at <idx>               Optional 1-based target index when combined with --to.",
+                "--order <id1,id2,...>    Exact comma-separated permutation of IDs or #refs on a session, component, or quiz.",
+                "--md                     Treat input file/'-' as a Markdown fragment (smart-wrapped for the target type).",
+                "--subtype <key>          Optional subtype hint when using --md (e.g. clinical, multi, blur).",
+                "--image <path>           Optional attached image path when using --md."
             ],
             Examples:
             [
                 "mby patch Session_2026...#c2.q1 --set text=\"Updated prompt\" --set layoutOverrides.optionColumns=2 --json",
                 "mby patch Session_2026...#c1.b2 --move 1:shift --json",
-                "mby patch Session_2026...#intro ./patch.json --json"
+                "mby patch Session_2026...#c1.b2 --to Session_2026...#c2:1 --json",
+                "mby patch Session_2026...#c1 --order #b2,#b1 --json"
             ]))
     {
     }
@@ -120,17 +149,95 @@ public sealed class PatchCliCommand : CliCommand
                 inlineJson = ij;
             }
 
+            int? moveToIdx = null;
+            var rawAt = context.GetOptionValue("at");
+            if (!string.IsNullOrWhiteSpace(rawAt))
+            {
+                if (!int.TryParse(rawAt, out int parsedAt))
+                    return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Invalid --at value '{rawAt}'. Pass a 1-based integer.", context.GlobalOptions.Json);
+                moveToIdx = parsedAt;
+            }
+
+            IReadOnlyList<string>? orderIds = null;
+            var rawOrder = context.GetOptionValue("order");
+            if (!string.IsNullOrWhiteSpace(rawOrder))
+            {
+                orderIds = rawOrder.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            }
+
             var cmd = new PatchEntityCommand(
                 Address: addr,
                 JsonFilePath: filePath,
                 InlineJson: inlineJson,
                 SetPairs: context.GetOptionValues("set"),
-                MoveSpec: context.GetOptionValue("move"));
+                MoveSpec: context.GetOptionValue("move"),
+                MoveToTargetAddress: context.GetOptionValue("to"),
+                MoveToIndex: moveToIdx,
+                ExactOrderIds: orderIds,
+                IsMarkdown: context.HasFlag("md"),
+                MarkdownSubtype: context.GetOptionValue("subtype"),
+                AttachedImagePath: context.GetOptionValue("image"));
 
             return await CliCommandHelpers.FinishAsync(
                 context,
                 useCase.HandleAsync(cmd, context.CancellationToken),
                 v => $"Patched {v.EntityKind} {v.TargetId}");
+        }
+    }
+}
+
+public sealed class CloneCliCommand : CliCommand
+{
+    private static readonly HashSet<string> AllowedValues = new(StringComparer.OrdinalIgnoreCase) { "to", "at", "ref" };
+
+    public CloneCliCommand()
+        : base(new CommandDescriptor(
+            Verb: "clone",
+            Usage: "clone <addr> [--to <compAddr>] [--at <idx>] [--ref <slug>]",
+            Description: "Duplicates an existing component, article block, or question with fresh IDs and non-colliding refs.",
+            HandlerType: typeof(Handler),
+            AllowedValueOptions: AllowedValues,
+            Prerequisites: "Target must resolve to a component, articleBlock, or question.",
+            OptionsHelp:
+            [
+                "--to <compAddr>  Optional target container in the same workspace.",
+                "--at <idx>       Optional 1-based insertion index.",
+                "--ref <slug>     Optional custom ref slug for the cloned entity."
+            ],
+            Examples:
+            [
+                "mby clone Session_2026...#c1.b1 --json",
+                "mby clone Session_2026...#q1 --to Session_2026...#quiz2 --at 1 --ref q1-copy --json"
+            ]))
+    {
+    }
+
+    public sealed class Handler(CloneEntityHandler useCase) : ICommandHandler
+    {
+        public async Task<int> InvokeAsync(CliInvocationContext context)
+        {
+            if (context.PositionalArgs.Count != 1)
+                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Usage: {new CloneCliCommand().Descriptor.Usage}", context.GlobalOptions.Json);
+
+            int? atIdx = null;
+            var rawAt = context.GetOptionValue("at");
+            if (!string.IsNullOrWhiteSpace(rawAt))
+            {
+                if (!int.TryParse(rawAt, out int parsedAt))
+                    return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Invalid --at value '{rawAt}'. Pass a 1-based integer.", context.GlobalOptions.Json);
+                atIdx = parsedAt;
+            }
+
+            var cmd = new CloneEntityCommand(
+                context.PositionalArgs[0],
+                context.GetOptionValue("to"),
+                atIdx,
+                context.GetOptionValue("ref"));
+
+            return await CliCommandHelpers.FinishAsync(
+                context,
+                useCase.HandleAsync(cmd, context.CancellationToken),
+                v => $"Cloned {v.EntityKind} -> {v.NewId}");
         }
     }
 }

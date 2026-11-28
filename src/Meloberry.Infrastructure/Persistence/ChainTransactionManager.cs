@@ -27,13 +27,16 @@ public sealed class ChainTransactionManager(MeloberryStorageOptions options) : I
         return new ScopeHandle(this, active, previous);
     }
 
-    internal void NotifyWorkspaceMutating(string storageDirectory)
+    public void NotifyWorkspaceMutating(string storageDirectory)
     {
         if (string.IsNullOrWhiteSpace(storageDirectory))
             return;
 
         _current.Value?.TrackWorkspaceMutation(storageDirectory);
     }
+
+    public void BackupFileForRollback(string filePath) =>
+        NotifyOutputFileMutating(filePath);
 
     internal void NotifyWorkspaceDeleting(string storageDirectory)
     {

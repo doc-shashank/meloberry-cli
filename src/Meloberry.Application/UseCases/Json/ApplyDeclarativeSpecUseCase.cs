@@ -25,7 +25,11 @@ public sealed record ApplySpecCommand(
     bool StaticVerifyOnly = false,
     int VerifyTimeoutSeconds = 30,
     bool Ephemeral = false,
-    string? AssetBaseDirectoryOverride = null);
+    string? AssetBaseDirectoryOverride = null,
+    int? InsertAtIndex = null,
+    bool IncludeAllThemes = false,
+    bool EmitSignal = false,
+    string? SignalDirectory = null);
 
 public sealed record AppliedComponentSummary(
     string P,
@@ -53,7 +57,8 @@ public sealed record ApplySpecResponse(
     string? PackagePath = null,
     WebAppVerificationReport? Verify = null,
     [property: JsonIgnore] StudySession? InMemorySession = null,
-    [property: JsonIgnore] Quiz? InMemoryQuiz = null);
+    [property: JsonIgnore] Quiz? InMemoryQuiz = null,
+    string? SignalPath = null);
 
 public sealed class ApplySpecHandler(
     IIdGenerator idGenerator,
@@ -73,6 +78,12 @@ public sealed class ApplySpecHandler(
 
         if (command.Ephemeral && !string.IsNullOrWhiteSpace(command.TargetAddress))
             return new Error("Cli.InvalidArgs", "Option '--ephemeral' cannot be used when appending to an existing workspace.", ErrorType.Validation);
+
+        if (command.InsertAtIndex.HasValue && string.IsNullOrWhiteSpace(command.TargetAddress))
+            return new Error("Cli.InvalidArgs", "Option '--at' requires a target address.", ErrorType.Validation);
+
+        if (command.InsertAtIndex is int requestedAt && requestedAt < 1)
+            return IndexErrors.OutOfIndexBounds(requestedAt, 1, 1);
 
         var loadRes = command.InlineJson is not null
             ? await specLoader.LoadFromTextAsync(command.InlineJson, cancellationToken)
@@ -126,9 +137,9 @@ public sealed class ApplySpecHandler(
 
             applyRes = target.EntityKind switch
             {
-                "session" => await AppendToSessionAsync(target.Session!, target.StorageDirectory, spec, command.DryRun, deferLintToBuildOrExport, command.Quiet, command.Verbose, jsonDir, cwd, addedComponents, addedBlocks, addedQuestions, cancellationToken),
-                "component" => await AppendToComponentAsync(target.Session!, target.Component!, target.StorageDirectory, spec, command.DryRun, command.Quiet, command.Verbose, jsonDir, cwd, addedBlocks, addedQuestions, cancellationToken),
-                "quiz" => await AppendToQuizAsync(target.Quiz!, target.StorageDirectory, spec, command.DryRun, deferLintToBuildOrExport, command.Quiet, command.Verbose, jsonDir, cwd, addedQuestions, cancellationToken),
+                "session" => await AppendToSessionAsync(target.Session!, target.StorageDirectory, spec, command.DryRun, deferLintToBuildOrExport, command.Quiet, command.Verbose, jsonDir, cwd, addedComponents, addedBlocks, addedQuestions, command.InsertAtIndex, cancellationToken),
+                "component" => await AppendToComponentAsync(target.Session!, target.Component!, target.StorageDirectory, spec, command.DryRun, command.Quiet, command.Verbose, jsonDir, cwd, addedBlocks, addedQuestions, command.InsertAtIndex, cancellationToken),
+                "quiz" => await AppendToQuizAsync(target.Quiz!, target.StorageDirectory, spec, command.DryRun, deferLintToBuildOrExport, command.Quiet, command.Verbose, jsonDir, cwd, addedQuestions, command.InsertAtIndex, cancellationToken),
                 _ => new Error("Apply.UnsupportedTarget", $"Target '{command.TargetAddress}' ({target.EntityKind}) cannot be used with apply. Target a session, component, quiz, or omit target.", ErrorType.Validation)
             };
         }
@@ -143,6 +154,7 @@ public sealed class ApplySpecHandler(
         try
         {
             string? webOut = null;
+            string? signalOut = null;
             string? pkgOut = null;
             ApplyLintSummary? lintSummary = res.Lint;
             LintReportResponse? cachedLintReport = null;
@@ -150,7 +162,17 @@ public sealed class ApplySpecHandler(
 
             if (!string.IsNullOrWhiteSpace(command.BuildOutDir))
             {
-                var buildCmd = new BuildWebAppCommand(res.TargetId, command.BuildOutDir, command.VerifyWeb, command.Verbose, command.Quiet, command.StaticVerifyOnly, command.VerifyTimeoutSeconds);
+                var buildCmd = new BuildWebAppCommand(
+                    res.TargetId,
+                    command.BuildOutDir,
+                    command.VerifyWeb,
+                    command.Verbose,
+                    command.Quiet,
+                    command.StaticVerifyOnly,
+                    command.VerifyTimeoutSeconds,
+                    IncludeAllThemes: command.IncludeAllThemes,
+                    EmitSignal: command.EmitSignal,
+                    SignalDirectory: command.SignalDirectory);
                 var buildRes = (res.InMemorySession is not null || res.InMemoryQuiz is not null)
                     ? await buildWebHandler.BuildResolvedWorkspaceAsync(
                         res.InMemorySession,
@@ -162,6 +184,7 @@ public sealed class ApplySpecHandler(
                     : await buildWebHandler.HandleAsync(buildCmd, cancellationToken);
                 if (!buildRes.IsSuccess) return buildRes.Error!;
                 webOut = buildRes.Value.IndexHtmlPath;
+                signalOut = buildRes.Value.SignalPath;
                 lintSummary = buildRes.Value.Lint;
                 cachedLintReport = buildRes.Value.LintReport;
                 verifyReport = buildRes.Value.Verify;
@@ -195,7 +218,8 @@ public sealed class ApplySpecHandler(
                 PackagePath = pkgOut,
                 Verify = verifyReport,
                 InMemorySession = null,
-                InMemoryQuiz = null
+                InMemoryQuiz = null,
+                SignalPath = signalOut
             };
         }
         finally
@@ -442,10 +466,14 @@ public sealed class ApplySpecHandler(
         List<SessionComponent> addedComponents,
         List<string> addedBlocks,
         List<string> addedQuestions,
+        int? insertAtIndex,
         CancellationToken ct)
     {
         if (spec.Order is { Count: > 0 })
             return new Error("Json.InvalidFieldForType", "Top-level 'order' is only supported in directory manifests ('_session.md' or 'session.json').", ErrorType.Validation);
+
+        if (insertAtIndex is int at && (at < 1 || at > session.Components.Count + 1))
+            return IndexErrors.OutOfIndexBounds(at, 1, session.Components.Count + 1);
 
         var compsToAdd = new List<DeclarativeComponentSpec>();
         bool isSingleComponentSpec = false;
@@ -494,10 +522,12 @@ public sealed class ApplySpecHandler(
             {
                 var usedRefs = CollectSessionRefs(session);
                 var reservedExplicitRefs = CollectExplicitSpecRefs(compsToAdd);
+                int? cursor = insertAtIndex;
                 foreach (var compSpec in compsToAdd)
                 {
-                    var res = await AddComponentFromSpecAsync(session, workingAssetRoot, compSpec, jsonDir, cwd, usedRefs, reservedExplicitRefs, addedComponents, addedBlocks, addedQuestions, ct);
+                    var res = await AddComponentFromSpecAsync(session, workingAssetRoot, compSpec, jsonDir, cwd, usedRefs, reservedExplicitRefs, addedComponents, addedBlocks, addedQuestions, ct, cursor);
                     if (!res.IsSuccess) return res.Error!;
+                    if (cursor.HasValue) cursor++;
                 }
                 return Result.Success();
             },
@@ -524,12 +554,17 @@ public sealed class ApplySpecHandler(
         string cwd,
         List<string> addedBlocks,
         List<string> addedQuestions,
+        int? insertAtIndex,
         CancellationToken ct)
     {
         if (spec.Order is { Count: > 0 })
             return new Error("Json.InvalidFieldForType", "Top-level 'order' is only supported in directory manifests ('_session.md' or 'session.json').", ErrorType.Validation);
         if (spec.Components is { Count: > 0 })
             return new Error("Json.InvalidFieldForType", "Cannot pass 'components[]' when targeting a single Component_*.", ErrorType.Validation);
+
+        int existingCount = comp.Kind == ComponentKind.Article ? comp.ArticleBlocks.Count : comp.Quiz?.Questions.Count ?? 0;
+        if (insertAtIndex is int at && (at < 1 || at > existingCount + 1))
+            return IndexErrors.OutOfIndexBounds(at, 1, existingCount + 1);
 
         var title = spec.Title ?? spec.Name;
         if (!string.IsNullOrWhiteSpace(title))
@@ -569,7 +604,7 @@ public sealed class ApplySpecHandler(
                     if (spec.Questions is { Count: > 0 })
                         return new Error("Json.InvalidFieldForType", "Article component cannot accept 'questions[]'.", ErrorType.Validation);
 
-                    var blockRes = await AddBlocksFromSpecsAsync(comp, workingAssetRoot, spec.Blocks ?? [], jsonDir, jsonDir, cwd, usedRefs, addedBlocks, ct);
+                    var blockRes = await AddBlocksFromSpecsAsync(comp, workingAssetRoot, spec.Blocks ?? [], jsonDir, jsonDir, cwd, usedRefs, addedBlocks, ct, insertAtIndex);
                     if (!blockRes.IsSuccess) return blockRes.Error!;
                     var linksRes = await AddLinkCardsFromSpecsAsync(comp, workingAssetRoot, spec.Links ?? [], jsonDir, jsonDir, cwd, ct);
                     if (!linksRes.IsSuccess) return linksRes.Error!;
@@ -579,7 +614,7 @@ public sealed class ApplySpecHandler(
                     if (spec.Blocks is { Count: > 0 } || spec.Links is { Count: > 0 })
                         return new Error("Json.InvalidFieldForType", "Quiz component cannot accept article 'blocks[]' or 'links[]'.", ErrorType.Validation);
 
-                    var qRes = await AddQuestionsFromSpecsAsync(comp.Quiz, workingAssetRoot, spec.Questions ?? [], jsonDir, jsonDir, cwd, usedRefs, addedQuestions, ct);
+                    var qRes = await AddQuestionsFromSpecsAsync(comp.Quiz, workingAssetRoot, spec.Questions ?? [], jsonDir, jsonDir, cwd, usedRefs, addedQuestions, ct, insertAtIndex);
                     if (!qRes.IsSuccess) return qRes.Error!;
                 }
                 return Result.Success();
@@ -604,6 +639,7 @@ public sealed class ApplySpecHandler(
         string jsonDir,
         string cwd,
         List<string> addedQuestions,
+        int? insertAtIndex,
         CancellationToken ct)
     {
         if (spec.Order is { Count: > 0 })
@@ -614,6 +650,9 @@ public sealed class ApplySpecHandler(
             return new Error("Json.InvalidFieldForType", "Top-level 'layoutOverrides' belong on individual questions, not standalone quiz roots.", ErrorType.Validation);
         if (!string.IsNullOrWhiteSpace(spec.Ref))
             return new Error("Json.InvalidFieldForType", "Top-level 'ref' belongs on individual questions, not standalone quiz roots.", ErrorType.Validation);
+
+        if (insertAtIndex is int at && (at < 1 || at > quiz.Questions.Count + 1))
+            return IndexErrors.OutOfIndexBounds(at, 1, quiz.Questions.Count + 1);
 
         if (!string.IsNullOrWhiteSpace(spec.Name))
         {
@@ -630,7 +669,7 @@ public sealed class ApplySpecHandler(
             workingAssetRoot =>
             {
                 var usedRefs = quiz.Questions.Where(q => q.RefKey is not null).Select(q => q.RefKey!).ToHashSet(StringComparer.OrdinalIgnoreCase);
-                return AddQuestionsFromSpecsAsync(quiz, workingAssetRoot, spec.Questions ?? [], jsonDir, jsonDir, cwd, usedRefs, addedQuestions, ct);
+                return AddQuestionsFromSpecsAsync(quiz, workingAssetRoot, spec.Questions ?? [], jsonDir, jsonDir, cwd, usedRefs, addedQuestions, ct, insertAtIndex);
             },
             () => repository.SaveQuizAsync(quiz, ct),
             assetRoot => lintHandler.LintQuizInMemoryAsync(quiz, assetRoot, ct),
@@ -683,14 +722,15 @@ public sealed class ApplySpecHandler(
         List<SessionComponent> addedComponents,
         List<string> addedBlocks,
         List<string> addedQuestions,
-        CancellationToken ct)
+        CancellationToken ct,
+        int? insertAtIndex = null)
     {
         var rawKind = compSpec.Kind?.Trim().ToLowerInvariant() ?? string.Empty;
         var effectiveType = rawKind == "quiz"
             ? (string.IsNullOrWhiteSpace(compSpec.QuizType) ? "mixed" : compSpec.QuizType)
             : rawKind;
 
-        var addRes = session.AddComponent(idGenerator.NewComponentId(), effectiveType);
+        var addRes = session.AddComponent(idGenerator.NewComponentId(), effectiveType, insertAtIndex);
         if (!addRes.IsSuccess) return addRes.Error!;
         var comp = addRes.Value;
 
@@ -780,8 +820,10 @@ public sealed class ApplySpecHandler(
         string cwd,
         HashSet<string> usedRefs,
         List<string> addedBlocks,
-        CancellationToken ct)
+        CancellationToken ct,
+        int? insertAtIndex = null)
     {
+        int? cursor = insertAtIndex;
         foreach (var b in blocks)
         {
             var bKind = b.Kind?.Trim().ToLowerInvariant();
@@ -797,7 +839,7 @@ public sealed class ApplySpecHandler(
                     return new Error("Json.InvalidFieldForType", "Article text block only supports 'kind', 'text', and optional 'ref'.", ErrorType.Validation);
                 }
 
-                var res = comp.AddTextBlock(blockId, b.Text ?? string.Empty);
+                var res = comp.AddTextBlock(blockId, b.Text ?? string.Empty, cursor);
                 if (!res.IsSuccess) return res.Error!;
                 created = res.Value;
             }
@@ -814,7 +856,7 @@ public sealed class ApplySpecHandler(
                 if (string.IsNullOrWhiteSpace(imgRes.Value))
                     return new Error("Json.InvalidSpec", "Article image block requires a valid 'imagePath'.", ErrorType.Validation);
 
-                var res = comp.AddImageBlock(blockId, imgRes.Value, caption: b.Caption, alt: b.Alt);
+                var res = comp.AddImageBlock(blockId, imgRes.Value, cursor, caption: b.Caption, alt: b.Alt);
                 if (!res.IsSuccess) return res.Error!;
                 created = res.Value;
             }
@@ -828,7 +870,7 @@ public sealed class ApplySpecHandler(
                 if (!string.IsNullOrWhiteSpace(b.Tone) && !ArticleBlock.TryParseCalloutTone(b.Tone, out tone))
                     return ArticleErrors.InvalidCalloutTone(b.Tone);
 
-                var res = comp.AddCalloutBlock(blockId, tone, b.Text ?? string.Empty, b.Title);
+                var res = comp.AddCalloutBlock(blockId, tone, b.Text ?? string.Empty, b.Title, cursor);
                 if (!res.IsSuccess) return res.Error!;
                 created = res.Value;
             }
@@ -842,7 +884,7 @@ public sealed class ApplySpecHandler(
                     return ArticleErrors.InvalidTablePayload("Table block requires valid 'headers' and 'rows' data.");
 
                 var canonicalJson = Phase1PayloadCodec.Serialize(tablePayload);
-                var res = comp.AddTableBlock(blockId, canonicalJson, tablePayload.Title ?? b.Title);
+                var res = comp.AddTableBlock(blockId, canonicalJson, tablePayload.Title ?? b.Title, cursor);
                 if (!res.IsSuccess) return res.Error!;
                 created = res.Value;
             }
@@ -899,7 +941,7 @@ public sealed class ApplySpecHandler(
                     hotspots,
                     SourceMasksPath: null));
 
-                var res = comp.AddDiagramExploreBlock(blockId, imgRes.Value, canonicalDiag, diagTitle, diagCaption, b.Alt);
+                var res = comp.AddDiagramExploreBlock(blockId, imgRes.Value, canonicalDiag, diagTitle, diagCaption, b.Alt, cursor);
                 if (!res.IsSuccess) return res.Error!;
                 created = res.Value;
             }
@@ -925,7 +967,7 @@ public sealed class ApplySpecHandler(
                     parsedRev.ShowFirst,
                     revSteps));
 
-                var res = comp.AddRevealBlock(blockId, canonicalRev, revTitle);
+                var res = comp.AddRevealBlock(blockId, canonicalRev, revTitle, cursor);
                 if (!res.IsSuccess) return res.Error!;
                 created = res.Value;
             }
@@ -933,6 +975,8 @@ public sealed class ApplySpecHandler(
             {
                 return new Error("Json.InvalidSpec", $"Unsupported article block kind '{b.Kind}'. Use 'text', 'image', 'callout', 'table', 'diagram-explore', or 'reveal'.", ErrorType.Validation);
             }
+
+            if (cursor.HasValue) cursor++;
 
             if (!string.IsNullOrWhiteSpace(b.Ref))
             {
@@ -956,8 +1000,10 @@ public sealed class ApplySpecHandler(
         string cwd,
         HashSet<string> usedRefs,
         List<string> addedQuestions,
-        CancellationToken ct)
+        CancellationToken ct,
+        int? insertAtIndex = null)
     {
+        int? cursor = insertAtIndex;
         foreach (var qSpec in questions)
         {
             var qId = idGenerator.NewQuestionId();
@@ -968,8 +1014,9 @@ public sealed class ApplySpecHandler(
             if (matRes.Value.RefKey is not null && !usedRefs.Add(matRes.Value.RefKey))
                 return AddressErrors.DuplicateRef(matRes.Value.RefKey);
 
-            var insRes = quiz.InsertQuestion(matRes.Value, null);
+            var insRes = quiz.InsertQuestion(matRes.Value, cursor);
             if (!insRes.IsSuccess) return insRes.Error!;
+            if (cursor.HasValue) cursor++;
             addedQuestions.Add(qId);
         }
         return Result.Success();

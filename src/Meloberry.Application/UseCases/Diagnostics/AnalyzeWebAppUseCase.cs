@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using System.Text.Json;
 using Meloberry.Application.Abstractions;
 using Meloberry.Domain.Analysis;
 using Meloberry.Domain.Common;
@@ -7,6 +8,11 @@ using Meloberry.Domain.Common;
 namespace Meloberry.Application.UseCases.Diagnostics;
 
 public sealed record AnalyzeWebAppQuery(string WebAppOrReportPath, bool IncludeAllRuns = false);
+
+public sealed record IngestAnalysisCommand(
+    string WebAppDirectory,
+    string? SourceFilePath = null,
+    string? InlineJson = null);
 
 public sealed record AnalyzeWebAppResponse(
     string TargetPath,
@@ -17,6 +23,79 @@ public sealed record AnalyzeWebAppResponse(
 
 public sealed class AnalyzeWebAppHandler(IAnalysisReportStore reportStore)
 {
+    public async Task<Result<SavedAnalysisFiles>> IngestAsync(
+        IngestAnalysisCommand command,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(command);
+
+        if (string.IsNullOrWhiteSpace(command.WebAppDirectory))
+        {
+            return new Error("Analysis.MissingPath", "Target WebApp directory is required.", ErrorType.Validation);
+        }
+
+        var fullWebDir = Path.GetFullPath(command.WebAppDirectory.Trim());
+        if (!Directory.Exists(fullWebDir))
+        {
+            return new Error("Analysis.WebAppOrReportNotFound", $"WebApp directory '{command.WebAppDirectory}' was not found.", ErrorType.NotFound);
+        }
+
+        string rawInput;
+        if (command.InlineJson is not null)
+        {
+            rawInput = command.InlineJson;
+        }
+        else if (!string.IsNullOrWhiteSpace(command.SourceFilePath))
+        {
+            var fullSrc = Path.GetFullPath(command.SourceFilePath.Trim());
+            if (!File.Exists(fullSrc))
+            {
+                return new Error("Analysis.SourceNotFound", $"Analysis payload file '{command.SourceFilePath}' was not found.", ErrorType.NotFound);
+            }
+
+            rawInput = await File.ReadAllTextAsync(fullSrc, cancellationToken);
+        }
+        else
+        {
+            return new Error("Analysis.MissingPayload", "Pass an analysis JSON file path or '-' for stdin with --ingest.", ErrorType.Validation);
+        }
+
+        string rawReportJson;
+        string? rawMarkdown = null;
+        try
+        {
+            using var doc = JsonDocument.Parse(rawInput);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                return new Error("Analysis.InvalidReportFormat", "Analysis ingest payload must be a JSON object.", ErrorType.Validation);
+            }
+
+            if (doc.RootElement.TryGetProperty("report", out var reportEl))
+            {
+                if (reportEl.ValueKind != JsonValueKind.Object)
+                {
+                    return new Error("Analysis.InvalidReportFormat", "Wrapped 'report' property must be a JSON object.", ErrorType.Validation);
+                }
+
+                rawReportJson = reportEl.GetRawText();
+                if (doc.RootElement.TryGetProperty("markdown", out var mdEl) && mdEl.ValueKind == JsonValueKind.String)
+                {
+                    rawMarkdown = mdEl.GetString();
+                }
+            }
+            else
+            {
+                rawReportJson = rawInput;
+            }
+        }
+        catch (JsonException ex)
+        {
+            return new Error("Analysis.InvalidReportFormat", $"Invalid analysis JSON: {ex.Message}", ErrorType.Validation);
+        }
+
+        return await reportStore.SaveReportToWebAppDirectoryAsync(fullWebDir, rawReportJson, rawMarkdown, cancellationToken);
+    }
+
     public async Task<Result<AnalyzeWebAppResponse>> HandleAsync(
         AnalyzeWebAppQuery query,
         CancellationToken cancellationToken = default)

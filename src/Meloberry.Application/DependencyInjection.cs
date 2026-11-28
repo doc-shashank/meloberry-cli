@@ -14,8 +14,13 @@ public static class DependencyInjection
     [
         typeof(EntityAddressResolver),
         typeof(DeleteEntityHandler),
+        typeof(CloneEntityHandler),
+        typeof(AddAssetHandler),
+        typeof(ListAssetsHandler),
+        typeof(PruneAssetsHandler),
         typeof(ListWorkspacesHandler),
         typeof(ApplySpecHandler),
+        typeof(ScaffoldHandler),
         typeof(PatchEntityHandler),
         typeof(BatchOperationsHandler),
         typeof(LintHandler),

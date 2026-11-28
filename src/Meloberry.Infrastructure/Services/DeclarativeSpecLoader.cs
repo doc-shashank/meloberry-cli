@@ -67,6 +67,16 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
         return Task.FromResult(ParseSpec(rawText, "<stdin>"));
     }
 
+    public Task<Result<DeclarativeApplySpec>> ParseFragmentAsync(
+        string topic,
+        string rawFragment,
+        string? subtype = null,
+        string? imagePath = null,
+        string? caption = null,
+        string? alt = null,
+        CancellationToken cancellationToken = default) =>
+        Task.FromResult(MarkdownSpecParser.ParseSingleFragment(topic, subtype, rawFragment, imagePath, caption, alt));
+
     private static async Task<Result<DeclarativeApplySpec>> LoadDirectoryAsync(string directoryPath, CancellationToken ct)
     {
         var fullDir = Path.GetFullPath(directoryPath);

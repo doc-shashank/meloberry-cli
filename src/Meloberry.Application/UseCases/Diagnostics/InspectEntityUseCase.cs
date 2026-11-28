@@ -7,9 +7,12 @@ using Meloberry.Domain.Sessions;
 
 namespace Meloberry.Application.UseCases.Diagnostics;
 
-public enum InspectViewMode { Outline, Full, Ids, Spec }
+public enum InspectViewMode { Outline, Full, Ids, Spec, Markdown }
 
-public sealed record InspectEntityQuery(string Address, InspectViewMode View = InspectViewMode.Outline);
+public sealed record InspectEntityQuery(
+    string Address,
+    InspectViewMode View = InspectViewMode.Outline,
+    string? OutputDirectory = null);
 
 public sealed record InspectFlashcardSideDto(string? Text, string? ImagePath, string Position);
 public sealed record InspectMcqOptionDto(int Index, string? Text, string? ImagePath, bool IsCorrect);
@@ -78,7 +81,9 @@ public sealed record InspectEntityResponse(
     IReadOnlyList<InspectQuestionDto>? Questions = null,
     InspectQuestionDto? Question = null,
     JsonNode? Spec = null,
-    InspectIdMapDto? IdMap = null);
+    InspectIdMapDto? IdMap = null,
+    IReadOnlyDictionary<string, string>? MarkdownFiles = null,
+    string? WrittenDirectory = null);
 
 public sealed class InspectEntityHandler(EntityAddressResolver addressResolver)
 {
@@ -94,6 +99,9 @@ public sealed class InspectEntityHandler(EntityAddressResolver addressResolver)
 
         if (query.View == InspectViewMode.Spec)
             return ProjectSpecResponse(entity, viewName, storage);
+
+        if (query.View == InspectViewMode.Markdown)
+            return await ProjectMarkdownResponseAsync(entity, viewName, storage, query.OutputDirectory, cancellationToken);
 
         return entity.EntityKind switch
         {
@@ -145,6 +153,69 @@ public sealed class InspectEntityHandler(EntityAddressResolver addressResolver)
                     entity.Component is not null ? $"c{entity.Component.Index}.q{entity.Question.Index}" : $"q{entity.Question.Index}",
                     query.View))
         };
+    }
+
+    private static async Task<Result<InspectEntityResponse>> ProjectMarkdownResponseAsync(
+        ResolvedEntity entity,
+        string viewName,
+        string? storage,
+        string? outputDirectory,
+        CancellationToken ct)
+    {
+        Dictionary<string, string> files = entity.EntityKind switch
+        {
+            "session" => WorkspaceMarkdownProjector.ProjectSessionToFiles(entity.Session!),
+            "quiz" => WorkspaceMarkdownProjector.ProjectQuizToFiles(entity.Quiz!),
+            "component" => new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [$"{entity.Component!.RefKey ?? $"c{entity.Component.Index}"}.md"] = WorkspaceMarkdownProjector.ProjectComponentToMarkdown(entity.Component)
+            },
+            "articleBlock" => new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [$"b{entity.ArticleBlock!.Index}.md"] = WorkspaceMarkdownProjector.ProjectBlockToMarkdown(entity.ArticleBlock)
+            },
+            _ => new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [$"q{entity.Question!.Index}.md"] = WorkspaceMarkdownProjector.ProjectQuestionToMarkdown(entity.Question)
+            }
+        };
+
+        string? writtenDir = null;
+        if (!string.IsNullOrWhiteSpace(outputDirectory))
+        {
+            writtenDir = Path.GetFullPath(outputDirectory);
+            Directory.CreateDirectory(writtenDir);
+            foreach (var (name, content) in files)
+                await File.WriteAllTextAsync(Path.Combine(writtenDir, name), content, ct);
+
+            var assetsToCopy = entity.Session is not null
+                ? WorkspaceAssetCollector.CollectSessionAssets(entity.Session)
+                : entity.Quiz is not null
+                    ? WorkspaceAssetCollector.CollectQuizAssets(entity.Quiz)
+                    : [];
+
+            foreach (var relAsset in assetsToCopy.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                if (Meloberry.Application.Abstractions.PathConfinement.TryResolveInside(entity.StorageDirectory, relAsset, out var srcFull) &&
+                    File.Exists(srcFull) &&
+                    Meloberry.Application.Abstractions.PathConfinement.TryResolveInside(writtenDir, relAsset, out var dstFull))
+                {
+                    var dstParent = Path.GetDirectoryName(dstFull);
+                    if (!string.IsNullOrWhiteSpace(dstParent)) Directory.CreateDirectory(dstParent);
+                    File.Copy(srcFull, dstFull, overwrite: true);
+                }
+            }
+        }
+
+        return new InspectEntityResponse(
+            EntityKind: entity.EntityKind,
+            Id: entity.EntityId,
+            View: viewName,
+            StorageDirectory: storage,
+            SessionId: entity.Session?.Id,
+            ContainerId: entity.Component?.Id ?? (entity.EntityKind == "question" ? entity.Quiz?.Id : null),
+            MarkdownFiles: files,
+            WrittenDirectory: writtenDir);
     }
 
     private static InspectEntityResponse ProjectSpecResponse(ResolvedEntity entity, string viewName, string? storage)

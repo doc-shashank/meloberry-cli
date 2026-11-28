@@ -33,6 +33,7 @@ public static class DependencyInjection
         services.AddScoped<IWorkspaceRepository, SqliteWorkspaceRepository>();
         services.AddScoped<IPackageExporter, MbypkgExporter>();
         services.AddScoped<IWebAppGenerator, SlidingWebAppGenerator>();
+        services.AddScoped<IBuildSignalWriter, FileBuildSignalWriter>();
         services.AddScoped<IAnalysisReportStore, AnalysisReportStore>();
         services.AddScoped<IHeadlessWebAppVerifier, CdpHeadlessWebAppVerifier>();
 

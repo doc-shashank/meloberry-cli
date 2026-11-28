@@ -10,8 +10,8 @@ namespace Meloberry.Cli.Commands;
 
 public sealed partial class BuildCliCommand : CliCommand
 {
-    private static readonly HashSet<string> AllowedFlags = new(StringComparer.OrdinalIgnoreCase) { "preview", "no-wait", "verify", "static-only", "ephemeral" };
-    private static readonly HashSet<string> AllowedValues = new(StringComparer.OrdinalIgnoreCase) { "out", "timeout" };
+    private static readonly HashSet<string> AllowedFlags = new(StringComparer.OrdinalIgnoreCase) { "preview", "no-wait", "verify", "static-only", "ephemeral", "all-themes", "signal" };
+    private static readonly HashSet<string> AllowedValues = new(StringComparer.OrdinalIgnoreCase) { "out", "timeout", "signal-dir" };
 
     [GeneratedRegex(@"^(Session|Set)_\d{8}_\d{6}_\d{3}$", RegexOptions.Compiled)]
     private static partial Regex StrictWorkspaceIdRegex();
@@ -19,7 +19,7 @@ public sealed partial class BuildCliCommand : CliCommand
     public BuildCliCommand()
         : base(new CommandDescriptor(
             Verb: "build",
-            Usage: "build <addr|spec.json|article.md|dir|-> [-o webDir] [--verify] [--static-only] [--ephemeral] [--timeout 30] [--preview] [--no-wait]",
+            Usage: "build <addr|spec.json|article.md|dir|-> [-o webDir] [--verify] [--static-only] [--ephemeral] [--all-themes] [--signal] [--signal-dir dir] [--timeout 30] [--preview] [--no-wait]",
             Description: "Runs mandatory lint and emits the deterministic study WebApp (supports one-shot JSON, Markdown, directories, or stdin).",
             HandlerType: typeof(Handler),
             AllowedFlagOptions: AllowedFlags,
@@ -31,6 +31,9 @@ public sealed partial class BuildCliCommand : CliCommand
                 "--verify             Run automated runtime verification after building (exits 2 on failure).",
                 "--static-only        Check static HTML/JS/CSS/asset integrity without launching a browser.",
                 "--ephemeral          For one-shot builds, compile inside a temporary workspace and delete it afterwards.",
+                "--all-themes         Emit all 4 CSS themes (berry, light, dark, paper) and the postMessage theme override bridge.",
+                "--signal             Atomically emit .mby-signal.txt (webapp_built) when build succeeds.",
+                "--signal-dir <dir>   Target directory for .mby-signal.txt (implies --signal).",
                 "--timeout <sec>      Headless browser verification timeout in seconds (default 30, range 5..180).",
                 "--preview            Serve built WebApp locally.",
                 "--no-wait            Exit immediately after printing preview URL (useful with --preview)."
@@ -38,7 +41,7 @@ public sealed partial class BuildCliCommand : CliCommand
             Examples:
             [
                 "mby build ./articles/ -o ./study_web --verify --json",
-                "mby build ./articles/ -o ./study_web --ephemeral --json",
+                "mby build ./articles/ -o ./study_web --ephemeral --all-themes --signal --json",
                 "mby build Session_2026... -o ./study_web --json"
             ]))
     {
@@ -61,6 +64,9 @@ public sealed partial class BuildCliCommand : CliCommand
             bool verify = context.HasFlag("verify");
             bool staticOnly = context.HasFlag("static-only");
             bool ephemeral = context.HasFlag("ephemeral");
+            bool allThemes = context.HasFlag("all-themes");
+            var signalDir = context.GetOptionValue("signal-dir");
+            bool emitSignal = context.HasFlag("signal") || !string.IsNullOrWhiteSpace(signalDir);
             if (!CliCommandHelpers.TryParseTimeoutOption(context, out int timeout, out int? timeoutErr))
                 return timeoutErr!.Value;
 
@@ -89,7 +95,10 @@ public sealed partial class BuildCliCommand : CliCommand
                         VerifyWeb: verify,
                         StaticVerifyOnly: staticOnly,
                         VerifyTimeoutSeconds: timeout,
-                        Ephemeral: ephemeral),
+                        Ephemeral: ephemeral,
+                        IncludeAllThemes: allThemes,
+                        EmitSignal: emitSignal,
+                        SignalDirectory: signalDir),
                     context.CancellationToken);
                 if (!applyRes.IsSuccess) return applyRes.ToExitCode(context.Console, context.GlobalOptions.Json);
 
@@ -113,7 +122,7 @@ public sealed partial class BuildCliCommand : CliCommand
                     ? Path.GetDirectoryName(Path.GetFullPath(trimmedTarget))
                     : null;
                 var buildRes = await buildWebHandler.HandleAsync(
-                    new BuildWebAppCommand(effectiveWsId, outDir, verify, context.GlobalOptions.Verbose, context.GlobalOptions.Quiet, staticOnly, timeout, workspaceParentDir),
+                    new BuildWebAppCommand(effectiveWsId, outDir, verify, context.GlobalOptions.Verbose, context.GlobalOptions.Quiet, staticOnly, timeout, workspaceParentDir, allThemes, emitSignal, signalDir),
                     context.CancellationToken);
                 if (!buildRes.IsSuccess) return buildRes.ToExitCode(context.Console, context.GlobalOptions.Json);
 
@@ -340,30 +349,32 @@ public sealed class LayoutCliCommand : CliCommand
 public sealed class AnalyzeCliCommand : CliCommand
 {
     private static readonly HashSet<string> AllowedFlags = new(StringComparer.OrdinalIgnoreCase) { "all", "live", "no-wait", "headless", "static-only" };
-    private static readonly HashSet<string> AllowedValues = new(StringComparer.OrdinalIgnoreCase) { "timeout" };
+    private static readonly HashSet<string> AllowedValues = new(StringComparer.OrdinalIgnoreCase) { "timeout", "ingest" };
 
     public AnalyzeCliCommand()
         : base(new CommandDescriptor(
             Verb: "analyze",
-            Usage: "analyze <webDir|report.json> [--headless] [--static-only] [--timeout 30] [--all] [--live] [--no-wait]",
-            Description: "Runs zero-touch headless browser/static verification (--headless/--static-only) or analyzes captured *.analysis.json telemetry reports.",
+            Usage: "analyze <webDir|report.json> [--headless] [--static-only] [--timeout 30] [--all] [--live] [--ingest file|-] [--no-wait]",
+            Description: "Runs zero-touch headless browser/static verification (--headless/--static-only), ingests external telemetry JSON (--ingest), or analyzes captured *.analysis.json telemetry reports.",
             HandlerType: typeof(Handler),
             AllowedFlagOptions: AllowedFlags,
             AllowedValueOptions: AllowedValues,
-            Prerequisites: "For --headless: Edge or Chrome installed (or MBY_BROWSER_PATH set). For telemetry mode (without --headless/--static-only): requires reports/*.analysis.json from a prior --live or --preview browser run.",
+            Prerequisites: "For --headless: Edge or Chrome installed (or MBY_BROWSER_PATH set). For --ingest: pass <webDir> and JSON file or '-'. For telemetry mode: requires reports/*.analysis.json.",
             OptionsHelp:
             [
-                "--headless     Launch headless Edge/Chrome via CDP, step every slide/question, check images/overflow/KaTeX/console, write reports/verify.latest.json.",
-                "--static-only  Verify HTML/JS/CSS, DATA JSON, and referenced local image assets on disk without launching a browser.",
-                "--timeout <n>  Timeout in seconds for --headless (default 30, range 5..180).",
-                "--live         Start preview server + /api/analysis receiver to save runtime session telemetry.",
-                "--all          Aggregate all saved *.analysis.json telemetry files in <webDir>/reports.",
-                "--no-wait      Exit immediately after printing URL in --live mode."
+                "--headless       Launch headless Edge/Chrome via CDP, step every slide/question, check images/overflow/KaTeX/console, write reports/verify.latest.json.",
+                "--static-only    Verify HTML/JS/CSS, DATA JSON, and referenced local image assets on disk without launching a browser.",
+                "--timeout <n>    Timeout in seconds for --headless (default 30, range 5..180).",
+                "--ingest <f|->   Validate and store an analysis telemetry payload (raw report or {report,markdown}) into <webDir>/reports/.",
+                "--live           Start preview server + /api/analysis receiver to save runtime session telemetry.",
+                "--all            Aggregate all saved *.analysis.json telemetry files in <webDir>/reports.",
+                "--no-wait        Exit immediately after printing URL in --live mode."
             ],
             Examples:
             [
                 "mby analyze ./study_web --headless --json",
                 "mby analyze ./study_web --static-only --json",
+                "mby analyze ./study_web --ingest - --json",
                 "mby analyze ./study_web --all --no-wait --json"
             ]))
     {
@@ -380,6 +391,18 @@ public sealed class AnalyzeCliCommand : CliCommand
                 return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Usage: {new AnalyzeCliCommand().Descriptor.Usage}", context.GlobalOptions.Json);
 
             var targetPath = context.PositionalArgs[0];
+            var ingestTarget = context.GetOptionValue("ingest");
+            if (!string.IsNullOrWhiteSpace(ingestTarget))
+            {
+                var (filePath, inlineJson, errExit) = await CliCommandHelpers.ReadJsonInputAsync(context, ingestTarget);
+                if (errExit is not null) return errExit.Value;
+
+                return await CliCommandHelpers.FinishAsync(
+                    context,
+                    useCase.IngestAsync(new IngestAnalysisCommand(targetPath, filePath, inlineJson), context.CancellationToken),
+                    saved => $"Saved analysis report '{saved.JsonPath}' and summary '{saved.MarkdownPath}'.");
+            }
+
             bool headless = context.HasFlag("headless");
             bool staticOnly = context.HasFlag("static-only");
 

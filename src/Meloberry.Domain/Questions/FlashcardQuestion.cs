@@ -67,5 +67,15 @@ public sealed class FlashcardQuestion : Question
         return side.Position;
     }
 
+    public override Question CloneWithNewId(string newQuestionId, string targetContainerId, string? newRefKey = null) =>
+        Rehydrate(
+            newQuestionId,
+            targetContainerId,
+            1,
+            FlashcardSide.Rehydrate(Front.Text, Front.ImagePath, Front.Position, Front.IsPositionExplicit),
+            FlashcardSide.Rehydrate(Back.Text, Back.ImagePath, Back.Position, Back.IsPositionExplicit),
+            CloneLayoutOverrides(),
+            newRefKey);
+
     private FlashcardSide GetSide(FlashcardFace face) => face == FlashcardFace.Front ? Front : Back;
 }

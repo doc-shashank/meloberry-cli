@@ -79,6 +79,38 @@ internal static class IndexedListReorderer
         return Result.Success();
     }
 
+    public static Result ApplyExactOrder<T>(List<T> items, IReadOnlyList<string> orderedIds, string entityLabel)
+        where T : IIndexedEntity
+    {
+        if (orderedIds.Count != items.Count)
+        {
+            return new Error(
+                "Reorder.CountMismatch",
+                $"Expected {items.Count} {entityLabel} ID(s) in order list, received {orderedIds.Count}.",
+                ErrorType.Validation);
+        }
+
+        var byId = items.ToDictionary(x => x.Id, StringComparer.Ordinal);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var reordered = new List<T>(items.Count);
+
+        for (int i = 0; i < orderedIds.Count; i++)
+        {
+            var id = orderedIds[i];
+            if (!seen.Add(id))
+                return new Error("Reorder.DuplicateId", $"Duplicate ID '{id}' in order list.", ErrorType.Validation);
+            if (!byId.TryGetValue(id, out var item))
+                return new Error("Reorder.UnknownId", $"Unknown {entityLabel} ID '{id}' in order list.", ErrorType.NotFound);
+
+            item.SetIndexInternal(i + 1);
+            reordered.Add(item);
+        }
+
+        items.Clear();
+        items.AddRange(reordered);
+        return Result.Success();
+    }
+
     public static void SortInPlace<T>(List<T> items) where T : IIndexedEntity =>
         items.Sort((a, b) => a.Index.CompareTo(b.Index));
 }

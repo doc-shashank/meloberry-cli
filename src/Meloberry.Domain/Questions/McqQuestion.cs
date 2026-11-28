@@ -127,4 +127,18 @@ public sealed class McqQuestion : Question
         IsMultiCorrect = false;
         return Result.Success();
     }
+
+    public override Question CloneWithNewId(string newQuestionId, string targetContainerId, string? newRefKey = null) =>
+        Rehydrate(
+            newQuestionId,
+            targetContainerId,
+            1,
+            Text,
+            MaxOptions,
+            IsMultiCorrect,
+            _options.Select(o => McqOption.Create(o.Index, o.Text, o.ImagePath, o.IsCorrect)),
+            CloneLayoutOverrides(),
+            ImagePath,
+            Explanation,
+            newRefKey);
 }

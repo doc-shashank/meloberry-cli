@@ -40,8 +40,8 @@ public sealed partial class FileContentInspector(ChainTransactionManager? transa
         int headerLen = await ReadHeaderBytesAsync(fs, headerBuf, cancellationToken);
         if (TryDetectRasterImageExtension(headerBuf.AsSpan(0, headerLen), out var rasterExt))
         {
-            var relativeAsset = await CopyRasterStreamToAssetsAsync(fs, valueOrPath, rasterExt, workspaceStorageDirectory, cancellationToken);
-            return new ResolvedContent(ResolvedContentKind.Image, null, relativeAsset);
+            var (relativeAsset, alreadyExisted) = await CopyRasterStreamToAssetsAsync(fs, valueOrPath, rasterExt, workspaceStorageDirectory, cancellationToken);
+            return new ResolvedContent(ResolvedContentKind.Image, null, relativeAsset, alreadyExisted);
         }
 
         fs.Position = 0;
@@ -50,8 +50,8 @@ public sealed partial class FileContentInspector(ChainTransactionManager? transa
 
         if (TryDetectImageExtension(bytes, out var imageExt))
         {
-            var relativeAsset = await CopyImageBytesToAssetsAsync(bytes, valueOrPath, imageExt, workspaceStorageDirectory, cancellationToken);
-            return new ResolvedContent(ResolvedContentKind.Image, null, relativeAsset);
+            var (relativeAsset, alreadyExisted) = await CopyImageBytesToAssetsAsync(bytes, valueOrPath, imageExt, workspaceStorageDirectory, cancellationToken);
+            return new ResolvedContent(ResolvedContentKind.Image, null, relativeAsset, alreadyExisted);
         }
 
         if (requireImageOnly)
@@ -67,6 +67,14 @@ public sealed partial class FileContentInspector(ChainTransactionManager? transa
     {
         var result = await ResolveInputAsync(ContentInputMethod.Path, sourceImagePath, workspaceStorageDirectory, requireImageOnly: true, cancellationToken);
         return result.IsSuccess ? result.Value.RelativeAssetPath! : result.Error!;
+    }
+
+    public async Task<Result<CopiedAssetResult>> CopyAndVerifyImageWithStatusAsync(string sourceImagePath, string workspaceStorageDirectory, CancellationToken cancellationToken = default)
+    {
+        var result = await ResolveInputAsync(ContentInputMethod.Path, sourceImagePath, workspaceStorageDirectory, requireImageOnly: true, cancellationToken);
+        return result.IsSuccess
+            ? new CopiedAssetResult(result.Value.RelativeAssetPath!, result.Value.AlreadyExisted)
+            : result.Error!;
     }
 
     public async Task<Result> VerifyStoredAssetAsync(string workspaceStorageDirectory, string relativeAssetPath, CancellationToken cancellationToken = default)
@@ -128,7 +136,7 @@ public sealed partial class FileContentInspector(ChainTransactionManager? transa
         return $"{safeName}_{hash8}{canonicalExtension}";
     }
 
-    private async Task<string> CopyRasterStreamToAssetsAsync(
+    private async Task<(string RelativePath, bool AlreadyExisted)> CopyRasterStreamToAssetsAsync(
         FileStream sourceStream, string originalPath, string canonicalExtension, string workspaceStorageDirectory, CancellationToken cancellationToken)
     {
         transactionManager?.NotifyWorkspaceMutating(workspaceStorageDirectory);
@@ -141,7 +149,8 @@ public sealed partial class FileContentInspector(ChainTransactionManager? transa
         var fileName = BuildCanonicalAssetFileName(originalPath, hash8, canonicalExtension);
         var destinationPath = Path.Combine(assetsDir, fileName);
 
-        if (!File.Exists(destinationPath))
+        bool existed = File.Exists(destinationPath);
+        if (!existed)
         {
             sourceStream.Position = 0;
             await using var dst = new FileStream(
@@ -150,10 +159,10 @@ public sealed partial class FileContentInspector(ChainTransactionManager? transa
             await sourceStream.CopyToAsync(dst, 81920, cancellationToken);
         }
 
-        return Path.Combine("assets", fileName).Replace('\\', '/');
+        return (Path.Combine("assets", fileName).Replace('\\', '/'), existed);
     }
 
-    private async Task<string> CopyImageBytesToAssetsAsync(
+    private async Task<(string RelativePath, bool AlreadyExisted)> CopyImageBytesToAssetsAsync(
         byte[] bytes, string originalPath, string canonicalExtension, string workspaceStorageDirectory, CancellationToken cancellationToken)
     {
         transactionManager?.NotifyWorkspaceMutating(workspaceStorageDirectory);
@@ -163,10 +172,11 @@ public sealed partial class FileContentInspector(ChainTransactionManager? transa
         var hash8 = Convert.ToHexStringLower(SHA256.HashData(bytes))[..8];
         var fileName = BuildCanonicalAssetFileName(originalPath, hash8, canonicalExtension);
         var destinationPath = Path.Combine(assetsDir, fileName);
-        if (!File.Exists(destinationPath))
+        bool existed = File.Exists(destinationPath);
+        if (!existed)
             await File.WriteAllBytesAsync(destinationPath, bytes, cancellationToken);
 
-        return Path.Combine("assets", fileName).Replace('\\', '/');
+        return (Path.Combine("assets", fileName).Replace('\\', '/'), existed);
     }
 
     private static bool CouldBeSvgHeader(ReadOnlySpan<byte> header)

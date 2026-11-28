@@ -192,6 +192,36 @@ internal static partial class MarkdownSpecParser
         return true;
     }
 
+    public static string SmartWrapSingleFragment(
+        string topic,
+        string? subtype,
+        string rawBody,
+        string? imagePath = null,
+        string? caption = null,
+        string? alt = null) =>
+        Domain.Scaffolding.MarkdownSmartWrapper.SmartWrapSingleFragment(
+            topic, subtype, rawBody, imagePath, caption, alt, out _);
+
+    public static Result<DeclarativeApplySpec> ParseSingleFragment(
+        string topic,
+        string? subtype,
+        string rawBody,
+        string? imagePath = null,
+        string? caption = null,
+        string? alt = null)
+    {
+        if (string.IsNullOrWhiteSpace(topic))
+            return new Error("Markdown.InvalidFragment", "Fragment topic cannot be empty.", ErrorType.Validation);
+
+        var t = topic.Trim().ToLowerInvariant();
+        var wrapped = SmartWrapSingleFragment(t, subtype, rawBody, imagePath, caption, alt);
+        bool isArticleBlock = t is "text" or "image" or "callout" or "table" or "diagram-explore" or "reveal" or "link";
+        var docText = isArticleBlock
+            ? $"---\nkind: article\ntitle: \"Fragment\"\n---\n\n{wrapped}"
+            : $"---\nkind: quiz\nquizType: mixed\ntitle: \"Fragment\"\n---\n\n{wrapped}";
+        return ParseSingleSpec(docText, $"<fragment:{t}>");
+    }
+
     public static Result<DeclarativeApplySpec> ParseSingleSpec(string rawMarkdown, string sourceLabel, string? filePath = null)
     {
         var parsedRes = ParseDocument(rawMarkdown, sourceLabel, isSessionManifest: false);

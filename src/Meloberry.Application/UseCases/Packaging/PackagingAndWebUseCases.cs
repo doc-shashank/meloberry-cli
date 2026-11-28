@@ -17,8 +17,19 @@ public sealed record ImportPackageResponse(
     string StorageDirectory,
     string TargetPlatform = "desktop",
     bool IncludedLayout = false);
-public sealed record BuildWebAppCommand(string Address, string? OutputDirectory = null, bool Verify = false, bool Verbose = false, bool Quiet = false, bool StaticVerifyOnly = false, int VerifyTimeoutSeconds = 30, string? WorkspaceParentDirectory = null);
-public sealed record BuildWebAppResponse(string TargetId, string OutputDirectory, string IndexHtmlPath, ApplyLintSummary Lint, LintReportResponse? LintReport = null, WebAppVerificationReport? Verify = null);
+public sealed record BuildWebAppCommand(
+    string Address,
+    string? OutputDirectory = null,
+    bool Verify = false,
+    bool Verbose = false,
+    bool Quiet = false,
+    bool StaticVerifyOnly = false,
+    int VerifyTimeoutSeconds = 30,
+    string? WorkspaceParentDirectory = null,
+    bool IncludeAllThemes = false,
+    bool EmitSignal = false,
+    string? SignalDirectory = null);
+public sealed record BuildWebAppResponse(string TargetId, string OutputDirectory, string IndexHtmlPath, ApplyLintSummary Lint, LintReportResponse? LintReport = null, WebAppVerificationReport? Verify = null, string? SignalPath = null);
 
 public sealed class ExportPackageHandler(
     ILayoutRepository layoutRepository,
@@ -129,7 +140,8 @@ public sealed class BuildWebAppHandler(
     LintHandler lintHandler,
     IWebAppGenerator webAppGenerator,
     VerifyWebAppHandler? verifyHandler = null,
-    IWorkspaceRepository? workspaceRepository = null)
+    IWorkspaceRepository? workspaceRepository = null,
+    IBuildSignalWriter? signalWriter = null)
 {
     public async Task<Result<BuildWebAppResponse>> HandleAsync(BuildWebAppCommand command, CancellationToken cancellationToken = default)
     {
@@ -173,8 +185,8 @@ public sealed class BuildWebAppHandler(
         var layouts = await layoutRepository.GetAllProfilesAsync(cancellationToken);
         var wsId = ws.Session?.Id ?? ws.Quiz!.Id;
         var webRes = ws.Session is not null
-            ? await webAppGenerator.GenerateForSessionAsync(ws.Session, ws.StorageDirectory, layouts, command.OutputDirectory, cancellationToken)
-            : await webAppGenerator.GenerateForQuizAsync(ws.Quiz!, ws.StorageDirectory, layouts, command.OutputDirectory, cancellationToken);
+            ? await webAppGenerator.GenerateForSessionAsync(ws.Session, ws.StorageDirectory, layouts, command.OutputDirectory, command.IncludeAllThemes, cancellationToken)
+            : await webAppGenerator.GenerateForQuizAsync(ws.Quiz!, ws.StorageDirectory, layouts, command.OutputDirectory, command.IncludeAllThemes, cancellationToken);
 
         if (!webRes.IsSuccess) return webRes.Error!;
         var webDir = Path.GetDirectoryName(webRes.Value) ?? webRes.Value;
@@ -204,6 +216,26 @@ public sealed class BuildWebAppHandler(
             }
         }
 
-        return new BuildWebAppResponse(wsId, webDir, webRes.Value, lintSummary, detailedLint, verifyReport);
+        string? signalPath = null;
+        bool shouldEmitSignal = command.EmitSignal || !string.IsNullOrWhiteSpace(command.SignalDirectory) || IsSignalEnvEnabled();
+        if (shouldEmitSignal && signalWriter is not null)
+        {
+            var title = ws.Session is not null
+                ? (string.IsNullOrWhiteSpace(ws.Session.Name) ? ws.Session.Id : ws.Session.Name)
+                : (string.IsNullOrWhiteSpace(ws.Quiz!.Name) ? ws.Quiz.Id : ws.Quiz.Name);
+
+            signalPath = await signalWriter.WriteWebAppBuiltSignalAsync(
+                new BuildSignalRequest(wsId, ws.StorageDirectory, webDir, title, command.SignalDirectory),
+                cancellationToken);
+        }
+
+        return new BuildWebAppResponse(wsId, webDir, webRes.Value, lintSummary, detailedLint, verifyReport, signalPath);
+    }
+
+    private static bool IsSignalEnvEnabled()
+    {
+        var raw = Environment.GetEnvironmentVariable("MBY_SIGNAL");
+        return string.Equals(raw, "1", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(raw, "true", StringComparison.OrdinalIgnoreCase);
     }
 }

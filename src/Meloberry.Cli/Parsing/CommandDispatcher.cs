@@ -14,13 +14,17 @@ public sealed class CommandDispatcher(
 {
     private static readonly HashSet<string> GlobalKnownValueOptions = new(StringComparer.OrdinalIgnoreCase)
     {
-        "app-data", "out", "build", "export", "view", "set", "move", "timeout"
+        "app-data", "out", "build", "export", "view", "set", "move", "timeout",
+        "at", "to", "order", "ref", "subtype", "image", "format", "topics",
+        "container", "cli-prefix", "authoring-format", "workspace", "ingest",
+        "signal-dir", "dir"
     };
 
     private static readonly HashSet<string> GlobalKnownFlagOptions = new(StringComparer.OrdinalIgnoreCase)
     {
         "json", "help", "version", "dry-run", "preview", "no-wait", "include-layout", "all", "live",
-        "quiet", "verbose", "headless", "verify", "static-only", "ephemeral", "icons", "nested"
+        "quiet", "verbose", "headless", "verify", "static-only", "ephemeral", "icons", "nested",
+        "templates", "md", "placeholders", "apply", "all-themes", "web", "signal"
     };
 
     private readonly Dictionary<string, CliCommand> _commands =
@@ -252,7 +256,7 @@ public sealed class CommandDispatcher(
                 if (i + 1 >= args.Length)
                 {
                     globals = new GlobalCliOptions(json, appDataDir, quiet, verbose);
-                    errorMessage = "Option '-o' requires a directory path.";
+                    errorMessage = "Option '-o' requires a path.";
                     return false;
                 }
                 AddNamedValue(named, "out", args[++i]);

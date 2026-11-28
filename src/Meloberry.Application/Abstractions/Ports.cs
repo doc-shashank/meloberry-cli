@@ -10,7 +10,8 @@ namespace Meloberry.Application.Abstractions;
 public enum ContentInputMethod { String, Path }
 public enum ResolvedContentKind { Text, Image }
 
-public sealed record ResolvedContent(ResolvedContentKind Kind, string? TextContent, string? RelativeAssetPath);
+public sealed record ResolvedContent(ResolvedContentKind Kind, string? TextContent, string? RelativeAssetPath, bool AlreadyExisted = false);
+public sealed record CopiedAssetResult(string RelativeAssetPath, bool AlreadyExisted);
 public sealed record JsonMcqOptionSpec(int Index, string? Text, string? ImagePath, bool IsCorrect);
 public sealed record JsonFlashcardSideSpec(string? Text, string? ImagePath, string? TextPosition);
 
@@ -76,6 +77,17 @@ public interface IDeclarativeSpecLoader
 {
     Task<Result<DeclarativeApplySpec>> LoadAsync(string specPath, CancellationToken cancellationToken = default);
     Task<Result<DeclarativeApplySpec>> LoadFromTextAsync(string rawText, CancellationToken cancellationToken = default);
+
+    Task<Result<DeclarativeApplySpec>> ParseFragmentAsync(
+        string topic,
+        string rawFragment,
+        string? subtype = null,
+        string? imagePath = null,
+        string? caption = null,
+        string? alt = null,
+        CancellationToken cancellationToken = default) =>
+        Task.FromResult(Result<DeclarativeApplySpec>.Failure(
+            new Error("SpecLoader.NotSupported", "Single-fragment Markdown parsing is not supported by this loader.", ErrorType.Failure)));
 }
 
 public sealed record SessionLookupContext(StudySession Session, string StorageDirectory);
@@ -197,6 +209,13 @@ public interface IContentInspector
     Task<Result<string>> CopyAndVerifyImageAsync(
         string sourceImagePath, string workspaceStorageDirectory, CancellationToken cancellationToken = default);
 
+    async Task<Result<CopiedAssetResult>> CopyAndVerifyImageWithStatusAsync(
+        string sourceImagePath, string workspaceStorageDirectory, CancellationToken cancellationToken = default)
+    {
+        var res = await CopyAndVerifyImageAsync(sourceImagePath, workspaceStorageDirectory, cancellationToken);
+        return res.IsSuccess ? new CopiedAssetResult(res.Value, false) : res.Error!;
+    }
+
     Task<Result> VerifyStoredAssetAsync(
         string workspaceStorageDirectory, string relativeAssetPath, CancellationToken cancellationToken = default);
 }
@@ -259,12 +278,30 @@ public interface IWebAppGenerator
 {
     Task<Result<string>> GenerateForSessionAsync(
         StudySession session, string storageDirectory, IReadOnlyDictionary<string, LayoutProfile> layouts,
-        string? outputDirectory, CancellationToken cancellationToken = default);
+        string? outputDirectory, bool includeAllThemes = false, CancellationToken cancellationToken = default);
 
     Task<Result<string>> GenerateForQuizAsync(
         Quiz quiz, string storageDirectory, IReadOnlyDictionary<string, LayoutProfile> layouts,
-        string? outputDirectory, CancellationToken cancellationToken = default);
+        string? outputDirectory, bool includeAllThemes = false, CancellationToken cancellationToken = default);
 }
+
+public sealed record BuildSignalRequest(
+    string WorkspaceId,
+    string StorageDirectory,
+    string WebOutputDirectory,
+    string Title,
+    string? SignalDirectory = null);
+
+public interface IBuildSignalWriter
+{
+    Task<string> WriteWebAppBuiltSignalAsync(BuildSignalRequest request, CancellationToken cancellationToken = default);
+}
+
+public sealed record DiscoveredWebAppDto(
+    string Path,
+    string Name,
+    int ReportCount,
+    string? LatestCompletedAtUtc);
 
 public sealed record SavedAnalysisFiles(string JsonPath, string MarkdownPath, SessionAnalysisReport Report);
 
@@ -293,6 +330,7 @@ public interface IAnalysisReportStore
 {
     Task<Result<IReadOnlyList<SessionAnalysisReport>>> LoadReportsAsync(string webAppOrReportPath, CancellationToken cancellationToken = default);
     Task<Result<SavedAnalysisFiles>> SaveReportToWebAppDirectoryAsync(string webAppDirectory, string rawReportJson, string? rawMarkdown = null, CancellationToken cancellationToken = default);
+    Task<Result<IReadOnlyList<DiscoveredWebAppDto>>> DiscoverWebAppsAsync(string directory, CancellationToken cancellationToken = default);
 }
 
 public static class CliCapabilities
@@ -306,7 +344,23 @@ public static class CliCapabilities
         "spec.icons",
         "spec.nested",
         "pkg.import.metadata",
-        "batch.atomic"
+        "batch.atomic",
+        "spec.linkTopic",
+        "spec.modeGroups",
+        "spec.markdownTemplates",
+        "reorg.crossComponentMove",
+        "reorg.positionalInsert",
+        "reorg.clone",
+        "reorg.batchReorder",
+        "asset.cli",
+        "scaffold.cli",
+        "preset.mbypreset",
+        "markdown.roundTrip",
+        "prime.agentsMd",
+        "build.allThemes",
+        "build.signal",
+        "ls.web",
+        "analyze.ingest"
     ];
 }
 
@@ -332,4 +386,6 @@ public interface IChainTransactionScope : IDisposable
 public interface IChainTransactionManager
 {
     IChainTransactionScope Begin();
+    void NotifyWorkspaceMutating(string storageDirectory) { }
+    void BackupFileForRollback(string filePath) { }
 }

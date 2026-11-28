@@ -9,25 +9,27 @@ namespace Meloberry.Cli.Commands;
 
 public sealed class GetCliCommand : CliCommand
 {
-    private static readonly HashSet<string> AllowedValues = new(StringComparer.OrdinalIgnoreCase) { "view" };
+    private static readonly HashSet<string> AllowedValues = new(StringComparer.OrdinalIgnoreCase) { "view", "out" };
 
     public GetCliCommand()
         : base(new CommandDescriptor(
             Verb: "get",
-            Usage: "get <addr> [--view outline|full|ids|spec]",
+            Usage: "get <addr> [--view outline|full|ids|spec|markdown] [-o dir]",
             Description: "Inspects an entity by ID, path (#c1.b2), or #ref (defaults to compact outline).",
             HandlerType: typeof(Handler),
             AllowedValueOptions: AllowedValues,
             Prerequisites: "Target entity must exist (direct ID, <wsId>#c<n>[.b<m>|.q<m>], <setId>#q<m>, or <wsId>#<ref>).",
             OptionsHelp:
             [
-                "--view <mode>   Output verbosity: 'outline' (default, compact snippets), 'full' (complete content), 'ids' (minimal ID/path map), or 'spec' (canonical apply-compatible JSON + idMap)."
+                "--view <mode>   Output verbosity: 'outline' (default), 'full', 'ids', 'spec' (canonical JSON), or 'markdown' (Modular Markdown).",
+                "-o, --out <dir> Optional output directory when --view markdown is used (writes files and referenced assets)."
             ],
             Examples:
             [
                 "mby get Session_2026... --json",
                 "mby get Session_2026...#c1 --view full --json",
                 "mby get Session_2026... --view spec --json",
+                "mby get Session_2026... --view markdown -o ./exported_md --json",
                 "mby get Session_2026... --view ids --json"
             ]))
     {
@@ -38,7 +40,7 @@ public sealed class GetCliCommand : CliCommand
         public Task<int> InvokeAsync(CliInvocationContext context)
         {
             if (context.PositionalArgs.Count != 1)
-                return Task.FromResult(CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: get <addr> [--view outline|full|ids|spec]", context.GlobalOptions.Json));
+                return Task.FromResult(CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: get <addr> [--view outline|full|ids|spec|markdown] [-o dir]", context.GlobalOptions.Json));
 
             var rawView = context.GetOptionValue("view") ?? "outline";
             InspectViewMode view;
@@ -48,13 +50,16 @@ public sealed class GetCliCommand : CliCommand
                 case "full": view = InspectViewMode.Full; break;
                 case "ids": view = InspectViewMode.Ids; break;
                 case "spec": view = InspectViewMode.Spec; break;
+                case "markdown":
+                case "md":
+                    view = InspectViewMode.Markdown; break;
                 default:
-                    return Task.FromResult(CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Invalid --view '{rawView}'. Use 'outline', 'full', 'ids', or 'spec'.", context.GlobalOptions.Json));
+                    return Task.FromResult(CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Invalid --view '{rawView}'. Use 'outline', 'full', 'ids', 'spec', or 'markdown'.", context.GlobalOptions.Json));
             }
 
             return CliCommandHelpers.FinishAsync(
                 context,
-                useCase.HandleAsync(new InspectEntityQuery(context.PositionalArgs[0], view), context.CancellationToken),
+                useCase.HandleAsync(new InspectEntityQuery(context.PositionalArgs[0], view, context.GetOptionValue("out")), context.CancellationToken),
                 FormatHuman);
         }
 
@@ -62,6 +67,17 @@ public sealed class GetCliCommand : CliCommand
         {
             var sb = new StringBuilder();
             sb.AppendLine($"[{r.EntityKind}] {r.Id} ({r.View})");
+            if (r.MarkdownFiles is { Count: > 0 })
+            {
+                foreach (var (name, content) in r.MarkdownFiles)
+                {
+                    sb.AppendLine($"=== {name} ===");
+                    sb.AppendLine(content.TrimEnd());
+                }
+                if (!string.IsNullOrWhiteSpace(r.WrittenDirectory))
+                    sb.AppendLine($"Written to: {r.WrittenDirectory}");
+                return sb.ToString().TrimEnd();
+            }
             if (r.Spec is not null)
             {
                 sb.AppendLine(r.Spec.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
@@ -122,24 +138,26 @@ public sealed class GetCliCommand : CliCommand
 
 public sealed class LsCliCommand : CliCommand
 {
-    private static readonly HashSet<string> AllowedFlags = new(StringComparer.OrdinalIgnoreCase) { "all" };
+    private static readonly HashSet<string> AllowedFlags = new(StringComparer.OrdinalIgnoreCase) { "all", "web" };
 
     public LsCliCommand()
         : base(new CommandDescriptor(
             Verb: "ls",
-            Usage: "ls [directory] [--all]",
-            Description: "Lists discovered study session and standalone quiz workspaces in CWD + .meloberry/workspaces (or globally with --all).",
+            Usage: "ls [directory] [--all|--web]",
+            Description: "Lists discovered study workspaces in CWD + .meloberry/workspaces (or compiled WebApp bundles with --web).",
             HandlerType: typeof(Handler),
             AllowedFlagOptions: AllowedFlags,
-            Prerequisites: "Scans [directory] (or CWD + .meloberry/workspaces when omitted); pass --all to query all globally registered workspaces in app_settings.db.",
+            Prerequisites: "Scans [directory] (or CWD + .meloberry/workspaces when omitted); pass --all for global workspaces or --web for compiled WebApp bundles.",
             OptionsHelp:
             [
-                "--all   List all workspaces registered globally in app_settings.db across all directories."
+                "--all   List all workspaces registered globally in app_settings.db across all directories.",
+                "--web   Discover compiled WebApp directories (containing index.html + app.js) and report telemetry counts."
             ],
             Examples:
             [
                 "mby ls --json",
                 "mby ls ./custom_dir --json",
+                "mby ls ./workspace --web --json",
                 "mby ls --all --json"
             ]))
     {
@@ -150,9 +168,19 @@ public sealed class LsCliCommand : CliCommand
         public Task<int> InvokeAsync(CliInvocationContext context)
         {
             if (context.PositionalArgs.Count > 1)
-                return Task.FromResult(CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: ls [directory] [--all]", context.GlobalOptions.Json));
+                return Task.FromResult(CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: ls [directory] [--all|--web]", context.GlobalOptions.Json));
 
             var dir = context.PositionalArgs.Count == 1 ? context.PositionalArgs[0] : null;
+            if (context.HasFlag("web"))
+            {
+                return CliCommandHelpers.FinishAsync(
+                    context,
+                    useCase.DiscoverWebAppsAsync(dir, context.CancellationToken),
+                    items => items.Count == 0
+                        ? "No compiled WebApps found."
+                        : string.Join(Environment.NewLine, items.Select(x => $"{x.Name} | reports:{x.ReportCount} | latest:{x.LatestCompletedAtUtc ?? "none"} | {x.Path}")));
+            }
+
             bool includeAll = context.HasFlag("all");
             return CliCommandHelpers.FinishAsync(
                 context,

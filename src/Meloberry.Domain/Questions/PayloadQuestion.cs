@@ -50,4 +50,14 @@ public sealed class PayloadQuestion : Question
         PayloadJson = payloadJson.Trim();
         return Result.Success();
     }
+
+    public override Question CloneWithNewId(string newQuestionId, string targetContainerId, string? newRefKey = null) =>
+        Rehydrate(
+            newQuestionId,
+            targetContainerId,
+            1,
+            Type,
+            PayloadJson ?? "{}",
+            CloneLayoutOverrides(),
+            newRefKey);
 }

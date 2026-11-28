@@ -152,8 +152,36 @@ public sealed class Quiz
     public Result DeleteQuestion(string questionId) =>
         IndexedListReorderer.RemoveAndShiftUp(_questions, questionId, QuestionErrors.NotFound(questionId));
 
+    internal Result<Question> DetachQuestion(string questionId)
+    {
+        var q = FindQuestion(questionId);
+        if (q is null) return QuestionErrors.NotFound(questionId);
+        var rm = IndexedListReorderer.RemoveAndShiftUp(_questions, questionId, QuestionErrors.NotFound(questionId));
+        return rm.IsSuccess ? q : Result<Question>.Failure(rm.Error!);
+    }
+
     public Result ReorderQuestion(string questionId, int targetIndex, ReorderMode mode) =>
         IndexedListReorderer.Reorder(_questions, questionId, targetIndex, mode, QuestionErrors.NotFound(questionId));
+
+    public Result ReorderQuestionsExact(IReadOnlyList<string> orderedQuestionIds) =>
+        IndexedListReorderer.ApplyExactOrder(_questions, orderedQuestionIds, "question");
+
+    public Quiz CloneForComponent(
+        string newComponentId,
+        Func<string> newQuestionId,
+        Func<Question, string?>? resolveQuestionRef = null)
+    {
+        var clonedQuestions = _questions
+            .Select((q, idx) =>
+            {
+                var cloned = q.CloneWithNewId(newQuestionId(), newComponentId, resolveQuestionRef?.Invoke(q));
+                ((IIndexedEntity)cloned).SetIndexInternal(idx + 1);
+                return cloned;
+            })
+            .ToList();
+
+        return Rehydrate(newComponentId, Type, WorkingDirectory, clonedQuestions, Name, Description);
+    }
 
     public Question? FindQuestion(string questionId) =>
         _questions.FirstOrDefault(q => string.Equals(q.Id, questionId, StringComparison.Ordinal));

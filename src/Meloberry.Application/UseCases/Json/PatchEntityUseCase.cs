@@ -19,7 +19,13 @@ public sealed record PatchEntityCommand(
     string? InlineJson = null,
     IReadOnlyList<string>? SetPairs = null,
     string? MoveSpec = null,
-    string? AssetBaseDirectoryOverride = null);
+    string? AssetBaseDirectoryOverride = null,
+    string? MoveToTargetAddress = null,
+    int? MoveToIndex = null,
+    IReadOnlyList<string>? ExactOrderIds = null,
+    bool IsMarkdown = false,
+    string? MarkdownSubtype = null,
+    string? AttachedImagePath = null);
 
 public sealed record PatchEntityResponse(
     string TargetId,
@@ -74,12 +80,19 @@ public sealed class PatchEntityHandler(
 
     public async Task<Result<PatchEntityResponse>> HandleAsync(PatchEntityCommand command, CancellationToken cancellationToken = default)
     {
+        bool hasReorgOp = !string.IsNullOrWhiteSpace(command.MoveSpec) ||
+                          !string.IsNullOrWhiteSpace(command.MoveToTargetAddress) ||
+                          (command.ExactOrderIds is { Count: > 0 });
+
+        if (command.IsMarkdown)
+            return await HandleMarkdownPatchAsync(command, cancellationToken);
+
         if (string.IsNullOrWhiteSpace(command.JsonFilePath) &&
             command.InlineJson is null &&
             (command.SetPairs is null || command.SetPairs.Count == 0) &&
-            string.IsNullOrWhiteSpace(command.MoveSpec))
+            !hasReorgOp)
         {
-            return new Error("Patch.Empty", "Provide a patch JSON file/'-', --set k=v, or --move <idx>:<shift|exchange>.", ErrorType.Validation);
+            return new Error("Patch.Empty", "Provide a patch JSON file/'-', --set k=v, --move <idx>:<shift|exchange>, --to <targetComp>, or --order <ids>.", ErrorType.Validation);
         }
 
         var resolved = await addressResolver.ResolveAsync(command.Address, cancellationToken);
@@ -145,8 +158,8 @@ public sealed class PatchEntityHandler(
             }
         }
 
-        if (patchObj.Count == 0 && string.IsNullOrWhiteSpace(command.MoveSpec))
-            return new Error("Patch.Empty", "Patch payload contains no fields to update. Provide at least one field, --set k=v, or --move <idx>:<shift|exchange>.", ErrorType.Validation);
+        if (patchObj.Count == 0 && !hasReorgOp)
+            return new Error("Patch.Empty", "Patch payload contains no fields to update. Provide at least one field, --set k=v, --move, --to, or --order.", ErrorType.Validation);
 
         if (AllowedKeysByKind.TryGetValue(schemaKey, out var allowedKeys))
         {
@@ -184,7 +197,15 @@ public sealed class PatchEntityHandler(
             if (!mutateRes.IsSuccess) return mutateRes.Error!;
 
             int? newIndex = null;
-            if (!string.IsNullOrWhiteSpace(command.MoveSpec))
+            if (!string.IsNullOrWhiteSpace(command.MoveToTargetAddress))
+            {
+                var toRes = await ApplyMoveToAsync(target, command.MoveToTargetAddress, command.MoveToIndex, cancellationToken);
+                if (!toRes.IsSuccess) return toRes.Error!;
+                newIndex = toRes.Value;
+                updatedFields.Add("component");
+                updatedFields.Add("index");
+            }
+            else if (!string.IsNullOrWhiteSpace(command.MoveSpec))
             {
                 var moveRes = ApplyMove(target, command.MoveSpec);
                 if (!moveRes.IsSuccess) return moveRes.Error!;
@@ -192,7 +213,14 @@ public sealed class PatchEntityHandler(
                 updatedFields.Add("index");
             }
 
-            if (target.Session is not null && string.IsNullOrWhiteSpace(command.MoveSpec))
+            if (command.ExactOrderIds is { Count: > 0 })
+            {
+                var orderRes = ApplyExactOrder(target, command.ExactOrderIds);
+                if (!orderRes.IsSuccess) return orderRes.Error!;
+                updatedFields.Add("order");
+            }
+
+            if (target.Session is not null && !hasReorgOp)
             {
                 switch (target.EntityKind)
                 {
@@ -216,7 +244,7 @@ public sealed class PatchEntityHandler(
                         break;
                 }
             }
-            else if (target.Quiz is not null && string.IsNullOrWhiteSpace(command.MoveSpec))
+            else if (target.Quiz is not null && !hasReorgOp)
             {
                 switch (target.EntityKind)
                 {
@@ -255,6 +283,202 @@ public sealed class PatchEntityHandler(
         {
             if (!persisted)
                 ApplySpecHandler.CleanupNewlyAddedAssets(target.StorageDirectory, existingAssets);
+        }
+    }
+
+    private async Task<Result<PatchEntityResponse>> HandleMarkdownPatchAsync(
+        PatchEntityCommand command,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(command.JsonFilePath) &&
+            command.InlineJson is null &&
+            string.IsNullOrWhiteSpace(command.AttachedImagePath))
+        {
+            return new Error("Patch.Empty", "Provide a Markdown file/'-' or --image when using --md.", ErrorType.Validation);
+        }
+
+        var resolved = await addressResolver.ResolveAsync(command.Address, ct);
+        if (!resolved.IsSuccess) return resolved.Error!;
+        var target = resolved.Value;
+
+        if (target.EntityKind is not ("articleBlock" or "question"))
+        {
+            return new Error(
+                "Patch.UnsupportedMarkdownTarget",
+                $"Option '--md' only supports articleBlock or question targets (got '{target.EntityKind}').",
+                ErrorType.Validation);
+        }
+
+        bool hasBaseOverride = !string.IsNullOrWhiteSpace(command.AssetBaseDirectoryOverride);
+        string baseDir = hasBaseOverride
+            ? workingDirectoryProvider.NormalizeDirectoryPath(command.AssetBaseDirectoryOverride)
+            : workingDirectoryProvider.GetCurrentDirectory();
+
+        string rawFragment = string.Empty;
+        if (command.InlineJson is not null)
+        {
+            rawFragment = command.InlineJson.TrimStart('\uFEFF');
+        }
+        else if (!string.IsNullOrWhiteSpace(command.JsonFilePath))
+        {
+            if (!File.Exists(command.JsonFilePath))
+                return new Error("Json.FileNotFound", $"Markdown file '{command.JsonFilePath}' was not found.", ErrorType.NotFound);
+            rawFragment = (await File.ReadAllTextAsync(command.JsonFilePath, ct)).TrimStart('\uFEFF');
+            if (!hasBaseOverride)
+                baseDir = Path.GetDirectoryName(Path.GetFullPath(command.JsonFilePath)) ?? baseDir;
+        }
+
+        string topic = target.EntityKind == "articleBlock"
+            ? target.ArticleBlock!.Kind switch
+            {
+                ArticleBlockKind.Image => "image",
+                ArticleBlockKind.Callout => "callout",
+                ArticleBlockKind.Table => "table",
+                ArticleBlockKind.DiagramExplore => "diagram-explore",
+                ArticleBlockKind.Reveal => "reveal",
+                _ => "text"
+            }
+            : Question.ToWireString(target.Question!.Type);
+
+        var fragRes = await specLoader.ParseFragmentAsync(
+            topic,
+            rawFragment,
+            command.MarkdownSubtype,
+            command.AttachedImagePath,
+            cancellationToken: ct);
+        if (!fragRes.IsSuccess) return fragRes.Error!;
+        var spec = fragRes.Value;
+
+        var existingAssets = ApplySpecHandler.CaptureExistingAssets(target.StorageDirectory);
+        bool persisted = false;
+        try
+        {
+            if (target.EntityKind == "articleBlock")
+            {
+                if (spec.Blocks is not { Count: 1 })
+                    return new Error("Patch.InvalidMarkdownFragment", $"Expected exactly 1 '{topic}' article block in Markdown fragment.", ErrorType.Validation);
+
+                var bSpec = spec.Blocks[0];
+                if (!string.Equals(bSpec.Kind, topic, StringComparison.OrdinalIgnoreCase))
+                    return new Error("Patch.KindMismatch", $"Target block '{target.EntityId}' is '{topic}', cannot patch with '{bSpec.Kind}'.", ErrorType.Validation);
+
+                var matBlockRes = await MaterializeReplacementBlockAsync(target.ArticleBlock!, bSpec, target.StorageDirectory, baseDir, ct);
+                if (!matBlockRes.IsSuccess) return matBlockRes.Error!;
+
+                var repRes = target.Component!.ReplaceBlockAt(target.ArticleBlock!.Id, matBlockRes.Value);
+                if (!repRes.IsSuccess) return repRes.Error!;
+                await repository.SaveSessionAsync(target.Session!, ct);
+                persisted = true;
+                return new PatchEntityResponse(target.EntityId, target.EntityKind, target.WorkspaceId, UpdatedFields: ["markdown"]);
+            }
+
+            if (spec.Questions is not { Count: 1 })
+                return new Error("Patch.InvalidMarkdownFragment", $"Expected exactly 1 '{topic}' question in Markdown fragment.", ErrorType.Validation);
+
+            var qSpec = spec.Questions[0];
+            if (!string.Equals(qSpec.Type, topic, StringComparison.OrdinalIgnoreCase))
+                return new Error("Patch.KindMismatch", $"Target question '{target.EntityId}' is '{topic}', cannot patch with '{qSpec.Type}'.", ErrorType.Validation);
+
+            var effectiveQSpec = string.IsNullOrWhiteSpace(qSpec.Ref) && !string.IsNullOrWhiteSpace(target.Question!.RefKey)
+                ? qSpec with { Ref = target.Question.RefKey }
+                : qSpec;
+
+            var matQRes = await JsonQuestionMaterializer.MaterializeAsync(
+                target.Question!.Id,
+                target.Quiz!.Id,
+                target.Question.Index,
+                effectiveQSpec,
+                baseDir,
+                target.StorageDirectory,
+                contentInspector,
+                ct,
+                baseDir,
+                baseDir);
+            if (!matQRes.IsSuccess) return matQRes.Error!;
+
+            var repQRes = target.Quiz.ReplaceQuestionAt(target.Question.Id, matQRes.Value);
+            if (!repQRes.IsSuccess) return repQRes.Error!;
+
+            if (target.Session is not null)
+                await repository.SaveSessionAsync(target.Session, ct);
+            else
+                await repository.SaveQuizAsync(target.Quiz, ct);
+
+            persisted = true;
+            return new PatchEntityResponse(target.EntityId, target.EntityKind, target.WorkspaceId, UpdatedFields: ["markdown"]);
+        }
+        finally
+        {
+            if (!persisted)
+                ApplySpecHandler.CleanupNewlyAddedAssets(target.StorageDirectory, existingAssets);
+        }
+    }
+
+    private async Task<Result<ArticleBlock>> MaterializeReplacementBlockAsync(
+        ArticleBlock existing,
+        DeclarativeArticleBlockSpec spec,
+        string storageDir,
+        string baseDir,
+        CancellationToken ct)
+    {
+        var refKey = existing.RefKey;
+        switch (existing.Kind)
+        {
+            case ArticleBlockKind.Text:
+            {
+                var r = ArticleBlock.CreateText(existing.Id, existing.ComponentId, spec.Text ?? string.Empty);
+                if (!r.IsSuccess) return r.Error!;
+                r.Value.SetRefKey(refKey);
+                return r.Value;
+            }
+            case ArticleBlockKind.Image:
+            {
+                var imgRes = await JsonQuestionMaterializer.CopyConfinedImageAsync(spec.ImagePath, baseDir, storageDir, contentInspector, ct, baseDir, baseDir);
+                if (!imgRes.IsSuccess) return imgRes.Error!;
+                if (string.IsNullOrWhiteSpace(imgRes.Value)) return ArticleErrors.EmptyImagePath();
+                var block = ArticleBlock.CreateImage(existing.Id, existing.ComponentId, imgRes.Value, spec.Caption, spec.Alt);
+                block.SetRefKey(refKey);
+                return block;
+            }
+            case ArticleBlockKind.Callout:
+            {
+                CalloutTone tone = CalloutTone.Pearl;
+                if (!string.IsNullOrWhiteSpace(spec.Tone) && !ArticleBlock.TryParseCalloutTone(spec.Tone, out tone))
+                    return ArticleErrors.InvalidCalloutTone(spec.Tone);
+                var r = ArticleBlock.CreateCallout(existing.Id, existing.ComponentId, tone, spec.Text ?? string.Empty, spec.Title);
+                if (!r.IsSuccess) return r.Error!;
+                r.Value.SetRefKey(refKey);
+                return r.Value;
+            }
+            case ArticleBlockKind.Table:
+            {
+                var r = ArticleBlock.CreateTable(existing.Id, existing.ComponentId, spec.PayloadJson ?? string.Empty, spec.Title);
+                if (!r.IsSuccess) return r.Error!;
+                r.Value.SetRefKey(refKey);
+                return r.Value;
+            }
+            case ArticleBlockKind.DiagramExplore:
+            {
+                if (!Phase1PayloadCodec.TryDeserialize<DiagramExplorePayload>(spec.PayloadJson, out var diag) || diag is null)
+                    return ArticleErrors.InvalidDiagramExplorePayload("Invalid diagram-explore Markdown.");
+                var imgRes = await JsonQuestionMaterializer.CopyConfinedImageAsync(diag.ImagePath, baseDir, storageDir, contentInspector, ct, baseDir, baseDir);
+                if (!imgRes.IsSuccess) return imgRes.Error!;
+                if (string.IsNullOrWhiteSpace(imgRes.Value)) return ArticleErrors.EmptyImagePath();
+                var canonical = Phase1PayloadCodec.Serialize(diag with { ImagePath = imgRes.Value, SourceMasksPath = null });
+                var r = ArticleBlock.CreateDiagramExplore(existing.Id, existing.ComponentId, imgRes.Value, canonical, diag.Title ?? spec.Title, diag.Caption ?? spec.Caption, spec.Alt);
+                if (!r.IsSuccess) return r.Error!;
+                r.Value.SetRefKey(refKey);
+                return r.Value;
+            }
+            case ArticleBlockKind.Reveal:
+            {
+                var r = ArticleBlock.CreateReveal(existing.Id, existing.ComponentId, spec.PayloadJson ?? string.Empty, spec.Title);
+                if (!r.IsSuccess) return r.Error!;
+                r.Value.SetRefKey(refKey);
+                return r.Value;
+            }
+            default:
+                return ArticleErrors.WrongBlockKind(existing.Id, existing.Kind.ToString());
         }
     }
 
@@ -1759,6 +1983,105 @@ public sealed class PatchEntityHandler(
         if (normRes.Value is not null && quiz.Questions.Any(q => q.Id != self.Id && string.Equals(q.RefKey, normRes.Value, StringComparison.Ordinal)))
             return AddressErrors.DuplicateRef(normRes.Value);
         return self.SetRefKey(raw);
+    }
+
+    private async Task<Result<int>> ApplyMoveToAsync(
+        ResolvedEntity target,
+        string rawTargetSpec,
+        int? explicitIndex,
+        CancellationToken ct)
+    {
+        if (target.EntityKind is not ("articleBlock" or "question") || target.Session is null || target.Component is null)
+            return new Error("Patch.UnsupportedMove", "Cross-component '--to' only supports article blocks or session quiz questions.", ErrorType.Validation);
+
+        string targetCompAddr = rawTargetSpec.Trim();
+        int? targetIndex = explicitIndex;
+
+        if (!targetIndex.HasValue)
+        {
+            int lastColon = targetCompAddr.LastIndexOf(':');
+            if (lastColon > 1 && lastColon < targetCompAddr.Length - 1)
+            {
+                var suffix = targetCompAddr[(lastColon + 1)..];
+                if (!suffix.Contains('\\') && !suffix.Contains('/') && int.TryParse(suffix, NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsedIdx))
+                {
+                    targetCompAddr = targetCompAddr[..lastColon];
+                    targetIndex = parsedIdx;
+                }
+            }
+        }
+
+        var dstRes = await addressResolver.ResolveAsync(targetCompAddr, ct);
+        if (!dstRes.IsSuccess) return dstRes.Error!;
+        var dst = dstRes.Value;
+
+        if (dst.EntityKind != "component" || dst.Component is null || dst.Session is null)
+            return new Error("Patch.InvalidTarget", $"Target '--to' address '{targetCompAddr}' must resolve to a session component.", ErrorType.Validation);
+        if (!string.Equals(dst.Session.Id, target.Session.Id, StringComparison.Ordinal))
+            return new Error("Patch.CrossWorkspaceMove", $"Target component '{dst.Component.Id}' belongs to a different session.", ErrorType.Validation);
+
+        return target.EntityKind == "articleBlock"
+            ? target.Session.TransferBlock(target.EntityId, target.Component.Id, dst.Component.Id, targetIndex)
+            : target.Session.TransferQuestion(target.EntityId, target.Component.Id, dst.Component.Id, targetIndex);
+    }
+
+    private static Result ApplyExactOrder(ResolvedEntity target, IReadOnlyList<string> rawEntries)
+    {
+        static string NormalizeToken(string raw) => raw.Trim().TrimStart('#');
+
+        switch (target.EntityKind)
+        {
+            case "session":
+            {
+                var session = target.Session!;
+                var resolved = rawEntries.Select(entry =>
+                {
+                    var tok = NormalizeToken(entry);
+                    return session.Components.FirstOrDefault(c =>
+                        string.Equals(c.Id, tok, StringComparison.Ordinal) ||
+                        string.Equals(c.RefKey, tok, StringComparison.OrdinalIgnoreCase))?.Id ?? tok;
+                }).ToList();
+                return session.ReorderComponentsExact(resolved);
+            }
+            case "component":
+            {
+                var comp = target.Component!;
+                if (comp.Kind == ComponentKind.Article)
+                {
+                    var resolved = rawEntries.Select(entry =>
+                    {
+                        var tok = NormalizeToken(entry);
+                        return comp.ArticleBlocks.FirstOrDefault(b =>
+                            string.Equals(b.Id, tok, StringComparison.Ordinal) ||
+                            string.Equals(b.RefKey, tok, StringComparison.OrdinalIgnoreCase))?.Id ?? tok;
+                    }).ToList();
+                    return comp.ReorderBlocksExact(resolved);
+                }
+
+                var qResolved = rawEntries.Select(entry =>
+                {
+                    var tok = NormalizeToken(entry);
+                    return comp.Quiz!.Questions.FirstOrDefault(q =>
+                        string.Equals(q.Id, tok, StringComparison.Ordinal) ||
+                        string.Equals(q.RefKey, tok, StringComparison.OrdinalIgnoreCase))?.Id ?? tok;
+                }).ToList();
+                return comp.Quiz!.ReorderQuestionsExact(qResolved);
+            }
+            case "quiz":
+            {
+                var quiz = target.Quiz!;
+                var resolved = rawEntries.Select(entry =>
+                {
+                    var tok = NormalizeToken(entry);
+                    return quiz.Questions.FirstOrDefault(q =>
+                        string.Equals(q.Id, tok, StringComparison.Ordinal) ||
+                        string.Equals(q.RefKey, tok, StringComparison.OrdinalIgnoreCase))?.Id ?? tok;
+                }).ToList();
+                return quiz.ReorderQuestionsExact(resolved);
+            }
+            default:
+                return new Error("Patch.UnsupportedOrder", $"Option '--order' only supports session, component, or quiz containers (got '{target.EntityKind}').", ErrorType.Validation);
+        }
     }
 
     private static Result<int> ApplyMove(ResolvedEntity target, string moveSpec)

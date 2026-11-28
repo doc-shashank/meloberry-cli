@@ -2,6 +2,7 @@ using Meloberry.Domain.Common;
 using Meloberry.Domain.Errors;
 using Meloberry.Domain.Layouts;
 using Meloberry.Domain.Payloads;
+using Meloberry.Domain.Questions;
 using Meloberry.Domain.Quizzes;
 
 namespace Meloberry.Domain.Sessions;
@@ -162,6 +163,82 @@ public sealed class SessionComponent : IIndexedEntity
         Kind != ComponentKind.Article
             ? ComponentErrors.WrongKind(Id, "article")
             : IndexedListReorderer.RemoveAndShiftUp(_articleBlocks, artCompId, ArticleErrors.BlockNotFound(artCompId));
+
+    internal Result<ArticleBlock> DetachBlock(string blockId)
+    {
+        if (Kind != ComponentKind.Article) return ComponentErrors.WrongKind(Id, "article");
+        var block = FindBlock(blockId);
+        if (block is null) return ArticleErrors.BlockNotFound(blockId);
+        var rm = IndexedListReorderer.RemoveAndShiftUp(_articleBlocks, blockId, ArticleErrors.BlockNotFound(blockId));
+        return rm.IsSuccess ? block : Result<ArticleBlock>.Failure(rm.Error!);
+    }
+
+    internal Result<int> AttachBlock(ArticleBlock block, int? targetIndex = null) =>
+        InsertBlockAt(block, targetIndex);
+
+    public Result<int> InsertBlockAt(ArticleBlock block, int? targetIndex = null)
+    {
+        if (Kind != ComponentKind.Article) return ComponentErrors.WrongKind(Id, "article");
+        block.ReassignComponentInternal(Id);
+        return IndexedListReorderer.InsertAt(_articleBlocks, block, targetIndex);
+    }
+
+    public Result ReplaceBlockAt(string existingBlockId, ArticleBlock replacement)
+    {
+        if (Kind != ComponentKind.Article) return ComponentErrors.WrongKind(Id, "article");
+        int currentIdx = _articleBlocks.FindIndex(b => string.Equals(b.Id, existingBlockId, StringComparison.Ordinal));
+        if (currentIdx < 0) return ArticleErrors.BlockNotFound(existingBlockId);
+
+        int preservedIndex = _articleBlocks[currentIdx].Index;
+        replacement.ReassignComponentInternal(Id);
+        ((IIndexedEntity)replacement).SetIndexInternal(preservedIndex);
+        _articleBlocks[currentIdx] = replacement;
+        IndexedListReorderer.SortInPlace(_articleBlocks);
+        return Result.Success();
+    }
+
+    public Result ReorderBlocksExact(IReadOnlyList<string> orderedBlockIds) =>
+        Kind != ComponentKind.Article
+            ? ComponentErrors.WrongKind(Id, "article")
+            : IndexedListReorderer.ApplyExactOrder(_articleBlocks, orderedBlockIds, "articleBlock");
+
+    public SessionComponent CloneWithNewId(
+        string newComponentId,
+        string targetSessionId,
+        Func<string> newBlockId,
+        Func<string> newQuestionId,
+        string? newRefKey = null,
+        Func<ArticleBlock, string?>? resolveBlockRef = null,
+        Func<Question, string?>? resolveQuestionRef = null)
+    {
+        var clonedOverrides = _layoutOverrides.Count > 0
+            ? new Dictionary<string, string>(_layoutOverrides, StringComparer.OrdinalIgnoreCase)
+            : null;
+        var clonedBlocks = _articleBlocks
+            .Select((b, idx) =>
+            {
+                var cloned = b.CloneWithNewId(newBlockId(), newComponentId, resolveBlockRef?.Invoke(b));
+                ((IIndexedEntity)cloned).SetIndexInternal(idx + 1);
+                return cloned;
+            })
+            .ToList();
+        var clonedLinks = _linkCards
+            .Select(l => new ArticleLinkCard(l.Id, l.Title, l.Text, l.ImagePath))
+            .ToList();
+        var clonedQuiz = Quiz?.CloneForComponent(newComponentId, newQuestionId, resolveQuestionRef);
+
+        return Rehydrate(
+            newComponentId,
+            targetSessionId,
+            1,
+            Kind,
+            clonedQuiz,
+            clonedBlocks,
+            clonedOverrides,
+            Title,
+            newRefKey,
+            clonedLinks);
+    }
 
     public ArticleBlock? FindBlock(string artCompId) =>
         _articleBlocks.FirstOrDefault(b => string.Equals(b.Id, artCompId, StringComparison.Ordinal));

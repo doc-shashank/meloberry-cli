@@ -27,7 +27,11 @@ public sealed partial class BatchOperationsHandler(
     BuildWebAppHandler buildHandler,
     ExportPackageHandler exportHandler,
     SetLayoutPropertyHandler setLayoutHandler,
-    IChainTransactionManager? transactionManager = null)
+    IChainTransactionManager? transactionManager = null,
+    CloneEntityHandler? cloneHandler = null,
+    AddAssetHandler? addAssetHandler = null,
+    PruneAssetsHandler? pruneAssetsHandler = null,
+    ScaffoldHandler? scaffoldHandler = null)
 {
     [GeneratedRegex(@"\$(?<ref>prev|\d+)\.id", RegexOptions.IgnoreCase)]
     private static partial Regex IdPlaceholderRegex();
@@ -193,6 +197,10 @@ public sealed partial class BatchOperationsHandler(
                 bool dryRun = GetBool(obj, "dryRun");
                 bool verify = GetBool(obj, "verify");
                 bool staticOnly = GetBool(obj, "staticOnly");
+                bool allThemes = GetBool(obj, "allThemes");
+                bool signal = GetBool(obj, "signal");
+                var signalDir = GetString(obj, "signalDir");
+                int? insertAt = GetNullableInt(obj, "at");
                 if (!TryResolveTimeout(obj, out int timeout, out var timeoutErr))
                     return (false, null, null, timeoutErr);
                 if (!TryResolveStepBaseDir(out var stepBaseDir, out var baseDirErr))
@@ -217,7 +225,11 @@ public sealed partial class BatchOperationsHandler(
                         VerifyWeb: verify,
                         StaticVerifyOnly: staticOnly,
                         VerifyTimeoutSeconds: timeout,
-                        AssetBaseDirectoryOverride: effectiveBaseDir),
+                        AssetBaseDirectoryOverride: effectiveBaseDir,
+                        InsertAtIndex: insertAt,
+                        IncludeAllThemes: allThemes,
+                        EmitSignal: signal,
+                        SignalDirectory: signalDir),
                     ct);
                 return res.IsSuccess
                     ? (true, res.Value, res.Value.TargetId, null)
@@ -293,9 +305,22 @@ public sealed partial class BatchOperationsHandler(
                 var outDir = GetString(obj, "out");
                 bool verify = GetBool(obj, "verify");
                 bool staticOnly = GetBool(obj, "staticOnly");
+                bool allThemes = GetBool(obj, "allThemes");
+                bool signal = GetBool(obj, "signal");
+                var signalDir = GetString(obj, "signalDir");
                 if (!TryResolveTimeout(obj, out int timeout, out var timeoutErr))
                     return (false, null, null, timeoutErr);
-                var res = await buildHandler.HandleAsync(new BuildWebAppCommand(addr, outDir, Verify: verify, StaticVerifyOnly: staticOnly, VerifyTimeoutSeconds: timeout), ct);
+                var res = await buildHandler.HandleAsync(
+                    new BuildWebAppCommand(
+                        addr,
+                        outDir,
+                        Verify: verify,
+                        StaticVerifyOnly: staticOnly,
+                        VerifyTimeoutSeconds: timeout,
+                        IncludeAllThemes: allThemes,
+                        EmitSignal: signal,
+                        SignalDirectory: signalDir),
+                    ct);
                 return res.IsSuccess
                     ? (true, res.Value, res.Value.TargetId, null)
                     : (false, null, null, res.Error);
@@ -326,8 +351,128 @@ public sealed partial class BatchOperationsHandler(
                     : (false, null, null, res.Error);
             }
 
+            case "move":
+            {
+                var addr = ResolveAddr(GetString(obj, "addr") ?? GetString(obj, "target"));
+                if (string.IsNullOrWhiteSpace(addr))
+                    return (false, null, null, new Error("Batch.InvalidOp", "'move' requires 'addr'.", ErrorType.Validation));
+
+                var toAddr = ResolveAddr(GetString(obj, "to"));
+                var idx = GetNullableInt(obj, "index") ?? GetNullableInt(obj, "at");
+                var mode = GetString(obj, "mode") ?? "shift";
+
+                PatchEntityCommand cmd = !string.IsNullOrWhiteSpace(toAddr)
+                    ? new PatchEntityCommand(addr, MoveToTargetAddress: toAddr, MoveToIndex: idx)
+                    : idx.HasValue
+                        ? new PatchEntityCommand(addr, MoveSpec: $"{idx.Value}:{mode}")
+                        : null!;
+
+                if (cmd is null)
+                    return (false, null, null, new Error("Batch.InvalidOp", "'move' requires 'to' and/or 'index'.", ErrorType.Validation));
+
+                var res = await patchHandler.HandleAsync(cmd, ct);
+                return res.IsSuccess
+                    ? (true, res.Value, res.Value.TargetId, null)
+                    : (false, null, null, res.Error);
+            }
+
+            case "reorder":
+            {
+                var addr = ResolveAddr(GetString(obj, "addr") ?? GetString(obj, "target"));
+                if (string.IsNullOrWhiteSpace(addr))
+                    return (false, null, null, new Error("Batch.InvalidOp", "'reorder' requires 'addr'.", ErrorType.Validation));
+                if (GetNode(obj, "order") is not JsonArray orderArr || orderArr.Count == 0)
+                    return (false, null, null, new Error("Batch.InvalidOp", "'reorder' requires a non-empty 'order' array.", ErrorType.Validation));
+
+                var orderIds = new List<string>(orderArr.Count);
+                foreach (var item in orderArr)
+                {
+                    if (item is null || item.GetValueKind() != JsonValueKind.String)
+                        return (false, null, null, new Error("Batch.InvalidOp", "'reorder.order' entries must be strings.", ErrorType.Validation));
+                    orderIds.Add(item.GetValue<string>());
+                }
+
+                var res = await patchHandler.HandleAsync(new PatchEntityCommand(addr, ExactOrderIds: orderIds), ct);
+                return res.IsSuccess
+                    ? (true, res.Value, res.Value.TargetId, null)
+                    : (false, null, null, res.Error);
+            }
+
+            case "clone":
+            {
+                if (cloneHandler is null)
+                    return (false, null, null, new Error("Batch.InvalidOp", "'clone' handler is unavailable.", ErrorType.Failure));
+                var addr = ResolveAddr(GetString(obj, "addr") ?? GetString(obj, "target"));
+                if (string.IsNullOrWhiteSpace(addr))
+                    return (false, null, null, new Error("Batch.InvalidOp", "'clone' requires 'addr'.", ErrorType.Validation));
+
+                var toAddr = ResolveAddr(GetString(obj, "to"));
+                var atIdx = GetNullableInt(obj, "at");
+                var newRef = GetString(obj, "ref");
+
+                var res = await cloneHandler.HandleAsync(new CloneEntityCommand(addr, toAddr, atIdx, newRef), ct);
+                return res.IsSuccess
+                    ? (true, res.Value, res.Value.NewId, null)
+                    : (false, null, null, res.Error);
+            }
+
+            case "asset-add":
+            {
+                if (addAssetHandler is null)
+                    return (false, null, null, new Error("Batch.InvalidOp", "'asset-add' handler is unavailable.", ErrorType.Failure));
+                var addr = ResolveAddr(GetString(obj, "addr") ?? GetString(obj, "target"));
+                var targetDir = GetString(obj, "dir");
+                var file = ResolveStepFile(GetString(obj, "file") ?? GetString(obj, "path"));
+                if (string.IsNullOrWhiteSpace(file))
+                    return (false, null, null, new Error("Batch.InvalidOp", "'asset-add' requires 'file' (or 'path').", ErrorType.Validation));
+                var res = await addAssetHandler.HandleAsync(new AddAssetCommand(addr, file, targetDir), ct);
+                return res.IsSuccess
+                    ? (true, res.Value, addr, null)
+                    : (false, null, null, res.Error);
+            }
+
+            case "asset-prune":
+            {
+                if (pruneAssetsHandler is null)
+                    return (false, null, null, new Error("Batch.InvalidOp", "'asset-prune' handler is unavailable.", ErrorType.Failure));
+                var addr = ResolveAddr(GetString(obj, "addr") ?? GetString(obj, "target"));
+                if (string.IsNullOrWhiteSpace(addr))
+                    return (false, null, null, new Error("Batch.InvalidOp", "'asset-prune' requires 'addr'.", ErrorType.Validation));
+                bool dryRun = GetBool(obj, "dryRun");
+                var res = await pruneAssetsHandler.HandleAsync(new PruneAssetsCommand(addr, dryRun), ct);
+                return res.IsSuccess
+                    ? (true, res.Value, addr, null)
+                    : (false, null, null, res.Error);
+            }
+
+            case "scaffold":
+            {
+                if (scaffoldHandler is null)
+                    return (false, null, null, new Error("Batch.InvalidOp", "'scaffold' handler is unavailable.", ErrorType.Failure));
+                var bpNode = GetNode(obj, "blueprint") ?? GetNode(obj, "spec");
+                var file = ResolveStepFile(GetString(obj, "file"));
+                if (bpNode is null && string.IsNullOrWhiteSpace(file))
+                    return (false, null, null, new Error("Batch.InvalidOp", "'scaffold' requires 'blueprint'/'spec' object or 'file' path.", ErrorType.Validation));
+                if (!TryResolveStepBaseDir(out var stepBaseDir, out var baseDirErr))
+                    return (false, null, null, baseDirErr);
+
+                var fmt = GetString(obj, "format") ?? "md";
+                var outPath = GetString(obj, "out");
+                var applyWs = GetBool(obj, "apply");
+                var placeholders = GetBool(obj, "placeholders");
+                var applyOutDir = GetString(obj, "applyOut");
+                var effectiveBase = stepBaseDir ?? (bpNode is not null ? batchFileDir : null);
+
+                var res = await scaffoldHandler.HandleAsync(
+                    new ScaffoldCommand(file, bpNode?.ToJsonString(), fmt, outPath, applyWs, placeholders, applyOutDir, effectiveBase),
+                    ct);
+                return res.IsSuccess
+                    ? (true, res.Value, res.Value.Applied?.TargetId ?? res.Value.WrittenPath, null)
+                    : (false, null, null, res.Error);
+            }
+
             default:
-                return (false, null, null, new Error("Batch.UnknownOp", $"Unknown batch operation '{op}'. Supported: apply, patch, rm, check, build, pkg, layout.", ErrorType.Validation));
+                return (false, null, null, new Error("Batch.UnknownOp", $"Unknown batch operation '{op}'. Supported: apply, scaffold, patch, move, reorder, clone, asset-add, asset-prune, rm, check, build, pkg, layout.", ErrorType.Validation));
         }
     }
 
@@ -361,6 +506,12 @@ public sealed partial class BatchOperationsHandler(
     {
         var node = GetNode(obj, name);
         return node is JsonValue v && v.TryGetValue<bool>(out bool b) && b;
+    }
+
+    private static int? GetNullableInt(JsonObject obj, string name)
+    {
+        var node = GetNode(obj, name);
+        return node is JsonValue v && v.TryGetValue<int>(out int val) ? val : null;
     }
 
     private static bool TryResolveTimeout(JsonObject obj, out int timeout, out Error? error)

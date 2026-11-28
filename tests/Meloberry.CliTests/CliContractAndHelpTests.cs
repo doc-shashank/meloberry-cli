@@ -53,10 +53,11 @@ public sealed class CliContractAndHelpTests : IDisposable
         using (var doc = JsonDocument.Parse(cBlocks.StandardOutput))
         {
             var schemas = doc.RootElement.GetProperty("data").GetProperty("schemas");
-            Assert.Equal(6, schemas.GetArrayLength());
+            Assert.Equal(7, schemas.GetArrayLength());
             var topics = schemas.EnumerateArray().Select(s => s.GetProperty("topic").GetString()).ToList();
             Assert.Contains("diagram-explore", topics);
             Assert.Contains("reveal", topics);
+            Assert.Contains("link", topics);
         }
 
         var cQuestions = new TestConsole();
@@ -105,10 +106,13 @@ public sealed class CliContractAndHelpTests : IDisposable
     [InlineData("spec")]
     [InlineData("apply")]
     [InlineData("patch")]
+    [InlineData("clone")]
     [InlineData("get")]
     [InlineData("ls")]
     [InlineData("rm")]
     [InlineData("check")]
+    [InlineData("asset")]
+    [InlineData("scaffold")]
     [InlineData("build")]
     [InlineData("batch")]
     [InlineData("pkg")]
@@ -454,10 +458,53 @@ public sealed class CliContractAndHelpTests : IDisposable
             "spec.icons",
             "spec.nested",
             "pkg.import.metadata",
-            "batch.atomic"
+            "batch.atomic",
+            "spec.linkTopic",
+            "spec.modeGroups",
+            "spec.markdownTemplates",
+            "reorg.crossComponentMove",
+            "reorg.positionalInsert",
+            "reorg.clone",
+            "reorg.batchReorder",
+            "asset.cli",
+            "scaffold.cli",
+            "preset.mbypreset",
+            "markdown.roundTrip",
+            "prime.agentsMd",
+            "build.allThemes",
+            "build.signal",
+            "ls.web",
+            "analyze.ingest"
         })
         {
             Assert.Contains(required, caps);
+        }
+        Assert.Equal("2.2.0-beta-1", data.GetProperty("version").GetString());
+    }
+
+    [Fact]
+    public async Task SpecCommand_WithTemplatesAndLink_ExposesModeGroupsSupportsImageAndStarters()
+    {
+        var cLink = new TestConsole();
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["spec", "link", "--templates", "--json"], cLink, _fx.AppDataDir));
+        using (var linkDoc = JsonDocument.Parse(cLink.StandardOutput))
+        {
+            var schema = linkDoc.RootElement.GetProperty("data").GetProperty("schemas")[0];
+            Assert.Equal("link", schema.GetProperty("topic").GetString());
+            Assert.Equal("Hover Link Card", schema.GetProperty("displayName").GetString());
+            Assert.True(schema.GetProperty("supportsImage").GetBoolean());
+            Assert.False(string.IsNullOrWhiteSpace(schema.GetProperty("markdownHint").GetString()));
+            Assert.False(string.IsNullOrWhiteSpace(schema.GetProperty("markdownStarter").GetString()));
+        }
+
+        var cDefault = new TestConsole();
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["spec", "mcq", "--json"], cDefault, _fx.AppDataDir));
+        using (var defDoc = JsonDocument.Parse(cDefault.StandardOutput))
+        {
+            var mcq = defDoc.RootElement.GetProperty("data").GetProperty("schemas")[0];
+            Assert.True(mcq.GetProperty("supportsImage").GetBoolean());
+            Assert.True(mcq.TryGetProperty("modeGroups", out var mg) && mg.GetArrayLength() == 1);
+            Assert.False(mcq.TryGetProperty("markdownStarter", out _));
         }
     }
 
@@ -543,6 +590,150 @@ public sealed class CliContractAndHelpTests : IDisposable
                 Assert.True(nestedTypes.TryGetProperty(expectedType, out var fields), $"Missing nestedType '{expectedType}'.");
                 Assert.True(fields.GetArrayLength() > 0);
             }
+        }
+    }
+
+    [Fact]
+    public async Task V2_2_0_Commands_Flags_Signal_WebDiscovery_And_TelemetryIngest_WorkEndToEnd()
+    {
+        // 1. prime --format agents-md -o <file>
+        var agentsOut = Path.Combine(_fx.WorkDir, "AGENTS.md");
+        var primeC = new TestConsole();
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(
+            ["prime", "--topics", "mcq,link", "--container", "article", "--format", "agents-md", "--cli-prefix", ".\\mby-pc.bat mby", "-o", agentsOut, "--json"],
+            primeC, _fx.AppDataDir));
+        using (var doc = JsonDocument.Parse(primeC.StandardOutput))
+        {
+            var data = doc.RootElement.GetProperty("data");
+            Assert.Equal("2.2.0-beta-1", data.GetProperty("version").GetString());
+            Assert.True(data.GetProperty("approximateTokens").GetInt32() > 0);
+            Assert.Equal(Path.GetFullPath(agentsOut), data.GetProperty("writtenPath").GetString());
+        }
+        Assert.True(File.Exists(agentsOut));
+
+        // 2. scaffold - -o <dir> --placeholders --json -> apply <dir> -o <WorkDir>
+        var blueprintJson = """
+        {
+          "container": "session",
+          "title": "CLI v2.2 Blueprint",
+          "components": [
+            {
+              "id": "c1",
+              "kind": "article",
+              "title": "Chapter 1",
+              "selections": [{ "topic": "text", "enabled": true, "desiredCount": 2 }]
+            },
+            {
+              "id": "c2",
+              "kind": "article",
+              "title": "Chapter 2",
+              "selections": [{ "topic": "callout", "enabled": true, "desiredCount": 1 }]
+            }
+          ]
+        }
+        """;
+        var scaffoldDir = _fx.SubDir("scaffold_md");
+        var scaffoldC = new TestConsole(blueprintJson);
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(
+            ["scaffold", "-", "-o", scaffoldDir, "--placeholders", "--json"],
+            scaffoldC, _fx.AppDataDir));
+        using (var sDoc = JsonDocument.Parse(scaffoldC.StandardOutput))
+        {
+            var data = sDoc.RootElement.GetProperty("data");
+            Assert.Equal(scaffoldDir, data.GetProperty("writtenPath").GetString());
+        }
+
+        var applyScaffoldC = new TestConsole();
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(
+            ["apply", scaffoldDir, "-o", _fx.WorkDir, "--json"],
+            applyScaffoldC, _fx.AppDataDir));
+        string wsId;
+        using (var aDoc = JsonDocument.Parse(applyScaffoldC.StandardOutput))
+        {
+            wsId = aDoc.RootElement.GetProperty("data").GetProperty("targetId").GetString()!;
+            Assert.StartsWith("Session_", wsId);
+        }
+        var wsAddr = Path.Combine(_fx.WorkDir, wsId);
+
+        // 3. asset add / ls / prune
+        var pngPath = Path.Combine(_fx.WorkDir, "fig.png");
+        await TestAssets.WritePngAsync(pngPath);
+        var assetAddC = new TestConsole();
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["asset", "add", wsAddr, pngPath, "--json"], assetAddC, _fx.AppDataDir));
+        var assetLsC = new TestConsole();
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["asset", "ls", wsAddr, "--json"], assetLsC, _fx.AppDataDir));
+        Assert.Contains("\"isOrphan\":true", assetLsC.StandardOutput);
+        var assetPruneC = new TestConsole();
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["asset", "prune", wsAddr, "--json"], assetPruneC, _fx.AppDataDir));
+
+        // 4. clone, patch --md, patch --to --at, apply --at
+        var cloneC = new TestConsole();
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["clone", $"{wsAddr}#c1.b1", "--json"], cloneC, _fx.AppDataDir));
+
+        var patchMdC = new TestConsole("Patched markdown body");
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["patch", $"{wsAddr}#c1.b1", "--md", "-", "--json"], patchMdC, _fx.AppDataDir));
+
+        var moveC = new TestConsole();
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["patch", $"{wsAddr}#c1.b1", "--to", $"{wsAddr}#c2", "--at", "1", "--json"], moveC, _fx.AppDataDir));
+
+        var applyAtFile = Path.Combine(_fx.WorkDir, "inserted_comp.md");
+        await File.WriteAllTextAsync(applyAtFile, "---\nkind: article\ntitle: Inserted First\n---\n\nInserted paragraph.\n");
+        var applyAtC = new TestConsole();
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["apply", wsAddr, applyAtFile, "--at", "1", "--json"], applyAtC, _fx.AppDataDir));
+
+        // 5. get --view markdown -o <dir>
+        var mdExportDir = _fx.SubDir("exported_md");
+        var getMdC = new TestConsole();
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["get", wsAddr, "--view", "markdown", "-o", mdExportDir, "--json"], getMdC, _fx.AppDataDir));
+        Assert.True(File.Exists(Path.Combine(mdExportDir, "_session.md")));
+
+        // 6. build --all-themes --signal --signal-dir
+        var scanDir = _fx.SubDir("built_scan");
+        var webDir = Path.Combine(scanDir, "study_web");
+        var sigDir = _fx.SubDir("sig_root");
+        var buildC = new TestConsole();
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(
+            ["build", wsAddr, "-o", webDir, "--all-themes", "--signal", "--signal-dir", sigDir, "--json"],
+            buildC, _fx.AppDataDir));
+        Assert.True(File.Exists(Path.Combine(sigDir, ".mby-signal.txt")));
+        Assert.Contains("mby-theme-override", await File.ReadAllTextAsync(Path.Combine(webDir, "app.js")));
+
+        // 7. analyze --ingest - & ls --web
+        var rawReport = $$"""
+        {
+          "report": {
+            "schemaVersion": "1.0",
+            "workspaceId": "{{wsId}}",
+            "title": "CLI v2.2 Blueprint",
+            "startedAtUtc": "2026-11-28T07:00:00Z",
+            "completedAtUtc": "2026-11-28T07:02:00Z",
+            "totalDurationMs": 5000,
+            "summary": {
+              "totalSlides": 3,
+              "mcqTotal": 0,
+              "mcqCorrectFirstTry": 0,
+              "mcqCorrectFinal": 0,
+              "mcqAccuracyPercent": 0,
+              "flashcardTotal": 0,
+              "flashcardKnown": 0,
+              "flashcardNeedsReview": 0,
+              "articleSlidesViewed": 3
+            },
+            "slides": [],
+            "weakItemIds": []
+          }
+        }
+        """;
+        var ingestC = new TestConsole(rawReport);
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["analyze", webDir, "--ingest", "-", "--json"], ingestC, _fx.AppDataDir));
+
+        var lsWebC = new TestConsole();
+        Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["ls", scanDir, "--web", "--json"], lsWebC, _fx.AppDataDir));
+        using (var lsDoc = JsonDocument.Parse(lsWebC.StandardOutput))
+        {
+            var arr = lsDoc.RootElement.GetProperty("data");
+            Assert.Equal(1, arr.GetArrayLength());
+            Assert.Equal(1, arr[0].GetProperty("reportCount").GetInt32());
         }
     }
 

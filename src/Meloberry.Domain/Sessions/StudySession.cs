@@ -1,5 +1,6 @@
 using Meloberry.Domain.Common;
 using Meloberry.Domain.Errors;
+using Meloberry.Domain.Questions;
 using Meloberry.Domain.Quizzes;
 
 namespace Meloberry.Domain.Sessions;
@@ -89,6 +90,85 @@ public sealed class StudySession
 
     public Result ReorderComponent(string componentId, int targetIndex, ReorderMode mode) =>
         IndexedListReorderer.Reorder(_components, componentId, targetIndex, mode, ComponentErrors.NotFound(componentId));
+
+    public Result ReorderComponentsExact(IReadOnlyList<string> orderedComponentIds) =>
+        IndexedListReorderer.ApplyExactOrder(_components, orderedComponentIds, "component");
+
+    public Result<int> AttachComponent(SessionComponent component, int? targetIndex = null)
+    {
+        var insertResult = IndexedListReorderer.InsertAt(_components, component, targetIndex);
+        if (!insertResult.IsSuccess) return insertResult.Error!;
+        ActiveComponentId = component.Id;
+        return insertResult.Value;
+    }
+
+    public Result<int> TransferBlock(string blockId, string sourceCompId, string targetCompId, int? targetIndex = null)
+    {
+        var src = FindComponent(sourceCompId);
+        var dst = FindComponent(targetCompId);
+        if (src is null) return ComponentErrors.NotFound(sourceCompId);
+        if (dst is null) return ComponentErrors.NotFound(targetCompId);
+        if (src.Kind != ComponentKind.Article) return ComponentErrors.WrongKind(src.Id, "article");
+        if (dst.Kind != ComponentKind.Article) return ComponentErrors.WrongKind(dst.Id, "article");
+
+        if (src.Id == dst.Id)
+        {
+            if (src.FindBlock(blockId) is null) return ArticleErrors.BlockNotFound(blockId);
+            int maxSame = src.ArticleBlocks.Count;
+            if (targetIndex is int req && (req < 1 || req > maxSame + 1))
+                return IndexErrors.OutOfIndexBounds(req, 1, maxSame + 1);
+            int idx = Math.Clamp(targetIndex ?? maxSame, 1, maxSame);
+            var same = src.ReorderBlock(blockId, idx, ReorderMode.Shift);
+            return same.IsSuccess ? idx : Result<int>.Failure(same.Error!);
+        }
+
+        if (src.FindBlock(blockId) is null) return ArticleErrors.BlockNotFound(blockId);
+        int maxIdx = dst.ArticleBlocks.Count + 1;
+        int insertIdx = targetIndex ?? maxIdx;
+        if (insertIdx < 1 || insertIdx > maxIdx) return IndexErrors.OutOfIndexBounds(insertIdx, 1, maxIdx);
+
+        var detached = src.DetachBlock(blockId);
+        if (!detached.IsSuccess) return detached.Error!;
+        return dst.AttachBlock(detached.Value, insertIdx);
+    }
+
+    public Result<int> TransferQuestion(string questionId, string sourceCompId, string targetCompId, int? targetIndex = null)
+    {
+        var src = FindComponent(sourceCompId);
+        var dst = FindComponent(targetCompId);
+        if (src is null) return ComponentErrors.NotFound(sourceCompId);
+        if (dst is null) return ComponentErrors.NotFound(targetCompId);
+        if (src.Kind != ComponentKind.Quiz || src.Quiz is null) return ComponentErrors.WrongKind(src.Id, "quiz");
+        if (dst.Kind != ComponentKind.Quiz || dst.Quiz is null) return ComponentErrors.WrongKind(dst.Id, "quiz");
+
+        var existing = src.Quiz.FindQuestion(questionId);
+        if (existing is null) return QuestionErrors.NotFound(questionId);
+
+        if (src.Id == dst.Id)
+        {
+            int maxSame = src.Quiz.Questions.Count;
+            if (targetIndex is int req && (req < 1 || req > maxSame + 1))
+                return IndexErrors.OutOfIndexBounds(req, 1, maxSame + 1);
+            int idx = Math.Clamp(targetIndex ?? maxSame, 1, maxSame);
+            var same = src.Quiz.ReorderQuestion(questionId, idx, ReorderMode.Shift);
+            return same.IsSuccess ? idx : Result<int>.Failure(same.Error!);
+        }
+
+        if (dst.Quiz.Type == QuizType.Mcq && existing.Type != QuestionType.Mcq)
+            return QuizErrors.QuestionTypeMismatch(dst.Quiz.Id, "mcq", Question.ToWireString(existing.Type));
+        if (dst.Quiz.Type == QuizType.Flashcard && existing.Type != QuestionType.Flashcard)
+            return QuizErrors.QuestionTypeMismatch(dst.Quiz.Id, "flashcard", Question.ToWireString(existing.Type));
+
+        int maxIdx = dst.Quiz.Questions.Count + 1;
+        int insertIdx = targetIndex ?? maxIdx;
+        if (insertIdx < 1 || insertIdx > maxIdx) return IndexErrors.OutOfIndexBounds(insertIdx, 1, maxIdx);
+
+        var detached = src.Quiz.DetachQuestion(questionId);
+        if (!detached.IsSuccess) return detached.Error!;
+        detached.Value.ReassignContainerInternal(dst.Quiz.Id);
+        var ins = dst.Quiz.InsertQuestion(detached.Value, insertIdx);
+        return ins.IsSuccess ? insertIdx : Result<int>.Failure(ins.Error!);
+    }
 
     public Result DeleteComponent(string componentId)
     {

@@ -84,6 +84,19 @@ public abstract class Question : IIndexedEntity
         return resolved.Value.Value;
     }
 
+    internal void ReassignContainerInternal(string newContainerId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(newContainerId);
+        ContainerId = newContainerId;
+    }
+
+    public abstract Question CloneWithNewId(string newQuestionId, string targetContainerId, string? newRefKey = null);
+
+    protected Dictionary<string, string>? CloneLayoutOverrides() =>
+        _layoutOverrides.Count > 0
+            ? new Dictionary<string, string>(_layoutOverrides, StringComparer.OrdinalIgnoreCase)
+            : null;
+
     void IIndexedEntity.SetIndexInternal(int index)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(index);

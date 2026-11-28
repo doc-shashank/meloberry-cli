@@ -237,6 +237,27 @@ public sealed class ArticleBlock : IIndexedEntity
         return Result.Success();
     }
 
+    internal void ReassignComponentInternal(string newComponentId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(newComponentId);
+        ComponentId = newComponentId;
+    }
+
+    public ArticleBlock CloneWithNewId(string newBlockId, string targetComponentId, string? newRefKey = null) =>
+        Rehydrate(
+            newBlockId,
+            targetComponentId,
+            1,
+            Kind,
+            TextContent,
+            ImagePath,
+            newRefKey,
+            Caption,
+            Alt,
+            CalloutTone,
+            CalloutTitle,
+            PayloadJson);
+
     void IIndexedEntity.SetIndexInternal(int index)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(index);

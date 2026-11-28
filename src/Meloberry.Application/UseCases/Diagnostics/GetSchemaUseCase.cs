@@ -8,7 +8,20 @@ namespace Meloberry.Application.UseCases.Diagnostics;
 public sealed record GetSchemaQuery(
     IReadOnlyList<string>? Topics = null,
     bool IncludeIcons = false,
-    bool IncludeNested = false);
+    bool IncludeNested = false,
+    bool IncludeTemplates = false);
+
+public sealed record SchemaModeOptionSpec(
+    string Key,
+    string Label,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    string? IconKey = null);
+
+public sealed record SchemaModeGroupSpec(
+    string FieldName,
+    string Label,
+    bool MultiSelect,
+    IReadOnlyList<SchemaModeOptionSpec> Options);
 
 public sealed record SchemaFieldSpec(
     string Name,
@@ -31,7 +44,15 @@ public sealed record SchemaTopicDefinition(
     object Example,
     string Scope = "content",
     string Category = "question",
-    string? DisplayName = null);
+    string? DisplayName = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    IReadOnlyList<SchemaModeGroupSpec>? ModeGroups = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    bool? SupportsImage = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    string? MarkdownHint = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    string? MarkdownStarter = null);
 
 public sealed record GetSchemaResponse(
     IReadOnlyList<string> RequestedTopics,
@@ -66,6 +87,7 @@ public sealed class GetSchemaHandler(ISpecIconProvider? iconProvider = null)
         ["table"] = "Study Table",
         ["diagram-explore"] = "Interactive Diagram",
         ["reveal"] = "Step-by-Step Reveal",
+        ["link"] = "Hover Link Card",
         ["mcq"] = "Multiple Choice",
         ["flashcard"] = "Flashcard",
         ["fill-blank"] = "Fill in the Blank",
@@ -100,6 +122,7 @@ public sealed class GetSchemaHandler(ISpecIconProvider? iconProvider = null)
         new("table", "content", "block"),
         new("diagram-explore", "content", "block"),
         new("reveal", "content", "block"),
+        new("link", "content", "block"),
         new("mcq", "content", "question"),
         new("flashcard", "content", "question"),
         new("fill-blank", "content", "question"),
@@ -122,7 +145,7 @@ public sealed class GetSchemaHandler(ISpecIconProvider? iconProvider = null)
     ];
 
     public static readonly IReadOnlyList<string> SupportedTopics =
-        ["session", "article", "quiz", "text", "image", "mcq", "flashcard", "layouts", "callout", "markdown", "analyze", "pkg", "build", "batch", "patch", "table", "fill-blank", "assertion-reason", "spot-error", "diff", "mechanism", "relabel", "diagram-explore", "reveal", "case", "classify", "match", "numeric"];
+        ["session", "article", "quiz", "text", "image", "mcq", "flashcard", "layouts", "callout", "markdown", "analyze", "pkg", "build", "batch", "patch", "table", "fill-blank", "assertion-reason", "spot-error", "diff", "mechanism", "relabel", "diagram-explore", "reveal", "link", "case", "classify", "match", "numeric"];
 
     public static readonly IReadOnlyList<string> SupportedGroups =
         ["@content", "@containers", "@blocks", "@questions", "@other", "@formats", "@workflows"];
@@ -155,6 +178,7 @@ public sealed class GetSchemaHandler(ISpecIconProvider? iconProvider = null)
         ["table"] = BuildTableBlockSchema,
         ["diagram-explore"] = BuildDiagramExploreSchema,
         ["reveal"] = BuildRevealSchema,
+        ["link"] = BuildLinkSchema,
         ["fill-blank"] = BuildFillBlankSchema,
         ["assertion-reason"] = BuildAssertionReasonSchema,
         ["spot-error"] = BuildSpotErrorSchema,
@@ -221,7 +245,8 @@ public sealed class GetSchemaHandler(ISpecIconProvider? iconProvider = null)
             if (TopicSchemaBuilders.TryGetValue(t, out var builder))
             {
                 var def = builder();
-                schemas.Add(def with { DisplayName = def.DisplayName ?? TopicDisplayNames.GetValueOrDefault(t, t) });
+                def = def with { DisplayName = def.DisplayName ?? TopicDisplayNames.GetValueOrDefault(t, t) };
+                schemas.Add(SpecTopicUiMetadata.Enrich(def, query.IncludeTemplates));
             }
         }
 
@@ -999,6 +1024,33 @@ public sealed class GetSchemaHandler(ISpecIconProvider? iconProvider = null)
                 {
                     new { heading = "Cue 1", body = "Current density is proportional to electric field." }
                 }
+            },
+            Scope: "content",
+            Category: "block");
+
+    private static SchemaTopicDefinition BuildLinkSchema() =>
+        new(
+            Topic: "link",
+            CompactSignature: """
+                // Article hover link card (inside article.links[] or :::link{id="slug" title?="..." image?="path"} in Markdown)
+                { id:string, title?:string, text?:string, imagePath?:string }
+                // Inline reference: [label](mby://card/<id>)
+                """,
+            Command: "Inside article.links[] or :::link{id=\"slug\"} in Markdown",
+            Summary: "Article hover link card referenced inline via [text](mby://card/<id>) or :::link blocks.",
+            DisallowUnmappedProperties: true,
+            Fields:
+            [
+                new("id", "string", true, "Unique link card slug referenced via [text](mby://card/<id>)."),
+                new("title", "string", false, "Optional hover card header title."),
+                new("text", "string", false, "Hover card Markdown/KaTeX body text."),
+                new("imagePath", "string", false, "Optional hover card image path.")
+            ],
+            Example: new
+            {
+                id = "atp-synthase",
+                title = "ATP Synthase",
+                text = "Complex V uses the proton gradient to synthesize ATP."
             },
             Scope: "content",
             Category: "block");

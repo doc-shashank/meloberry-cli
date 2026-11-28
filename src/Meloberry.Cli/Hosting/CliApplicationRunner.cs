@@ -21,7 +21,10 @@ public static class CliServiceRegistration
         CliCommand[] commands =
         [
             new ApplyCliCommand(),
+            new ScaffoldCliCommand(),
             new PatchCliCommand(),
+            new CloneCliCommand(),
+            new AssetCliCommand(),
             new BatchCliCommand(),
             new RmCliCommand(),
             new BuildCliCommand(),
