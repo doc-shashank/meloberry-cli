@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Meloberry.Application.Abstractions;
+using Meloberry.Application.UseCases.Diagnostics;
 using Meloberry.Application.UseCases.Json;
 using Meloberry.Domain.Common;
 using Meloberry.Domain.Payloads;
@@ -409,7 +410,29 @@ public sealed class PayloadAndMarkdownTests : IDisposable
 
         var escapedOrder = await loader.LoadFromTextAsync("---\nkind: session\norder: [\"01-a\\\\\", \"02-b\"]\n---\n");
         Assert.True(escapedOrder.IsSuccess);
-        Assert.Equal(@"01-a\\", escapedOrder.Value.Order![0]);
+        Assert.Equal(@"01-a\", escapedOrder.Value.Order![0]);
+
+        // Round-trip KaTeX backslashes & quotes across callout, table, and standalone image caption
+        const string katexTitle = @"$\text{Na}^+$ & ""K""";
+        var calloutBlk = ArticleBlock.CreateCallout("ArtComp_rt1", "Component_rt", CalloutTone.Clinical, "Body text", katexTitle).Value;
+        var tableBlk = ArticleBlock.CreateTable(
+            "ArtComp_rt2",
+            "Component_rt",
+            Phase1PayloadCodec.Serialize(new TableBlockPayload(katexTitle, @"Caption $\frac{1}{2}$", false, [], ["Ion"], ["left"], [["Na+"]], null)),
+            katexTitle).Value;
+        var rtImgBlk = ArticleBlock.CreateImage("ArtComp_rt3", "Component_rt", "assets/fig.png", caption: @"Fig ""1"" $\text{Na}^+$", alt: "Ion fig");
+        var projectedDoc = $"---\nkind: article\ntitle: \"RoundTrip\"\n---\n\n" +
+            $"{WorkspaceMarkdownProjector.ProjectBlockToMarkdown(calloutBlk)}\n\n" +
+            $"{WorkspaceMarkdownProjector.ProjectBlockToMarkdown(tableBlk)}\n\n" +
+            $"{WorkspaceMarkdownProjector.ProjectBlockToMarkdown(rtImgBlk)}\n";
+        var reparsedDoc = await loader.LoadFromTextAsync(projectedDoc);
+        Assert.True(reparsedDoc.IsSuccess, reparsedDoc.Error?.Description);
+        Assert.Equal(3, reparsedDoc.Value.Blocks!.Count);
+        Assert.Equal(katexTitle, reparsedDoc.Value.Blocks[0].Title);
+        Assert.True(Phase1PayloadCodec.TryDeserialize<TableBlockPayload>(reparsedDoc.Value.Blocks[1].PayloadJson, out var rtTbl));
+        Assert.Equal(katexTitle, rtTbl!.Title);
+        Assert.Equal(@"Caption $\frac{1}{2}$", rtTbl.Caption);
+        Assert.Equal(@"Fig ""1"" $\text{Na}^+$", reparsedDoc.Value.Blocks[2].Caption);
 
         // 3. Standalone auto-detected Markdown quiz + plain paragraph + inline layoutOverrides
         var standalone = await apply.HandleAsync(new ApplySpecCommand(null, null, InlineJson: "# Quick Auto Quiz\n\n:::mcq\nForce?\n- [x] Newton\n- [ ] Joule\n:::\n", WorkingDirectory: _fx.WorkDir));

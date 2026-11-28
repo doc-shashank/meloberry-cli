@@ -20,7 +20,7 @@ public sealed class CliContractAndHelpTests : IDisposable
     public void Dispose() => _fx.Dispose();
 
     [Fact]
-    public async Task Prime_And_SpecCatalog_ExposeAll28TopicsAndGroups_WithinCrlfBudget()
+    public async Task Prime_And_SpecCatalog_ExposeAll29TopicsAndGroups_WithinCrlfBudget()
     {
         var cEmpty = new TestConsole();
         Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync([], cEmpty, _fx.AppDataDir));
@@ -479,7 +479,7 @@ public sealed class CliContractAndHelpTests : IDisposable
         {
             Assert.Contains(required, caps);
         }
-        Assert.Equal("2.2.0-beta-1", data.GetProperty("version").GetString());
+        Assert.Equal("2.2.0-beta-2", data.GetProperty("version").GetString());
     }
 
     [Fact]
@@ -605,7 +605,7 @@ public sealed class CliContractAndHelpTests : IDisposable
         using (var doc = JsonDocument.Parse(primeC.StandardOutput))
         {
             var data = doc.RootElement.GetProperty("data");
-            Assert.Equal("2.2.0-beta-1", data.GetProperty("version").GetString());
+            Assert.Equal("2.2.0-beta-2", data.GetProperty("version").GetString());
             Assert.True(data.GetProperty("approximateTokens").GetInt32() > 0);
             Assert.Equal(Path.GetFullPath(agentsOut), data.GetProperty("writtenPath").GetString());
         }

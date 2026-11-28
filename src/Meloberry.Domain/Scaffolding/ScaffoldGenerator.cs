@@ -41,6 +41,13 @@ public static class ScaffoldGenerator
         if (active.Count == 0)
             return new Error("Scaffold.EmptyBlueprint", "Cannot scaffold an empty blueprint. Add an Article or Quiz component first.", ErrorType.Validation);
 
+        foreach (var comp in active)
+        {
+            var invalidQty = comp.Selections.FirstOrDefault(s => s.Enabled && s.DesiredCount is <= 0);
+            if (invalidQty is not null)
+                return new Error("Scaffold.InvalidQty", $"Spec '{invalidQty.Topic}' in '{comp.Title}' has non-positive Qty.", ErrorType.Validation);
+        }
+
         var title = string.IsNullOrWhiteSpace(blueprint.Title) ? "Study Module" : blueprint.Title.Trim();
         var slug = Slugify(title, "study_module");
         var files = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -733,7 +740,9 @@ public static class ScaffoldGenerator
                         ["rows"] = new[] { new[] { "Property 1", cellA, cellB } },
                         ["explanation"] = $"Comparison explanation {num}."
                     };
-                    if (modes.Contains("bank", StringComparer.OrdinalIgnoreCase)) diffObj["bank"] = true;
+                    if (modes.Contains("bank", StringComparer.OrdinalIgnoreCase) ||
+                        string.Equals(inst.Subtype, "bank", StringComparison.OrdinalIgnoreCase))
+                        diffObj["bank"] = true;
                     questions.Add(diffObj);
                     break;
                 }
@@ -1071,7 +1080,11 @@ public static class ScaffoldGenerator
     };
 
     private static string YamlQuote(string value) =>
-        "\"" + value.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal) + "\"";
+        "\"" + value.Replace("\r\n", " ", StringComparison.Ordinal)
+                    .Replace('\r', ' ')
+                    .Replace('\n', ' ')
+                    .Replace("\\", "\\\\", StringComparison.Ordinal)
+                    .Replace("\"", "\\\"", StringComparison.Ordinal) + "\"";
 
     private static string Slugify(string raw, string fallback)
     {

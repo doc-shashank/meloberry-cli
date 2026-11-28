@@ -464,8 +464,41 @@ public sealed class PatchEntityHandler(
                 var imgRes = await JsonQuestionMaterializer.CopyConfinedImageAsync(diag.ImagePath, baseDir, storageDir, contentInspector, ct, baseDir, baseDir);
                 if (!imgRes.IsSuccess) return imgRes.Error!;
                 if (string.IsNullOrWhiteSpace(imgRes.Value)) return ArticleErrors.EmptyImagePath();
-                var canonical = Phase1PayloadCodec.Serialize(diag with { ImagePath = imgRes.Value, SourceMasksPath = null });
-                var r = ArticleBlock.CreateDiagramExplore(existing.Id, existing.ComponentId, imgRes.Value, canonical, diag.Title ?? spec.Title, diag.Caption ?? spec.Caption, spec.Alt);
+
+                var cwd = workingDirectoryProvider.GetCurrentDirectory();
+                IReadOnlyList<DiagramHotspot> hotspots;
+                if (!string.IsNullOrWhiteSpace(diag.SourceMasksPath))
+                {
+                    var sidecarRes = JsonQuestionMaterializer.ResolveConfinedSidecarFile(diag.SourceMasksPath, baseDir, baseDir, cwd);
+                    if (!sidecarRes.IsSuccess) return sidecarRes.Error!;
+                    var rawSidecar = await File.ReadAllTextAsync(sidecarRes.Value, ct);
+                    var boxesRes = Phase2PayloadRules.ParseMaskSidecarJson(rawSidecar);
+                    if (!boxesRes.IsSuccess) return boxesRes.Error!;
+                    var annotations = (diag.Hotspots ?? [])
+                        .Where(h => h is not null)
+                        .Select(h => new DiagramHotspotAnnotation(h.Label ?? string.Empty, h.Note ?? string.Empty))
+                        .ToList();
+                    var resolvedHotspots = Phase3PayloadRules.ResolveHotspotsFromSidecar(boxesRes.Value, annotations);
+                    if (!resolvedHotspots.IsSuccess) return resolvedHotspots.Error!;
+                    hotspots = resolvedHotspots.Value;
+                }
+                else
+                {
+                    hotspots = (diag.Hotspots ?? [])
+                        .Where(h => h is not null)
+                        .Select((h, idx) => new DiagramHotspot(idx, h.Label?.Trim() ?? string.Empty, h.Note?.Trim() ?? string.Empty, h.X, h.Y, h.W, h.H))
+                        .ToList();
+                }
+
+                var diagTitle = diag.Title ?? spec.Title;
+                var diagCaption = diag.Caption ?? spec.Caption;
+                var canonical = Phase1PayloadCodec.Serialize(new DiagramExplorePayload(
+                    imgRes.Value,
+                    string.IsNullOrWhiteSpace(diagTitle) ? null : diagTitle.Trim(),
+                    string.IsNullOrWhiteSpace(diagCaption) ? null : diagCaption.Trim(),
+                    hotspots,
+                    SourceMasksPath: null));
+                var r = ArticleBlock.CreateDiagramExplore(existing.Id, existing.ComponentId, imgRes.Value, canonical, diagTitle, diagCaption, spec.Alt);
                 if (!r.IsSuccess) return r.Error!;
                 r.Value.SetRefKey(refKey);
                 return r.Value;
@@ -1503,14 +1536,21 @@ public sealed class PatchEntityHandler(
                     if (bN is not JsonArray bArr || bArr.Count == 0)
                         return new Error("Patch.InvalidValue", "'buckets' must be a non-empty array.", ErrorType.Validation, Path: "buckets");
                     var parsedB = new List<ClassifyBucket>(bArr.Count);
+                    var seenBucketIds = new HashSet<int>();
                     for (int i = 0; i < bArr.Count; i++)
                     {
                         var el = bArr[i];
                         if (el is JsonValue sv && sv.GetValueKind() == JsonValueKind.String)
+                        {
+                            if (!seenBucketIds.Add(i))
+                                return new Error("Patch.InvalidValue", $"Duplicate classify bucketId {i} at index {i}.", ErrorType.Validation, Path: "buckets");
                             parsedB.Add(new ClassifyBucket(i, sv.GetValue<string>().Trim()));
+                        }
                         else if (el is JsonObject bo && TryGetProp(bo, "name", out var bn) && bn is not null && bn.GetValueKind() == JsonValueKind.String)
                         {
                             int bid = TryGetProp(bo, "bucketId", out var bi) && bi is JsonValue biv && biv.TryGetValue<int>(out var bIdVal) ? bIdVal : i;
+                            if (!seenBucketIds.Add(bid))
+                                return new Error("Patch.InvalidValue", $"Duplicate classify bucketId {bid} at index {i}.", ErrorType.Validation, Path: "buckets");
                             parsedB.Add(new ClassifyBucket(bid, bn.GetValue<string>().Trim()));
                         }
                         else return new Error("Patch.InvalidValue", $"Classify bucket at index {i} must be string or {{bucketId, name}}.", ErrorType.Validation, Path: "buckets");

@@ -34,7 +34,7 @@ public static class WorkspaceMarkdownProjector
         if (!string.IsNullOrWhiteSpace(session.Name))
             sb.AppendLine($"name: {YamlQuote(session.Name)}");
         if (!string.IsNullOrWhiteSpace(session.Description))
-            sb.AppendLine($"description: {YamlQuote(session.Description)}");
+            AppendYamlField(sb, "", "description", session.Description);
         if (order.Count > 0)
         {
             sb.AppendLine("order:");
@@ -98,7 +98,7 @@ public static class WorkspaceMarkdownProjector
             if (!string.IsNullOrWhiteSpace(quiz.Name))
                 sb.AppendLine($"name: {YamlQuote(quiz.Name)}");
             if (!string.IsNullOrWhiteSpace(quiz.Description))
-                sb.AppendLine($"description: {YamlQuote(quiz.Description)}");
+                AppendYamlField(sb, "", "description", quiz.Description);
         }
         else if (!string.IsNullOrWhiteSpace(componentTitle))
         {
@@ -125,7 +125,7 @@ public static class WorkspaceMarkdownProjector
 
             case ArticleBlockKind.Image:
             {
-                var alt = block.Alt ?? string.Empty;
+                var alt = (block.Alt ?? string.Empty).Replace("\r\n", " ", StringComparison.Ordinal).Replace('\r', ' ').Replace('\n', ' ');
                 var target = MarkdownSmartWrapper.FormatMarkdownImageTarget(block.ImagePath ?? string.Empty);
                 return string.IsNullOrWhiteSpace(block.Caption)
                     ? $"![{alt}]({target})"
@@ -187,7 +187,7 @@ public static class WorkspaceMarkdownProjector
                 foreach (var hs in diag?.Hotspots ?? [])
                 {
                     sb.AppendLine($"  - label: {YamlQuote(hs.Label)}");
-                    sb.AppendLine($"    note: {YamlQuote(hs.Note)}");
+                    AppendYamlField(sb, "    ", "note", hs.Note);
                     sb.AppendLine(FormattableString.Invariant($"    rect: [{hs.X:G}, {hs.Y:G}, {hs.W:G}, {hs.H:G}]"));
                 }
                 sb.Append(":::");
@@ -417,7 +417,7 @@ public static class WorkspaceMarkdownProjector
                     if (rel.CaseSensitive) attrs.Add("caseSensitive=true");
                 }
                 sb.AppendLine($"{fence}relabel{{{string.Join(' ', attrs)}}}");
-                if (!string.IsNullOrWhiteSpace(rel?.Prompt)) sb.AppendLine($"prompt: {YamlQuote(rel.Prompt)}");
+                if (!string.IsNullOrWhiteSpace(rel?.Prompt)) AppendYamlField(sb, "", "prompt", rel.Prompt);
                 if (rel?.Distractors is { Count: > 0 })
                 {
                     sb.AppendLine("distractors:");
@@ -533,7 +533,7 @@ public static class WorkspaceMarkdownProjector
         IReadOnlyList<IReadOnlyList<string>> rows)
     {
         if (headers.Count == 0) return;
-        sb.AppendLine("| " + string.Join(" | ", headers) + " |");
+        sb.AppendLine("| " + string.Join(" | ", headers.Select(EscapeTableCell)) + " |");
         var seps = new string[headers.Count];
         for (int i = 0; i < headers.Count; i++)
         {
@@ -547,7 +547,51 @@ public static class WorkspaceMarkdownProjector
         }
         sb.AppendLine("| " + string.Join(" | ", seps) + " |");
         foreach (var row in rows)
-            sb.AppendLine("| " + string.Join(" | ", row) + " |");
+            sb.AppendLine("| " + string.Join(" | ", row.Select(EscapeTableCell)) + " |");
+    }
+
+    private static string EscapeTableCell(string? rawCell)
+    {
+        if (string.IsNullOrEmpty(rawCell)) return string.Empty;
+        var text = rawCell.Replace("\r\n", "<br>", StringComparison.Ordinal)
+                          .Replace("\r", "<br>", StringComparison.Ordinal)
+                          .Replace("\n", "<br>", StringComparison.Ordinal);
+
+        var sb = new StringBuilder(text.Length);
+        int i = 0;
+        while (i < text.Length)
+        {
+            if (Phase1PayloadRules.TrySkipInlineCodeSpan(text, i, out int afterCode))
+            {
+                sb.Append(text, i, afterCode - i);
+                i = afterCode;
+                continue;
+            }
+            if (Phase1PayloadRules.TrySkipMathSpan(text, i, out int afterMath))
+            {
+                sb.Append(text, i, afterMath - i);
+                i = afterMath;
+                continue;
+            }
+            if (i + 1 < text.Length && text[i] == '{' && text[i + 1] == '{')
+            {
+                int close = text.IndexOf("}}", i + 2, StringComparison.Ordinal);
+                if (close > i)
+                {
+                    sb.Append(text, i, (close + 2) - i);
+                    i = close + 2;
+                    continue;
+                }
+            }
+            if (text[i] == '|' && !Phase1PayloadRules.IsEscaped(text, i))
+            {
+                sb.Append(@"\|");
+                i++;
+                continue;
+            }
+            sb.Append(text[i++]);
+        }
+        return sb.ToString();
     }
 
     private static void AppendExplanationAndLayout(
@@ -580,11 +624,33 @@ public static class WorkspaceMarkdownProjector
             sb.AppendLine($"  {kv.Key}: {YamlQuote(kv.Value)}");
     }
 
+    private static void AppendYamlField(StringBuilder sb, string indent, string key, string value)
+    {
+        var normalized = value.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
+        if (!normalized.Contains('\n'))
+        {
+            sb.AppendLine($"{indent}{key}: {YamlQuote(normalized)}");
+            return;
+        }
+
+        sb.AppendLine($"{indent}{key}: |");
+        foreach (var line in normalized.Split('\n'))
+            sb.AppendLine($"{indent}  {line}");
+    }
+
     private static string YamlQuote(string value) =>
-        "\"" + value.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal) + "\"";
+        "\"" + value.Replace("\r\n", " ", StringComparison.Ordinal)
+                    .Replace('\r', ' ')
+                    .Replace('\n', ' ')
+                    .Replace("\\", "\\\\", StringComparison.Ordinal)
+                    .Replace("\"", "\\\"", StringComparison.Ordinal) + "\"";
 
     private static string EscapeAttr(string value) =>
-        value.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal);
+        value.Replace("\r\n", " ", StringComparison.Ordinal)
+             .Replace('\r', ' ')
+             .Replace('\n', ' ')
+             .Replace("\\", "\\\\", StringComparison.Ordinal)
+             .Replace("\"", "\\\"", StringComparison.Ordinal);
 
     private static string Slugify(string? raw, string fallback)
     {

@@ -1045,6 +1045,125 @@ public sealed class AddressPatchAndLintTests : IDisposable
         Assert.True(lintRes.Value.IsClean, string.Join("; ", lintRes.Value.Issues.Select(i => $"{i.Code}: {i.Message}")));
     }
 
+    [Fact]
+    public async Task Lint_DetectsDuplicateLinkCardIdAcrossArticles_And_RejectsDuplicateClassifyBucketIds()
+    {
+        using var sp = _fx.CreateProvider();
+        using var scope = sp.CreateScope();
+        var apply = scope.ServiceProvider.GetRequiredService<ApplySpecHandler>();
+        var patch = scope.ServiceProvider.GetRequiredService<PatchEntityHandler>();
+        var lint = scope.ServiceProvider.GetRequiredService<LintHandler>();
+        var repo = scope.ServiceProvider.GetRequiredService<IWorkspaceRepository>();
+
+        // Fix #6: Duplicate hover link card IDs across two articles in one session
+        var dupDir = _fx.SubDir("dup_link_cards");
+        await File.WriteAllTextAsync(Path.Combine(dupDir, "_session.md"), "---\nkind: session\nname: Dup Links\norder:\n  - 01-a.md\n  - 02-b.md\n---\n");
+        await File.WriteAllTextAsync(Path.Combine(dupDir, "01-a.md"), """
+            ---
+            title: Article A
+            ---
+            See [note](mby://card/dup-note).
+
+            :::link{id="dup-note" title="First"}
+            First body.
+            :::
+            """);
+        await File.WriteAllTextAsync(Path.Combine(dupDir, "02-b.md"), """
+            ---
+            title: Article B
+            ---
+            See [note](mby://card/dup-note).
+
+            :::link{id="dup-note" title="Second"}
+            Second body.
+            :::
+            """);
+        var dupApply = await apply.HandleAsync(new ApplySpecCommand(null, dupDir, WorkingDirectory: _fx.WorkDir));
+        Assert.True(dupApply.IsSuccess, dupApply.Error?.Description);
+        var dupLint = await lint.HandleAsync(new LintCommand(dupApply.Value.TargetId));
+        Assert.True(dupLint.IsSuccess);
+        Assert.Contains(dupLint.Value.Issues, i => i.Code == "Lint.DuplicateLinkCardId");
+
+        // Fix #9a: Duplicate classify bucketId rejected on apply
+        var dupBucketApplyJson = """
+        {
+          "kind": "quiz",
+          "quizType": "mixed",
+          "name": "Dup Classify Apply",
+          "questions": [
+            {
+              "type": "classify",
+              "title": "Sort Ions",
+              "buckets": [
+                { "bucketId": 0, "name": "Cations" },
+                { "bucketId": 0, "name": "Anions" }
+              ],
+              "items": [
+                { "text": "Na+", "bucketId": 0 }
+              ]
+            }
+          ]
+        }
+        """;
+        var dupBucketApplyRes = await apply.HandleAsync(new ApplySpecCommand(null, null, dupBucketApplyJson, _fx.WorkDir));
+        Assert.False(dupBucketApplyRes.IsSuccess);
+        Assert.Equal("Json.InvalidQuestion", dupBucketApplyRes.Error!.Code);
+
+        // Fix #9b: Duplicate classify bucketId rejected on patch
+        var validClassifyJson = """
+        {
+          "kind": "quiz",
+          "quizType": "mixed",
+          "name": "Valid Classify",
+          "questions": [
+            {
+              "type": "classify",
+              "title": "Sort Ions",
+              "buckets": [
+                { "bucketId": 0, "name": "Cations" },
+                { "bucketId": 1, "name": "Anions" }
+              ],
+              "items": [
+                { "text": "Na+", "bucketId": 0 },
+                { "text": "Cl-", "bucketId": 1 }
+              ]
+            }
+          ]
+        }
+        """;
+        var validApplyRes = await apply.HandleAsync(new ApplySpecCommand(null, null, validClassifyJson, _fx.WorkDir));
+        Assert.True(validApplyRes.IsSuccess, validApplyRes.Error?.Description);
+        var quizId = validApplyRes.Value.TargetId;
+
+        var dupPatchJson = """
+        {
+          "buckets": [
+            "Cations",
+            { "bucketId": 0, "name": "Anions" }
+          ]
+        }
+        """;
+        var dupPatchRes = await patch.HandleAsync(new PatchEntityCommand($"{quizId}#q1", InlineJson: dupPatchJson));
+        Assert.False(dupPatchRes.IsSuccess);
+        Assert.Equal("Patch.InvalidValue", dupPatchRes.Error!.Code);
+
+        // Fix #9c: Corrupted DB with duplicate classify bucketId caught by Lint
+        var loadedQuiz = await repo.FindQuizContainerAsync(quizId);
+        Assert.NotNull(loadedQuiz);
+        var pq = Assert.IsType<PayloadQuestion>(loadedQuiz!.Quiz.Questions[0]);
+        var corruptedPayload = Phase1PayloadCodec.Serialize(new ClassifyPayload(
+            "Sort Ions",
+            [new ClassifyBucket(0, "Cations"), new ClassifyBucket(0, "Anions")],
+            [new ClassifyItem(0, 0, "Na+"), new ClassifyItem(1, 0, "Cl-")],
+            null));
+        Assert.True(pq.SetPayloadJson(corruptedPayload).IsSuccess);
+        await repo.SaveOwnerAsync(loadedQuiz);
+
+        var corruptLint = await lint.HandleAsync(new LintCommand(quizId));
+        Assert.True(corruptLint.IsSuccess);
+        Assert.Contains(corruptLint.Value.Issues, i => i.Code == "Lint.DuplicateClassifyBucket" && i.Message.Contains("bucketId", StringComparison.OrdinalIgnoreCase));
+    }
+
     private sealed class FixedWorkingDirectoryProvider(string currentDir) : IWorkingDirectoryProvider
     {
         public string GetCurrentDirectory() => currentDir;

@@ -76,6 +76,26 @@ public sealed class PrimeAgentsAndBuildExtensionsTests : IDisposable
         Assert.Contains("### `link`", text);
         Assert.Contains("### `markdown`", text);
         Assert.DoesNotContain("### `flashcard`", text);
+
+        // Fix #5: layouts topic and @other group are included in agents-md output
+        var layoutsOnly = await handler.HandleAsync(new GetPrimeGuideQuery(
+            Topics: ["layouts"],
+            Format: "agents-md"));
+        Assert.True(layoutsOnly.IsSuccess, layoutsOnly.Error?.Description);
+        Assert.NotNull(layoutsOnly.Value.IncludedTopics);
+        Assert.Contains("layouts", layoutsOnly.Value.IncludedTopics);
+        Assert.Contains("### `layouts`", layoutsOnly.Value.Guide);
+        Assert.Contains("cardMaxWidthPx", layoutsOnly.Value.Guide);
+        Assert.Contains("themeMode", layoutsOnly.Value.Guide);
+
+        var otherGroup = await handler.HandleAsync(new GetPrimeGuideQuery(
+            Topics: ["@other"],
+            Format: "agents-md"));
+        Assert.True(otherGroup.IsSuccess, otherGroup.Error?.Description);
+        Assert.NotNull(otherGroup.Value.IncludedTopics);
+        Assert.Contains("layouts", otherGroup.Value.IncludedTopics);
+        Assert.Contains("cardMaxWidthPx", otherGroup.Value.Guide);
+        Assert.Contains("themeMode", otherGroup.Value.Guide);
     }
 
     [Fact]

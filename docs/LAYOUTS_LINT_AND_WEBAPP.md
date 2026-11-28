@@ -42,11 +42,12 @@ Three global profiles (`article`, `mcq`, `flashcard`) persist in `<app-data>/app
 | `Lint.BrokenAssetDirectory` | Error | Workspace or `assets/` directory is missing |
 | `Lint.BrokenImageFile` | Error | Referenced image is missing, escapes workspace, or fails magic-byte check |
 | `Lint.MissingLinkCard` | Error | Article references `[text](mby://card/<id>)` with no matching `:::link` card |
+| `Lint.DuplicateLinkCardId` | Error | Two or more articles in the same session define a `:::link` card with the same `id` |
 | `Lint.UnresolvedArticleLink` | Error | Article references `[text](mby://article/<ref>)` not matching any article in the session |
 | `Lint.UnresolvedSessionLink` | Warning | Cross-session `mby://session/<id>[/<ref>]` target is not yet indexed |
 | `Lint.InvalidTablePayload` | Error | Table block has missing/invalid JSON, empty headers/rows, mismatched row widths, or invalid alignment |
 | `Lint.InvalidTableHideableCol` | Error | Table `hideableCols` contains a duplicate or out-of-bounds (`1..headers.length`) index |
-| `Lint.InvalidQuestionPayload` | Error | Payload question (`fill-blank`, `assertion-reason`, `spot-error`, `diff`, `mechanism`, `relabel`) has missing/corrupted/out-of-sync `payloadJson` |
+| `Lint.InvalidQuestionPayload` | Error | Payload question (`fill-blank`, `assertion-reason`, `spot-error`, `diff`, `mechanism`, `relabel`, `classify`, `match`, `numeric`, `case`) has missing/corrupted/out-of-sync `payloadJson` |
 | `Lint.UnbalancedBlankDelimiters` | Error | `fill-blank` template contains unclosed `{{`, nested `{{`, or unmatched `}}` |
 | `Lint.NoFillBlanks` | Error | `fill-blank` template contains zero `{{answer}}` blank slots |
 | `Lint.EmptyBlankAnswer` | Error | `fill-blank` blank slot or pipe alias is empty |

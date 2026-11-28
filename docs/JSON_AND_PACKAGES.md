@@ -211,7 +211,7 @@ Pass a `.md` file or directory (`./articles/`) directly to `mby apply` or `mby b
 
 ZIP archive produced after mandatory `check`:
 - `manifest.json`: `packageVersion` (`"2.0"`), `kind` (`session`\|`quiz`), `id`, `exportedAtUtc`, `assets[]`, `targetPlatform` (`desktop`\|`android`)
-- `workspace.json`: serialized components/blocks/questions (including article `links` and `payloadJson` on `table`, `fill-blank`, `assertion-reason`, `spot-error`, `diff`, `mechanism`, and `relabel` items; omits `layoutOverrides` unless `--include-layout` is passed)
+- `workspace.json`: serialized components/blocks/questions (including article `links` and `payloadJson` on `table`, `diagram-explore`, `reveal`, `fill-blank`, `assertion-reason`, `spot-error`, `diff`, `mechanism`, `relabel`, `classify`, `match`, `numeric`, and `case` items; omits `layoutOverrides` unless `--include-layout` is passed)
 - `layouts.json`: global profiles (included only with `--include-layout`)
 - `assets/<filename>`: deduped verified media files
 

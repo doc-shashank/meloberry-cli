@@ -70,19 +70,19 @@ public sealed class LayoutAndWebAppTests : IDisposable
         var domainMeta = new AssemblyCliToolMetadataProvider(typeof(Meloberry.Domain.Common.Result).Assembly, "mby").GetMetadata();
         var appMeta = new AssemblyCliToolMetadataProvider(typeof(Meloberry.Application.DependencyInjection).Assembly, "mby").GetMetadata();
         var infraMeta = sp.GetRequiredService<ICliToolMetadataProvider>().GetMetadata();
-        Assert.Equal("2.2.0-beta-1", domainMeta.Version);
-        Assert.Equal("2.2.0-beta-1", appMeta.Version);
-        Assert.Equal("2.2.0-beta-1", infraMeta.Version);
+        Assert.Equal("2.2.0-beta-2", domainMeta.Version);
+        Assert.Equal("2.2.0-beta-2", appMeta.Version);
+        Assert.Equal("2.2.0-beta-2", infraMeta.Version);
         Assert.Equal("Meloberry", infraMeta.AppName);
         Assert.Equal("Meloberry CLI", infraMeta.ProductName);
         Assert.Equal("mby", infraMeta.ExecutableName);
         Assert.Equal("https://github.com/doc-shashank/meloberry-cli/", infraMeta.RepositoryUrl);
 
         var editorHtml = sp.GetRequiredService<ILayoutEditorPageBuilder>().BuildHtml("relabel", infraMeta, "csrf-sample-123");
-        Assert.Contains("<meta name=\"generator\" content=\"Meloberry CLI (mby) 2.2.0-beta-1\"", editorHtml);
+        Assert.Contains("<meta name=\"generator\" content=\"Meloberry CLI (mby) 2.2.0-beta-2\"", editorHtml);
         Assert.Contains("EDITOR_CSRF_TOKEN = \"csrf-sample-123\"", editorHtml);
         Assert.Contains("X-Mby-Editor-Token", editorHtml);
-        Assert.Contains("mby v2.2.0-beta-1", editorHtml);
+        Assert.Contains("mby v2.2.0-beta-2", editorHtml);
         Assert.Contains("data-theme=\"paper\"", editorHtml);
         foreach (var targetId in new[] { "article-text", "callout", "table", "image", "mcq-question", "mcq-options", "fill-blank", "assertion-reason", "spot-error", "diff", "mechanism", "relabel", "flashcard" })
             Assert.Contains($"id: '{targetId}'", editorHtml);
@@ -119,7 +119,7 @@ public sealed class LayoutAndWebAppTests : IDisposable
           "quizType": "mixed",
           "name": "Web Security & Math",
           "questions": [
-            { "type": "flashcard", "front": { "text": "<script>alert(1)</script> [x](javascript:alert(2))", "imagePath": "diagram..final v2.png" }, "back": { "text": "Back **safe**" } },
+            { "type": "flashcard", "front": { "text": "<script>alert(1)</script> [x](javascript:alert(2)) [svg](data:image/svg+xml,<svg onload=alert(1)>) [xhtml](data:application/xhtml+xml,<html/>)", "imagePath": "diagram..final v2.png" }, "back": { "text": "Back **safe**" } },
             { "type": "fill-blank", "text": "Compute value: {{$\\sqrt{4}$ | 2}}." },
             { "type": "spot-error", "requireFix": true, "text": "Given [x is real], result is [~~2~~ -> $\\sqrt{4}$]." }
           ]
@@ -137,9 +137,11 @@ public sealed class LayoutAndWebAppTests : IDisposable
 
         var html = await File.ReadAllTextAsync(built.Value.IndexHtmlPath);
         var js = await File.ReadAllTextAsync(Path.Combine(webOut, "app.js"));
-        Assert.Contains("<meta name=\"generator\" content=\"Meloberry CLI (mby) 2.2.0-beta-1\"", html);
+        Assert.Contains("<meta name=\"generator\" content=\"Meloberry CLI (mby) 2.2.0-beta-2\"", html);
         Assert.DoesNotContain("<script>alert(1)</script>", js);
         Assert.DoesNotContain("javascript:alert(2)", js);
+        Assert.DoesNotContain("data:image/svg+xml", js);
+        Assert.DoesNotContain("data:application/xhtml+xml", js);
         Assert.Contains("aboveImage", js);
         Assert.Contains("diagram_final%20v2", js);
         Assert.Contains("primaryAnswerHtml", js);

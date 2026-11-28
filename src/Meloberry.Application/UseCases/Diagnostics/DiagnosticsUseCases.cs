@@ -146,15 +146,31 @@ public sealed class LintHandler(
 
     private async Task LintSessionNativeLinksAsync(StudySession session, List<LintIssue> issues, CancellationToken ct)
     {
-        var allCardIds = session.Components
-            .Where(c => c.Kind == ComponentKind.Article)
-            .SelectMany(c => c.LinkCards)
-            .Select(l => l.Id)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
         var sessionArticles = session.Components
             .Where(c => c.Kind == ComponentKind.Article)
             .ToList();
+
+        var cardOwnerById = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var comp in sessionArticles)
+        {
+            foreach (var card in comp.LinkCards)
+            {
+                if (cardOwnerById.TryGetValue(card.Id, out var firstCompId))
+                {
+                    issues.Add(new LintIssue(
+                        "Error",
+                        "Lint.DuplicateLinkCardId",
+                        comp.Id,
+                        $"Duplicate hover link card id '{card.Id}' already defined in article '{firstCompId}'. Link card IDs must be unique across a session."));
+                }
+                else
+                {
+                    cardOwnerById[card.Id] = comp.Id;
+                }
+            }
+        }
+
+        var allCardIds = cardOwnerById.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         var externalSessionCache = new Dictionary<string, StudySession?>(StringComparer.Ordinal);
 
@@ -713,7 +729,8 @@ public sealed class LintHandler(
                         issues.Add(new LintIssue("Error", "Lint.InvalidQuestionPayload", pq.Id, "Classify bucket name cannot be empty."));
                         continue;
                     }
-                    bucketIds.Add(b.BucketId);
+                    if (!bucketIds.Add(b.BucketId))
+                        issues.Add(new LintIssue("Error", "Lint.DuplicateClassifyBucket", pq.Id, $"Duplicate classify bucketId {b.BucketId}."));
                     if (!bucketNames.Add(b.Name.Trim()))
                         issues.Add(new LintIssue("Error", "Lint.DuplicateClassifyBucket", pq.Id, $"Duplicate bucket name '{b.Name.Trim()}'."));
                 }

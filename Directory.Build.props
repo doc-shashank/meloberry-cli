@@ -1,10 +1,10 @@
 <Project>
   <PropertyGroup>
-    <Version>2.2.0-beta-1</Version>
-    <VersionPrefix>2.2.0-beta-1</VersionPrefix>
+    <Version>2.2.0-beta-2</Version>
+    <VersionPrefix>2.2.0-beta-2</VersionPrefix>
     <AssemblyVersion>2.2.0.0</AssemblyVersion>
     <FileVersion>2.2.0.0</FileVersion>
-    <InformationalVersion>2.2.0-beta-1</InformationalVersion>
+    <InformationalVersion>2.2.0-beta-2</InformationalVersion>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <Product>Meloberry CLI</Product>
     <Company>Meloberry</Company>

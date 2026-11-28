@@ -47,7 +47,7 @@ public sealed partial class SlidingWebAppGenerator(
             var normalized = new string(decoded.Where(c => !char.IsWhiteSpace(c) && !char.IsControl(c)).ToArray());
             if (normalized.StartsWith("javascript:", StringComparison.OrdinalIgnoreCase) ||
                 normalized.StartsWith("vbscript:", StringComparison.OrdinalIgnoreCase) ||
-                normalized.StartsWith("data:text/html", StringComparison.OrdinalIgnoreCase))
+                normalized.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
             {
                 return $"{rawAttr}{q}#{q}";
             }

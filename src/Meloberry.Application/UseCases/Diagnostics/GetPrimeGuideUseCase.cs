@@ -104,7 +104,7 @@ public sealed class GetPrimeGuideHandler(
                 return Result<GetPrimeGuideResponse>.Failure(schemaResult.Error!);
             }
 
-            var selectedSchemas = schemaResult.Value.Schemas
+            var selectedSchemasList = schemaResult.Value.Schemas
                 .Select(s => new AgentsMdTopicSchema(
                     s.Topic,
                     s.Category,
@@ -125,7 +125,45 @@ public sealed class GetPrimeGuideHandler(
                     s.Example is null ? null : JsonSerializer.Serialize(s.Example, ExampleJsonOptions),
                     s.MarkdownHint,
                     s.MarkdownStarter))
-                .ToArray();
+                .ToList();
+
+            if (schemaResult.Value.LayoutProperties is { Count: > 0 } layoutProps)
+            {
+                var compactLines = layoutProps.Select(p =>
+                {
+                    var bounds = p.AllowedValues is { Count: > 0 }
+                        ? string.Join('|', p.AllowedValues)
+                        : $"{p.MinValue}..{p.MaxValue}";
+                    return $"{p.Name} ({p.ValueType}, def={p.DefaultValue}, bounds={bounds}, targets={string.Join(',', p.ApplicableTargets)})";
+                });
+
+                var layoutFields = layoutProps
+                    .Select(p => new AgentsMdTopicField(
+                        p.Name,
+                        p.ValueType,
+                        Required: false,
+                        $"{p.Description} (default={p.DefaultValue}, targets={string.Join(',', p.ApplicableTargets)})",
+                        p.AllowedValues,
+                        MaxLength: null,
+                        Pattern: null,
+                        p.MinValue,
+                        p.MaxValue))
+                    .ToArray();
+
+                selectedSchemasList.Add(new AgentsMdTopicSchema(
+                    Topic: "layouts",
+                    Category: "format",
+                    DisplayName: "Layouts",
+                    Summary: "Global and entity layout profile bounds (`article`, `mcq`, `flashcard`).",
+                    Command: "mby layout get|set|reset|edit",
+                    CompactSignature: string.Join('\n', compactLines),
+                    Fields: layoutFields,
+                    ExampleJson: null,
+                    MarkdownHint: null,
+                    MarkdownStarter: null));
+            }
+
+            var selectedSchemas = selectedSchemasList.ToArray();
 
             var markdown = AgentsMdRenderer.Render(new AgentsMdRenderInput(
                 meta.ExecutableName,

@@ -280,7 +280,7 @@ internal static partial class MarkdownSpecParser
         if (isQuizDoc)
         {
             if (doc.Questions.Count == 0)
-                return new Error("Markdown.EmptyBody", $"Markdown quiz '{sourceLabel}' has no question directives (use ':::mcq', ':::flashcard', ':::fill-blank', ':::assertion-reason', ':::spot-error', ':::diff', ':::mechanism', or ':::relabel').", ErrorType.Validation);
+                return new Error("Markdown.EmptyBody", $"Markdown quiz '{sourceLabel}' has no question directives (use ':::mcq', ':::flashcard', ':::fill-blank', ':::assertion-reason', ':::spot-error', ':::diff', ':::mechanism', ':::relabel', ':::classify', ':::match', ':::numeric', or ':::case').", ErrorType.Validation);
 
             var effectiveQuizType = ResolveQuizType(doc.Kind, doc.QuizType);
             return new DeclarativeApplySpec(
@@ -547,7 +547,17 @@ internal static partial class MarkdownSpecParser
                 continue;
             }
 
-            var scalar = UnquoteYamlScalar(rawVal);
+            string scalar;
+            if (rawVal is "|" or "|-")
+            {
+                int keyIndent = 0;
+                while (keyIndent < rawLine.Length && rawLine[keyIndent] == ' ') keyIndent++;
+                scalar = ReadYamlLiteralBlock(lines, ref i, endLineIdx, keyIndent);
+            }
+            else
+            {
+                scalar = UnquoteYamlScalar(rawVal);
+            }
             switch (key.ToLowerInvariant())
             {
                 case "kind": kind = scalar; break;
@@ -2029,8 +2039,10 @@ internal static partial class MarkdownSpecParser
             }
         }
 
-        foreach (var rawLine in body.MainBody.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n'))
+        var relLines = body.MainBody.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+        for (int i = 0; i < relLines.Length; i++)
         {
+            var rawLine = relLines[i];
             var trimmed = rawLine.Trim();
             if (string.IsNullOrEmpty(trimmed) || trimmed.StartsWith('#'))
                 continue;
@@ -2099,7 +2111,16 @@ internal static partial class MarkdownSpecParser
             switch (key.ToLowerInvariant())
             {
                 case "prompt":
-                    prompt = UnquoteYamlScalar(val);
+                    if (val is "|" or "|-")
+                    {
+                        int keyIndent = 0;
+                        while (keyIndent < rawLine.Length && rawLine[keyIndent] == ' ') keyIndent++;
+                        prompt = ReadYamlLiteralBlock(relLines, ref i, relLines.Length, keyIndent);
+                    }
+                    else
+                    {
+                        prompt = UnquoteYamlScalar(val);
+                    }
                     break;
                 case "include":
                     if (string.IsNullOrEmpty(val)) { include ??= []; section = "include"; }
@@ -2276,8 +2297,9 @@ internal static partial class MarkdownSpecParser
             return Result.Success();
         }
 
-        foreach (var rawLine in lines)
+        for (int i = 0; i < lines.Length; i++)
         {
+            var rawLine = lines[i];
             var trimmed = rawLine.Trim();
             if (string.IsNullOrWhiteSpace(trimmed) || trimmed.StartsWith('#')) continue;
 
@@ -2293,11 +2315,17 @@ internal static partial class MarkdownSpecParser
                 continue;
             }
 
+            int keyColumn = 0;
+            while (keyColumn < rawLine.Length && rawLine[keyColumn] == ' ') keyColumn++;
+
             if (trimmed.StartsWith("- ", StringComparison.Ordinal))
             {
                 var fl = FlushCur();
                 if (!fl.IsSuccess) return fl.Error!;
                 hasCur = true;
+                int afterDash = keyColumn + 1;
+                while (afterDash < rawLine.Length && rawLine[afterDash] == ' ') afterDash++;
+                keyColumn = afterDash;
                 trimmed = trimmed[2..].Trim();
                 if (string.IsNullOrWhiteSpace(trimmed)) continue;
             }
@@ -2318,7 +2346,9 @@ internal static partial class MarkdownSpecParser
                     curLabel = UnquoteYamlScalar(bVal);
                     break;
                 case "note":
-                    curNote = UnquoteYamlScalar(bVal);
+                    curNote = bVal is "|" or "|-"
+                        ? ReadYamlLiteralBlock(lines, ref i, lines.Length, keyColumn)
+                        : UnquoteYamlScalar(bVal);
                     break;
                 case "rect":
                     var rectRes = ParseYamlRect(bVal, "Markdown.InvalidDiagramExplore", ":::diagram-explore", openLine, sourceLabel);
@@ -2731,13 +2761,63 @@ internal static partial class MarkdownSpecParser
     private static bool IsCloseCodeFence(string trimmed, string openingToken) =>
         MarkdownFenceHelper.IsCloseCodeFence(trimmed, openingToken);
 
-    private static string UnescapeQuotedValue(string raw, char quoteChar) =>
-        quoteChar switch
+    private static string UnescapeQuotedValue(string raw, char quoteChar)
+    {
+        if (string.IsNullOrEmpty(raw) || !raw.Contains('\\'))
+            return raw;
+
+        var sb = new StringBuilder(raw.Length);
+        for (int i = 0; i < raw.Length; i++)
         {
-            '"' => raw.Replace("\\\"", "\"", StringComparison.Ordinal),
-            '\'' => raw.Replace("\\'", "'", StringComparison.Ordinal),
-            _ => raw
-        };
+            if (raw[i] == '\\' && i + 1 < raw.Length)
+            {
+                char next = raw[i + 1];
+                if (next == '\\' || next == quoteChar)
+                {
+                    sb.Append(next);
+                    i++;
+                    continue;
+                }
+            }
+            sb.Append(raw[i]);
+        }
+        return sb.ToString();
+    }
+
+    private static string ReadYamlLiteralBlock(string[] lines, ref int index, int endExclusive, int parentIndent)
+    {
+        var blockLines = new List<string>();
+        int blockIndent = -1;
+        while (index + 1 < endExclusive)
+        {
+            var nextRaw = lines[index + 1];
+            if (string.IsNullOrWhiteSpace(nextRaw))
+            {
+                blockLines.Add(string.Empty);
+                index++;
+                continue;
+            }
+
+            int leading = 0;
+            while (leading < nextRaw.Length && nextRaw[leading] == ' ')
+                leading++;
+
+            if (leading <= parentIndent)
+                break;
+
+            if (blockIndent < 0)
+                blockIndent = leading;
+
+            int strip = Math.Min(leading, blockIndent);
+            blockLines.Add(nextRaw[strip..]);
+            index++;
+        }
+
+        while (blockLines.Count > 0 && blockLines[^1].Length == 0)
+            blockLines.RemoveAt(blockLines.Count - 1);
+
+        return string.Join('\n', blockLines);
+    }
 
     private static string UnquoteYamlScalar(string raw)
     {
@@ -2838,14 +2918,22 @@ internal static partial class MarkdownSpecParser
                     return false;
             }
         }
-        else if (inner.EndsWith('"') || inner.EndsWith('\''))
+        else if ((inner.EndsWith('"') || inner.EndsWith('\'')) && !Phase1PayloadRules.IsEscaped(inner, inner.Length - 1))
         {
             char quote = inner[^1];
-            int openQuote = inner.LastIndexOf(quote, inner.Length - 2);
-            if (openQuote > 0 && char.IsWhiteSpace(inner[openQuote - 1]))
+            int openQuote = -1;
+            for (int idx = 1; idx < inner.Length - 1; idx++)
+            {
+                if (inner[idx] == quote && char.IsWhiteSpace(inner[idx - 1]) && !Phase1PayloadRules.IsEscaped(inner, idx))
+                {
+                    openQuote = idx;
+                    break;
+                }
+            }
+            if (openQuote > 0)
             {
                 rawDestination = inner[..openQuote].Trim();
-                parsedCaption = inner[(openQuote + 1)..^1].Trim();
+                parsedCaption = UnescapeQuotedValue(inner[(openQuote + 1)..^1], quote).Trim();
             }
         }
 
@@ -2862,9 +2950,9 @@ internal static partial class MarkdownSpecParser
         caption = null;
         if (raw.Length < 2) return false;
         char q = raw[0];
-        if ((q == '"' || q == '\'') && raw[^1] == q)
+        if ((q == '"' || q == '\'') && raw[^1] == q && !Phase1PayloadRules.IsEscaped(raw, raw.Length - 1))
         {
-            caption = raw[1..^1].Trim();
+            caption = UnescapeQuotedValue(raw[1..^1], q).Trim();
             return true;
         }
         return false;

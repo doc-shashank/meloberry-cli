@@ -249,7 +249,11 @@ public static partial class MarkdownSmartWrapper
             return;
         }
 
-        collected.Add(trimmed.Replace('\\', '/').TrimStart('.', '/'));
+        var normalized = trimmed.Replace('\\', '/');
+        while (normalized.StartsWith("./", StringComparison.Ordinal))
+            normalized = normalized[2..];
+        if (!string.IsNullOrWhiteSpace(normalized))
+            collected.Add(normalized);
     }
 
     private static bool StartsWithOuterDirective(string body, string topic)
@@ -319,5 +323,9 @@ public static partial class MarkdownSmartWrapper
     }
 
     private static string EscapeAttr(string value) =>
-        value.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal);
+        value.Replace("\r\n", " ", StringComparison.Ordinal)
+             .Replace('\r', ' ')
+             .Replace('\n', ' ')
+             .Replace("\\", "\\\\", StringComparison.Ordinal)
+             .Replace("\"", "\\\"", StringComparison.Ordinal);
 }

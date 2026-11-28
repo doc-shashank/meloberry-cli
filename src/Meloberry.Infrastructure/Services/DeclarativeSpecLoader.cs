@@ -827,16 +827,23 @@ public sealed partial class DeclarativeSpecLoader : IDeclarativeSpecLoader
                     case QuestionType.Classify:
                     {
                         var buckets = new List<ClassifyBucket>();
+                        var seenBucketIds = new HashSet<int>();
                         if (q.Buckets is not null)
                         {
                             for (int bIdx = 0; bIdx < q.Buckets.Count; bIdx++)
                             {
                                 var be = q.Buckets[bIdx];
                                 if (be.ValueKind == JsonValueKind.String)
+                                {
+                                    if (!seenBucketIds.Add(bIdx))
+                                        return new Error("Json.InvalidQuestion", $"Duplicate classify bucketId {bIdx} at '{pathPrefix}[{i}].buckets[{bIdx}]'.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].buckets[{bIdx}]");
                                     buckets.Add(new ClassifyBucket(bIdx, be.GetString()?.Trim() ?? string.Empty));
+                                }
                                 else if (be.ValueKind == JsonValueKind.Object)
                                 {
                                     int bid = be.TryGetProperty("bucketId", out var idEl) && idEl.ValueKind == JsonValueKind.Number && idEl.TryGetInt32(out var idVal) ? idVal : bIdx;
+                                    if (!seenBucketIds.Add(bid))
+                                        return new Error("Json.InvalidQuestion", $"Duplicate classify bucketId {bid} at '{pathPrefix}[{i}].buckets[{bIdx}]'.", ErrorType.Validation, Path: $"{pathPrefix}[{i}].buckets[{bIdx}]");
                                     string bName = be.TryGetProperty("name", out var nEl) && nEl.ValueKind == JsonValueKind.String ? nEl.GetString()?.Trim() ?? string.Empty : string.Empty;
                                     buckets.Add(new ClassifyBucket(bid, bName));
                                 }
